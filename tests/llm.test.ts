@@ -409,13 +409,15 @@ describe("retry and timeout", () => {
 
   it("gives up after one retry on persistent 5xx", async () => {
     stubFetch(() => json(500, {}));
-    expect(await callLlm(fakeOpenAiEp(), msgs(), opts())).toMatchObject({ ok: false, reason: "http-error" });
+    const r = await callLlm(fakeOpenAiEp(), msgs(), opts());
+    expect(r).toMatchObject({ ok: false, reason: "http-error", status: 500 });
     expect(fetchCallCount()).toBe(2);
   }, 15000);
 
   it("does not retry 4xx", async () => {
     stubFetch(() => json(400, { error: "bad" }));
-    expect(await callLlm(fakeOpenAiEp(), msgs(), opts())).toMatchObject({ ok: false, reason: "http-error" });
+    const r = await callLlm(fakeOpenAiEp(), msgs(), opts());
+    expect(r).toMatchObject({ ok: false, reason: "http-error", status: 400 });
     expect(fetchCallCount()).toBe(1);
   });
 

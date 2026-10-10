@@ -117,7 +117,7 @@ export async function callResponses(
 
   if (!a.ok) {
     const snippet = redact(a.text, key).slice(0, SNIPPET_CHARS);
-    return { ok: false, reason: "http-error", detail: `HTTP ${a.status}${snippet ? `: ${snippet}` : ""}` };
+    return { ok: false, reason: "http-error", detail: `HTTP ${a.status}${snippet ? `: ${snippet}` : ""}`, status: a.status };
   }
 
   let json: unknown;

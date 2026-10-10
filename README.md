@@ -82,7 +82,7 @@ The default wire format is `openai-chat`: `POST {base_url}/chat/completions` wit
 |---|---|---|
 | `auto` (default) | Error-driven probe: chat first, then the adapters below in order, learning the style from HTTP 400/404; the working style is remembered for the run. | Everything, automatically. |
 | `openai-chat` | `POST {base}/chat/completions` | `openai`, `groq`, `mistral`, `openrouter`, `ollama`, `custom`; `anthropic` and `google` through their OpenAI-compatible layers; chat-capable Zen/Go models. |
-| `openai-responses` | `POST {base}/responses` | Zen and Go: `gpt-*`, `grok-*` and `muse-spark-*` models. Also native on the `openai` preset. |
+| `openai-responses` | `POST {base}/responses` | Zen/Go `gpt-*`, `grok-*` and `muse-spark-*` models. Also native on the `openai` preset. |
 | `anthropic-messages` | `POST {base}/messages` | Zen/Go `claude-*`, `qwen*` and `minimax*` models. Also native on the `anthropic` preset. |
 | `google-models` | `POST {base}/models/<id>:generateContent` | Zen/Go `gemini-*` models. Also native on the `google` preset. |
 | `custom-path` | Path-only override via `llm_path` (experimental). | Custom OpenAI-compatible endpoints. |

@@ -151,6 +151,7 @@ describe("callMessages", () => {
     expect(await callMessages(fakeMessagesEp(), msgs(), opts())).toMatchObject({
       ok: false,
       reason: "http-error",
+      status: 503,
     });
     expect(calls.length).toBe(2);
 

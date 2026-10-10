@@ -1,6 +1,6 @@
-import { describe, it, expect, vi, afterEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import * as core from "@actions/core";
-import { callWithProbe, PROBE_ORDER } from "../src/llm.js";
+import { callWithProbe, resetProbeMemo, PROBE_ORDER } from "../src/llm.js";
 
 vi.mock("@actions/core", () => ({ warning: vi.fn(), info: vi.fn() }));
 
@@ -43,6 +43,11 @@ function warnings(): string[] {
   return vi.mocked(core.warning).mock.calls.map((c) => String(c[0]));
 }
 
+beforeEach(() => {
+  // Test-only: the in-process memo must not leak across tests.
+  resetProbeMemo();
+});
+
 afterEach(() => {
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
@@ -65,7 +70,7 @@ describe("callWithProbe: auto discovers the style from 400/404 errors", () => {
     ["openai-responses", 1, "/responses", RESPONSES_OK],
     ["anthropic-messages", 2, "/messages", MESSAGES_OK],
     ["google-models", 3, ":generateContent", GOOGLE_OK],
-  ] as const)("auto walks %i style miss(es) and succeeds on %s", async (style, misses, pathSuffix, okBody) => {
+  ] as const)("auto %s: walks %i style miss(es) and succeeds", async (style, misses, pathSuffix, okBody) => {
     stubProbe(misses, okBody);
     const model = `probe-${style}`;
     const r = await callWithProbe("opencode-zen", model, ZEN, "k", msgs, o);
@@ -82,11 +87,33 @@ describe("callWithProbe: auto discovers the style from 400/404 errors", () => {
     expect(r.result.ok).toBe(false);
     expect(r.result.ok === false && r.result.reason).toBe("http-error");
     expect(r.result.ok === false && r.result.detail).toContain("HTTP 404");
+    // The last failure's numeric status rides the exhaustion result (R1 contract).
+    expect(r.result.ok === false && r.result.reason === "http-error" && r.result.status).toBe(404);
     expect(vi.mocked(fetch)).toHaveBeenCalledTimes(PROBE_ORDER.length);
     expect(warnings()).toHaveLength(1);
     const w = warnings()[0];
     expect(w).toContain("epsilon-model");
     for (const s of PROBE_ORDER) expect(w).toContain(s);
+  });
+
+  it("a persistent 400 (schema-fallback exhausted) advances the probe — spec §9.5", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string | URL) => {
+        const u = String(url);
+        if (u.endsWith("/chat/completions")) return new Response("not found", { status: 404 });
+        if (u.endsWith("/responses")) {
+          return new Response(JSON.stringify({ error: { message: "bad request" } }), { status: 400 });
+        }
+        if (u.endsWith("/messages")) return new Response(JSON.stringify(MESSAGES_OK), { status: 200 });
+        return new Response("not found", { status: 404 });
+      }),
+    );
+    const r = await callWithProbe("opencode-zen", "nu-model", ZEN, "k", msgs, o);
+    expect(r.result).toEqual({ ok: true, findings: [FINDING] });
+    expect(r.via).toBe("anthropic-messages");
+    // chat 404 (1 fetch) + responses 400 with and without the strict format (2) + messages (1).
+    expect(vi.mocked(fetch)).toHaveBeenCalledTimes(4);
   });
 
   it("a non-400/404 failure stops the probe at the first style", async () => {
@@ -130,6 +157,67 @@ describe("callWithProbe: auto discovers the style from 400/404 errors", () => {
     expect(urls().at(-1)).toBe(`${ZEN}/responses`);
   });
 
+  it("a stale memo does not dead-end the probe: it is dropped and the walk continues", async () => {
+    let drifted = false;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string | URL) => {
+        const u = String(url);
+        if (u.endsWith("/responses")) {
+          return drifted
+            ? new Response(JSON.stringify({ error: { message: "bad request" } }), { status: 400 })
+            : new Response(JSON.stringify(RESPONSES_OK), { status: 200 });
+        }
+        if (u.endsWith("/chat/completions")) {
+          return drifted
+            ? new Response(JSON.stringify(CHAT_OK), { status: 200 })
+            : new Response("not found", { status: 404 });
+        }
+        return new Response("not found", { status: 404 });
+      }),
+    );
+    // Seed the memo: chat 404s, responses wins.
+    const first = await callWithProbe("opencode-zen", "stale-memo-model", ZEN, "k", msgs, o);
+    expect(first.via).toBe("openai-responses");
+    // The contract drifts: the memoized style now answers a persistent 400.
+    drifted = true;
+    const second = await callWithProbe("opencode-zen", "stale-memo-model", ZEN, "k", msgs, o);
+    expect(second.result).toEqual({ ok: true, findings: [FINDING] });
+    expect(second.via).toBe("openai-chat");
+    // The memo now points at the new winner: one fetch, straight to chat.
+    const before = vi.mocked(fetch).mock.calls.length;
+    const third = await callWithProbe("opencode-zen", "stale-memo-model", ZEN, "k", msgs, o);
+    expect(third.via).toBe("openai-chat");
+    expect(vi.mocked(fetch).mock.calls.length).toBe(before + 1);
+    expect(urls().at(-1)).toBe(`${ZEN}/chat/completions`);
+  });
+
+  it("a stale memo whose style exhausts warns with every style tried", async () => {
+    let seeded = false;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string | URL) => {
+        const u = String(url);
+        if (!seeded && u.endsWith("/responses")) return new Response(JSON.stringify(RESPONSES_OK), { status: 200 });
+        return new Response("not found", { status: 404 });
+      }),
+    );
+    // Seed the memo with a responses success (chat 404s first).
+    const first = await callWithProbe("opencode-zen", "stale-exhaust-model", ZEN, "k", msgs, o);
+    expect(first.via).toBe("openai-responses");
+    const seededCalls = vi.mocked(fetch).mock.calls.length;
+    // Everything answers 404 now: the memoized style first, then the rest of the order.
+    seeded = true;
+    const r = await callWithProbe("opencode-zen", "stale-exhaust-model", ZEN, "k", msgs, o);
+    expect(r.result.ok === false && r.result.reason).toBe("http-error");
+    expect(r.result.ok === false && r.result.reason === "http-error" && r.result.status).toBe(404);
+    expect(vi.mocked(fetch).mock.calls.length).toBe(seededCalls + PROBE_ORDER.length);
+    expect(warnings()).toHaveLength(1);
+    const w = warnings()[0];
+    expect(w).toContain("stale-exhaust-model");
+    for (const s of PROBE_ORDER) expect(w).toContain(s);
+  });
+
   it("redaction holds across every probe attempt", async () => {
     const key = "sk-SECRET-KEY-123";
     vi.stubGlobal(
@@ -142,6 +230,15 @@ describe("callWithProbe: auto discovers the style from 400/404 errors", () => {
     expect(detail).toContain("[REDACTED]");
     expect(detail).not.toContain(key);
     for (const w of warnings()) expect(w).not.toContain(key);
+  });
+
+  it("custom-path never reaches a probe: rejected with a clear error", async () => {
+    vi.stubGlobal("fetch", vi.fn());
+    await expect(
+      // Bypass the Exclude<..., "custom-path"> type on purpose: the runtime guard stays loud.
+      callWithProbe("custom", "xi-model", "https://x", "k", msgs, o, "custom-path" as never),
+    ).rejects.toThrow(/requires llm_path/);
+    expect(vi.mocked(fetch)).not.toHaveBeenCalled();
   });
 
   it("explicit style never probes (single fetch even on 404)", async () => {

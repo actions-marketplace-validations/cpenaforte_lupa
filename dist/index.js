@@ -25426,7 +25426,7 @@ async function callGoogle(ep, modelId, messages, o) {
   }
   if (!a.ok) {
     const snippet = redact(a.text, key).slice(0, SNIPPET_CHARS);
-    return { ok: false, reason: "http-error", detail: `HTTP ${a.status}${snippet ? `: ${snippet}` : ""}` };
+    return { ok: false, reason: "http-error", detail: `HTTP ${a.status}${snippet ? `: ${snippet}` : ""}`, status: a.status };
   }
   let json;
   try {
@@ -25527,7 +25527,7 @@ async function callMessages(ep, messages, o) {
   }
   if (!a.ok) {
     const snippet = redact(a.text, key).slice(0, SNIPPET_CHARS);
-    return { ok: false, reason: "http-error", detail: `HTTP ${a.status}${snippet ? `: ${snippet}` : ""}` };
+    return { ok: false, reason: "http-error", detail: `HTTP ${a.status}${snippet ? `: ${snippet}` : ""}`, status: a.status };
   }
   let json;
   try {
@@ -25637,7 +25637,7 @@ async function callResponses(ep, messages, o) {
   }
   if (!a.ok) {
     const snippet = redact(a.text, key).slice(0, SNIPPET_CHARS);
-    return { ok: false, reason: "http-error", detail: `HTTP ${a.status}${snippet ? `: ${snippet}` : ""}` };
+    return { ok: false, reason: "http-error", detail: `HTTP ${a.status}${snippet ? `: ${snippet}` : ""}`, status: a.status };
   }
   let json;
   try {
@@ -25846,7 +25846,7 @@ async function callLlm(ep, messages, o) {
   }
   if (!a.ok) {
     const snippet = redact(a.text, key).slice(0, SNIPPET_CHARS);
-    return { ok: false, reason: "http-error", detail: `HTTP ${a.status}${snippet ? `: ${snippet}` : ""}` };
+    return { ok: false, reason: "http-error", detail: `HTTP ${a.status}${snippet ? `: ${snippet}` : ""}`, status: a.status };
   }
   let json;
   try {
@@ -25898,7 +25898,11 @@ async function callByStyle(ep, messages, o) {
 var PROBE_ORDER = ["openai-chat", "openai-responses", "anthropic-messages", "google-models"];
 var PROBE_MEMO = /* @__PURE__ */ new Map();
 function isProbeTrigger(result) {
-  return result.ok === false && result.reason === "http-error" && /^HTTP (400|404)(?!\d)/.test(result.detail);
+  if (result.ok || result.reason !== "http-error")
+    return false;
+  if (result.status !== void 0)
+    return result.status === 400 || result.status === 404;
+  return /^HTTP (400|404)(?!\d)/.test(result.detail);
 }
 async function callWithProbe(provider, model, baseUrl2, key, messages, o, explicitStyle) {
   if (key === "") {
@@ -25922,7 +25926,7 @@ async function callWithProbe(provider, model, baseUrl2, key, messages, o, explic
   }
   const memoKey = `${provider}:${model}`;
   const memoized = PROBE_MEMO.get(memoKey);
-  const order = memoized !== void 0 ? [memoized] : PROBE_ORDER;
+  const order = memoized !== void 0 ? [memoized, ...PROBE_ORDER.filter((s) => s !== memoized)] : PROBE_ORDER;
   const attempted = [];
   let last;
   for (const style of order) {
@@ -25935,11 +25939,18 @@ async function callWithProbe(provider, model, baseUrl2, key, messages, o, explic
     last = out.result;
     if (!isProbeTrigger(last))
       return out;
+    PROBE_MEMO.delete(memoKey);
   }
   warning(`model "${model}": no API style accepted the request; tried ${attempted.join(" \u2192 ")}. Set llm_api_style explicitly to skip the probe.`);
   const detail = last !== void 0 && !last.ok ? last.detail : "no API style accepted the request";
+  const status = last !== void 0 && !last.ok && last.reason === "http-error" ? last.status : void 0;
   return {
-    result: { ok: false, reason: "http-error", detail: redact(detail, key) },
+    result: {
+      ok: false,
+      reason: "http-error",
+      detail: redact(detail, key),
+      ...status !== void 0 ? { status } : {}
+    },
     via: attempted.at(-1)
   };
 }
