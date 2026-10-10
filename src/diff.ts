@@ -33,6 +33,11 @@ const LOCKFILES: ReadonlySet<string> = new Set([
   "flake.lock",
 ]);
 
+/** True when the path's basename is a known lockfile (any ecosystem). */
+export function isLockfile(path: string): boolean {
+  return LOCKFILES.has(basename(path));
+}
+
 /**
  * PROMPT-LLM ONLY. Drops lockfiles, minified JS, source maps and binaries.
  * L0 must run on the UNFILTERED list first (binary note / lockfile-without-manifest).
