@@ -186,8 +186,8 @@ describe("getInputs sampling (llm_temperature / llm_top_p)", () => {
     },
   );
 
-  // Deliberate (controller ruling): decimal form is strict `-?\d+(\.\d+)?`.
-  // Leading-dot and explicit-plus forms are rejected, not normalized.
+  // Strict decimal form per spec grammar: leading-dot (.5) and explicit-plus (+0.5)
+  // are not normalized inputs.
   it.each([".5", "+0.5"])("rejects llm_temperature %s by design (strict decimal form)", (v) => {
     setInputs({ llm_temperature: v });
     expect(() => getInputs()).toThrow(/llm_temperature/);

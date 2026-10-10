@@ -119,7 +119,7 @@ export function getInputs(): ActionInputs {
   };
 }
 
-// Single read: empty input means "not set" (null); otherwise validated like readInt.
+// Single read: empty means not-set (null); otherwise validated by parseIntValue.
 function readOptionalInt(name: string, min: number): number | null {
   const raw = readString(name);
   if (raw === "") return null;
