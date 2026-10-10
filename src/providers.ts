@@ -214,12 +214,15 @@ export function resolveEndpoint(o: ResolveEndpointOptions): ResolvedEndpoint {
 
 /**
  * Auth header for the GET {base}/models existence check, derived from
- * provider + resolved style at the call site: Google-native endpoints
- * (provider `google` speaking the google-models protocol) use `x-goog-api-key`;
- * everything else — including Zen/Go catalog checks — keeps Bearer.
+ * provider + resolved style at the call site: the `google` preset and a
+ * `custom` provider pointed at a native Google base (both speaking the
+ * google-models protocol) use `x-goog-api-key`, pairing with callGoogle's POST
+ * auth. Everything else keeps Bearer — including Zen/Go catalog checks, whose
+ * `/models` is the OpenCode catalog even when the POST adapter is google-models.
  */
 export function authHeaderFor(provider: string, apiStyle: ResolvedApiStyle): { header: string } {
-  return { header: provider === "google" && apiStyle === "google-models" ? "x-goog-api-key" : "Authorization" };
+  const googleNative = apiStyle === "google-models" && (provider === "google" || provider === "custom");
+  return { header: googleNative ? "x-goog-api-key" : "Authorization" };
 }
 
 /**

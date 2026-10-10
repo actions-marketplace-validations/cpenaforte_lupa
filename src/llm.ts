@@ -325,6 +325,9 @@ export async function callByStyle(
       return callGoogle(ep, o.model, messages, o);
     case "openai-chat":
       return callLlm(ep, messages, o);
+    default:
+      // Unreachable by type; guards forged/malformed endpoints at runtime.
+      throw new Error("unsupported apiStyle: " + String(ep.apiStyle));
   }
 }
 

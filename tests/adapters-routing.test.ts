@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { callByStyle } from "../src/llm.js";
-import { resolveEndpoint, UnsupportedModelError } from "../src/providers.js";
+import { resolveEndpoint, UnsupportedModelError, type ResolvedApiStyle } from "../src/providers.js";
 import { googleSchema } from "../src/adapters/google.js";
 import { PR_REVIEW_SCHEMA } from "../src/prompt.js";
 
@@ -268,5 +268,14 @@ describe("callByStyle dispatches to the adapter of the resolved style", () => {
       expect(r.ok).toBe(false);
       expect(r.ok === false && r.reason).toBe("content-filter");
     }
+  });
+
+  // Micro fix 1: the "fail loudly" promise is backed by code — no silent chat fallback.
+  it("a forged apiStyle throws instead of falling back to chat", async () => {
+    const ep = {
+      ...resolveEndpoint({ ...base, llmProvider: "openai", llmModel: "m" }),
+      apiStyle: "bogus-style" as unknown as ResolvedApiStyle,
+    };
+    await expect(callByStyle(ep, msgs, { ...opts, model: "m" })).rejects.toThrow("unsupported apiStyle: bogus-style");
   });
 });

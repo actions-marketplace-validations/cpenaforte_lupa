@@ -25759,6 +25759,8 @@ async function callByStyle(ep, messages, o) {
       return callGoogle(ep, o.model, messages, o);
     case "openai-chat":
       return callLlm(ep, messages, o);
+    default:
+      throw new Error("unsupported apiStyle: " + String(ep.apiStyle));
   }
 }
 async function ensureOllama(baseUrl2, model, o = {}) {
@@ -25934,7 +25936,8 @@ function resolveEndpoint(o) {
   return { baseUrl: effectiveBase, path, headers, apiStyle };
 }
 function authHeaderFor(provider, apiStyle) {
-  return { header: provider === "google" && apiStyle === "google-models" ? "x-goog-api-key" : "Authorization" };
+  const googleNative = apiStyle === "google-models" && (provider === "google" || provider === "custom");
+  return { header: googleNative ? "x-goog-api-key" : "Authorization" };
 }
 async function validateModelExists(baseUrl2, model, apiKey, auth2 = {}) {
   const url = `${baseUrl2.replace(/\/+$/, "")}/models`;

@@ -295,7 +295,13 @@ describe("validateModelExists", () => {
     expect(authHeaderFor("google", "google-models").header).toBe("x-goog-api-key");
     expect(authHeaderFor("google", "openai-chat").header).toBe("Authorization");
     expect(authHeaderFor("opencode-zen", "google-models").header).toBe("Authorization");
+    expect(authHeaderFor("opencode-go", "google-models").header).toBe("Authorization");
     expect(authHeaderFor("custom", "anthropic-messages").header).toBe("Authorization");
+  });
+
+  // Micro fix 2: a custom provider on a native Google base must pair with callGoogle's POST auth.
+  it("authHeaderFor: custom + google-models is x-goog-api-key (pairs with callGoogle)", () => {
+    expect(authHeaderFor("custom", "google-models").header).toBe("x-goog-api-key");
   });
 
   // R4 / F2
