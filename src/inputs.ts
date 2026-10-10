@@ -24,11 +24,14 @@ export const LLM_API_STYLES = [
   "custom-path",
 ] as const;
 
+export type LlmProvider = (typeof LLM_PROVIDERS)[number];
+export type LlmApiStyle = (typeof LLM_API_STYLES)[number];
+
 export interface ActionInputs {
   githubToken: string;
-  llmProvider: string;
+  llmProvider: LlmProvider;
   llmBaseUrl: string;
-  llmApiStyle: string;
+  llmApiStyle: LlmApiStyle;
   llmPath: string;
   llmModel: string;
   llmApiKey: string;
@@ -47,26 +50,28 @@ export function parseFailLevel(v: string): FailLevel {
   throw new Error(`Invalid fail_level "${v}": expected none, warning, or high`);
 }
 
+// core.getInput already trims whitespace (trimWhitespace defaults to true).
 function readString(name: string, fallback = ""): string {
-  const v = core.getInput(name).trim();
+  const v = core.getInput(name);
   return v === "" ? fallback : v;
 }
 
-function readInt(name: string, fallback: number): number {
+function readInt(name: string, fallback: number, min: number): number {
   const raw = readString(name);
   if (raw === "") return fallback;
-  if (!/^\d+$/.test(raw)) {
-    throw new Error(`Invalid ${name} "${raw}": expected a non-negative integer`);
+  const n = Number(raw);
+  if (!/^\d+$/.test(raw) || !Number.isSafeInteger(n) || n < min) {
+    throw new Error(`Invalid ${name} "${raw}": expected an integer >= ${min} (safe integer)`);
   }
-  return Number(raw);
+  return n;
 }
 
-function readOptionalNumber(name: string): number | undefined {
+function readOptionalDecimal(name: string): number | undefined {
   const raw = readString(name);
   if (raw === "") return undefined;
   const n = Number(raw);
-  if (!Number.isFinite(n)) {
-    throw new Error(`Invalid ${name} "${raw}": expected a number`);
+  if (!/^-?\d+(\.\d+)?$/.test(raw) || !Number.isFinite(n)) {
+    throw new Error(`Invalid ${name} "${raw}": expected a finite decimal number (e.g. 0.7)`);
   }
   return n;
 }
@@ -87,16 +92,9 @@ function readEnum<T extends string>(name: string, allowed: readonly T[], fallbac
 }
 
 export function getInputs(): ActionInputs {
-  const llmTemperature = readOptionalNumber("llm_temperature");
-  const llmTopP = readOptionalNumber("llm_top_p");
-  const prRaw = readString("pr_number");
-  let prNumber: number | null = null;
-  if (prRaw !== "") {
-    if (!/^\d+$/.test(prRaw) || Number(prRaw) < 1) {
-      throw new Error(`Invalid pr_number "${prRaw}": expected a positive integer`);
-    }
-    prNumber = Number(prRaw);
-  }
+  const llmTemperature = readOptionalDecimal("llm_temperature");
+  const llmTopP = readOptionalDecimal("llm_top_p");
+  const prNumber = readOptionalInt("pr_number", 1);
 
   return {
     githubToken: readString("github_token"),
@@ -108,11 +106,17 @@ export function getInputs(): ActionInputs {
     llmApiKey: readString("llm_api_key"),
     ...(llmTemperature !== undefined ? { llmTemperature } : {}),
     ...(llmTopP !== undefined ? { llmTopP } : {}),
-    llmMaxTokens: readInt("llm_max_tokens", 2000),
+    llmMaxTokens: readInt("llm_max_tokens", 2000, 1),
     failLevel: parseFailLevel(readString("fail_level", "warning")),
-    maxDiffChars: readInt("max_diff_chars", 60000),
+    maxDiffChars: readInt("max_diff_chars", 60000, 1),
     postComment: readBool("post_comment", true),
-    timeoutSeconds: readInt("timeout_seconds", 90),
+    timeoutSeconds: readInt("timeout_seconds", 90, 1),
     prNumber,
   };
+}
+
+function readOptionalInt(name: string, min: number): number | null {
+  const raw = readString(name);
+  if (raw === "") return null;
+  return readInt(name, 0, min);
 }

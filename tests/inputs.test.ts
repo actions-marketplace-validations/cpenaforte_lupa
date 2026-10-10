@@ -1,5 +1,10 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { getInputs, parseFailLevel } from "../src/inputs.js";
+import {
+  getInputs,
+  parseFailLevel,
+  LLM_PROVIDERS,
+  LLM_API_STYLES,
+} from "../src/inputs.js";
 
 const INPUT_NAMES = [
   "github_token",
@@ -73,7 +78,7 @@ describe("parseFailLevel", () => {
   });
 });
 
-describe("getInputs parsing", () => {
+describe("getInputs fail_level / pr_number", () => {
   it("rejects bad fail_level via getInputs", () => {
     setInputs({ fail_level: "block" });
     expect(() => getInputs()).toThrow(/fail_level/);
@@ -89,25 +94,31 @@ describe("getInputs parsing", () => {
     expect(() => getInputs()).toThrow(/pr_number/);
   });
 
+  it("rejects pr_number '0' (must be >= 1)", () => {
+    setInputs({ pr_number: "0" });
+    expect(() => getInputs()).toThrow(/pr_number/);
+  });
+
+  it("rejects pr_number '-1'", () => {
+    setInputs({ pr_number: "-1" });
+    expect(() => getInputs()).toThrow(/pr_number/);
+  });
+
+  it("rejects pr_number beyond MAX_SAFE_INTEGER", () => {
+    setInputs({ pr_number: "9007199254740993" });
+    expect(() => getInputs()).toThrow(/pr_number/);
+  });
+});
+
+describe("getInputs enums (single source of truth)", () => {
   it("rejects unknown llm_provider naming the input", () => {
     setInputs({ llm_provider: "bogus" });
     expect(() => getInputs()).toThrow(/llm_provider/);
   });
 
-  it("accepts all 10 llm_provider values", () => {
-    const providers = [
-      "openai",
-      "anthropic",
-      "google",
-      "groq",
-      "mistral",
-      "openrouter",
-      "ollama",
-      "opencode-zen",
-      "opencode-go",
-      "custom",
-    ];
-    for (const p of providers) {
+  it("accepts every LLM_PROVIDERS value", () => {
+    expect(LLM_PROVIDERS).toHaveLength(10);
+    for (const p of LLM_PROVIDERS) {
       setInputs({ llm_provider: p });
       expect(getInputs().llmProvider).toBe(p);
     }
@@ -118,26 +129,33 @@ describe("getInputs parsing", () => {
     expect(() => getInputs()).toThrow(/llm_api_style/);
   });
 
-  it("accepts all 6 llm_api_style values", () => {
-    const styles = [
-      "auto",
-      "openai-chat",
-      "openai-responses",
-      "anthropic-messages",
-      "google-models",
-      "custom-path",
-    ];
-    for (const s of styles) {
+  it("accepts every LLM_API_STYLES value", () => {
+    expect(LLM_API_STYLES).toHaveLength(6);
+    for (const s of LLM_API_STYLES) {
       setInputs({ llm_api_style: s });
       expect(getInputs().llmApiStyle).toBe(s);
     }
   });
+});
 
-  it("parses llm_temperature and llm_top_p only when non-empty", () => {
+describe("getInputs sampling (llm_temperature / llm_top_p)", () => {
+  it("parses decimal values when non-empty", () => {
     setInputs({ llm_temperature: "0.5", llm_top_p: "0.9" });
     const i = getInputs();
     expect(i.llmTemperature).toBe(0.5);
     expect(i.llmTopP).toBe(0.9);
+  });
+
+  it("parses negative decimals (range is validateSampling's job)", () => {
+    setInputs({ llm_temperature: "-0.5" });
+    expect(getInputs().llmTemperature).toBe(-0.5);
+  });
+
+  it("leaves both undefined when inputs are empty strings", () => {
+    setInputs({ llm_temperature: "", llm_top_p: "" });
+    const i = getInputs();
+    expect(i.llmTemperature).toBeUndefined();
+    expect(i.llmTopP).toBeUndefined();
   });
 
   it("rejects non-numeric llm_temperature naming the input", () => {
@@ -150,6 +168,21 @@ describe("getInputs parsing", () => {
     expect(() => getInputs()).toThrow(/llm_top_p/);
   });
 
+  it.each(["Infinity", "NaN", "0x10", "1e3", "1e-400"])(
+    "rejects llm_temperature %s naming the input",
+    (v) => {
+      setInputs({ llm_temperature: v });
+      expect(() => getInputs()).toThrow(/llm_temperature/);
+    },
+  );
+
+  it.each(["Infinity", "NaN", "0x10", "1e3"])("rejects llm_top_p %s naming the input", (v) => {
+    setInputs({ llm_top_p: v });
+    expect(() => getInputs()).toThrow(/llm_top_p/);
+  });
+});
+
+describe("getInputs integer inputs", () => {
   it("coerces integer inputs", () => {
     setInputs({ max_diff_chars: "1000", timeout_seconds: "30", llm_max_tokens: "500" });
     const i = getInputs();
@@ -163,6 +196,35 @@ describe("getInputs parsing", () => {
     expect(() => getInputs()).toThrow(/max_diff_chars/);
   });
 
+  it.each([
+    ["timeout_seconds", "soon"],
+    ["llm_max_tokens", "many"],
+    ["max_diff_chars", "lots"],
+  ])("rejects non-numeric %s naming the input", (name, v) => {
+    setInputs({ [name]: v });
+    expect(() => getInputs()).toThrow(new RegExp(name));
+  });
+
+  it.each([
+    ["timeout_seconds", "0"],
+    ["llm_max_tokens", "0"],
+    ["max_diff_chars", "0"],
+  ])("rejects %s = 0 (must be >= 1)", (name, v) => {
+    setInputs({ [name]: v });
+    expect(() => getInputs()).toThrow(new RegExp(name));
+  });
+
+  it.each([
+    ["timeout_seconds", "9007199254740993"],
+    ["llm_max_tokens", "9007199254740993"],
+    ["max_diff_chars", "9007199254740993"],
+  ])("rejects unsafe-integer %s naming the input", (name, v) => {
+    setInputs({ [name]: v });
+    expect(() => getInputs()).toThrow(new RegExp(name));
+  });
+});
+
+describe("getInputs post_comment", () => {
   it("parses post_comment false", () => {
     setInputs({ post_comment: "false" });
     expect(getInputs().postComment).toBe(false);
