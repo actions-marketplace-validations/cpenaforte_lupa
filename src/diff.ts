@@ -12,7 +12,7 @@ export interface FileDiff {
 }
 
 /** Lockfile basenames (any ecosystem). Prompt-filtered only. */
-export const LOCKFILES: ReadonlySet<string> = new Set([
+const LOCKFILES: ReadonlySet<string> = new Set([
   "package-lock.json",
   "npm-shrinkwrap.json",
   "pnpm-lock.yaml",
@@ -54,8 +54,7 @@ export function filterForPrompt(files: FileDiff[]): FileDiff[] {
 export function parseRename(nameStatus: string): { oldPath: string; newPath: string }[] {
   const out: { oldPath: string; newPath: string }[] = [];
   let pendingFrom: string | undefined;
-  for (const raw of nameStatus.split("\n")) {
-    const line = raw.replace(/\r$/, "");
+  for (const line of nameStatus.split(/\r?\n/)) {
     const tab = /^R\d*\t([^\t]+)\t([^\t]+)$/.exec(line);
     if (tab) {
       out.push({ oldPath: tab[1], newPath: tab[2] });
@@ -77,8 +76,13 @@ const TRUNC_NOTE = "\n[... truncated ...]\n";
 
 /**
  * Concatenates per-file sections, capping each at `perFile` chars and the
- * whole text at `maxChars`. Files that do not fit the global budget are
- * recorded in `skipped` (by file path) instead of included.
+ * whole text at `maxChars`.
+ *
+ * Fill policy: greedy skip-and-continue. A section that does not fit the
+ * remaining global budget is skipped (its path goes into `skipped`), but the
+ * loop keeps going, so later smaller sections can still fill the budget.
+ * Callers surface `skipped`; the prompt note about skipped files is added by
+ * buildMessages (Task 8), not here.
  */
 export function truncateDiff(
   files: FileDiff[],
@@ -121,7 +125,16 @@ export function writePrMeta(m: PrMeta, dir: string): void {
 export function readPrMeta(dir: string): PrMeta | undefined {
   const path = join(dir, PR_META_FILE);
   if (!existsSync(path)) return undefined;
-  const v = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(path, "utf8"));
+  } catch {
+    throw new Error(`Invalid ${PR_META_FILE} in ${dir}: malformed JSON`);
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new Error(`Invalid ${PR_META_FILE} in ${dir}`);
+  }
+  const v = parsed as Record<string, unknown>;
   if (
     typeof v.pr_number !== "number" ||
     typeof v.head_sha !== "string" ||

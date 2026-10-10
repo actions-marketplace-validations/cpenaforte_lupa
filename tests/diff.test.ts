@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -79,6 +79,40 @@ describe("diff", () => {
       expect(readPrMeta(dir)).toEqual(m);
     } finally {
       rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("parseRename handles CRLF line endings", () => {
+    const r = parseRename("R100\told/a.ts\tnew/a.ts\r\nM\tsrc/b.ts\r\n");
+    expect(r).toEqual([{ oldPath: "old/a.ts", newPath: "new/a.ts" }]);
+    const h = parseRename("rename from old/c.ts\r\nrename to new/c.ts\r\n");
+    expect(h).toEqual([{ oldPath: "old/c.ts", newPath: "new/c.ts" }]);
+  });
+
+  it("filterForPrompt keeps binary:false files with image extensions (flag decides, not extension)", () => {
+    const f: FileDiff = { file: "x.png", hunks: "", truncated: false, binary: false };
+    expect(filterForPrompt([f])).toEqual([f]);
+  });
+
+  it("readPrMeta throws a clean error on malformed JSON", () => {
+    const dir = mkdtempSync(join(tmpdir(), "prmeta-"));
+    try {
+      writeFileSync(join(dir, "pr-meta.json"), "{not json", "utf8");
+      expect(() => readPrMeta(dir)).toThrow(/Invalid pr-meta\.json/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("readPrMeta throws a clean error when JSON is null or an array", () => {
+    for (const body of ["null", "[]", "42", '"str"']) {
+      const dir = mkdtempSync(join(tmpdir(), "prmeta-"));
+      try {
+        writeFileSync(join(dir, "pr-meta.json"), body, "utf8");
+        expect(() => readPrMeta(dir)).toThrow(/Invalid pr-meta\.json/);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
     }
   });
 
