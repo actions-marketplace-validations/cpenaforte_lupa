@@ -1,5 +1,14 @@
 # PR Reviewer: Fluxo A (unprivileged). Copy into .github/workflows/ of the consuming repository.
 # Replace OWNER and the action SHA below with a released commit of pr-reviewer.
+#
+# Trust model (read before enabling):
+# - issue_comment and pull_request_review run in the BASE repository context WITH secrets, and
+#   the review checks out and executes PR-controlled code (scanners, linters). Those triggers are
+#   gated to trusted author associations (OWNER, MEMBER, COLLABORATOR) by the action.
+# - The exec environment is scrubbed (no *TOKEN*, *KEY*, *SECRET*, *PASSWORD*, *AUTH*, GITHUB_TOKEN,
+#   ACTIONS_*), so PR code cannot read the GitHub token or the LLM key from the environment.
+# - Accepted risk: a malicious trusted-author PR could still run code on the ephemeral runner.
+#   The runner holds no secrets after the scrub and is discarded with the job.
 name: PR Reviewer
 
 on:
@@ -18,8 +27,10 @@ on:
 permissions:
   contents: read
   pull-requests: write
-  # issues: write is used only by the issue-comment fallback (PR_REVIEWER_ISSUE_FALLBACK).
-  issues: write
+  # Uncomment ONLY when PR_REVIEWER_ISSUE_FALLBACK is "true" (issue-comment fallback for refused reviews):
+  # issues: write
+  # Uncomment ONLY together with the SARIF upload step below (code scanning, same-repo PRs):
+  # security-events: write
 
 concurrency:
   group: pr-reviewer-${{ github.event.pull_request.number || github.event.issue.number || inputs.pr_number }}
@@ -51,10 +62,25 @@ jobs:
 
       - name: Fetch PR head and base, check out the PR head
         env:
+          FETCH_TOKEN: ${{ github.token }}
           BASE_SHA: ${{ steps.shas.outputs.base_sha }}
           HEAD_SHA: ${{ steps.shas.outputs.head_sha }}
         run: |
           set -euo pipefail
+          # Token auth for explicit fetches (private repos): an in-memory extraheader passed through
+          # GIT_CONFIG_* env, so the token never reaches argv, .git/config, or the logs.
+          # Without a token the fetch is anonymous (public repositories only).
+          git_auth() {
+            if [ -n "${FETCH_TOKEN:-}" ]; then
+              basic=$(printf 'x-access-token:%s' "$FETCH_TOKEN" | base64 -w0)
+              export GIT_CONFIG_COUNT=1
+              export GIT_CONFIG_KEY_0=http.extraheader
+              export GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $basic"
+            else
+              unset GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0
+            fi
+          }
+          git_auth
           git fetch --no-tags origin "pull/${PR_NUMBER}/head:refs/remotes/pr-reviewer/head-${PR_NUMBER}"
           git fetch --no-tags origin "${BASE_SHA}"
           git checkout --detach --force "${HEAD_SHA}"
@@ -66,6 +92,8 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$OUT_DIR"
+          # Same effect as `git -c core.quotePath=false`: raw UTF-8 names, no octal-quoted paths.
+          export GIT_CONFIG_PARAMETERS="'core.quotePath=false'"
           git diff -U3 --no-ext-diff --no-color "${BASE_SHA}...${HEAD_SHA}" > "$OUT_DIR/diff.patch"
 
       - name: Review
@@ -78,8 +106,7 @@ jobs:
           PR_REVIEWER_HEAD_SHA: ${{ steps.shas.outputs.head_sha }}
           PR_REVIEWER_ARTIFACT_DIR: ${{ runner.temp }}/pr-reviewer-out
           PR_REVIEWER_TOKEN_TYPE: github-token
-          PR_REVIEWER_ISSUE_FALLBACK: "true"
-          SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+          PR_REVIEWER_ISSUE_FALLBACK: "false"
         with:
           github_token: ${{ github.token }}
           pr_number: ${{ github.event.pull_request.number || github.event.issue.number || inputs.pr_number }}
@@ -87,6 +114,15 @@ jobs:
           llm_model: ${{ vars.PR_REVIEWER_MODEL }}
           llm_api_key: ${{ secrets.LLM_API_KEY }}
           fail_level: warning
+
+      - name: Upload SARIF (same-repo PRs; needs security-events: write above)
+        # Fork PRs get a read-only token, so the upload is limited to same-repository PRs.
+        # continue-on-error: a missing permission or disabled code scanning never fails the job.
+        if: always() && github.event.pull_request.head.repo.full_name == github.repository
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
+        with:
+          sarif_file: ${{ runner.temp }}/pr-reviewer-out/sarif.json
 
       - name: Upload review artifact
         if: always()
@@ -98,6 +134,7 @@ jobs:
             ${{ runner.temp }}/pr-reviewer-out/diff.patch
             ${{ runner.temp }}/pr-reviewer-out/pr-meta.json
             ${{ runner.temp }}/pr-reviewer-out/findings.json
+            ${{ runner.temp }}/pr-reviewer-out/sarif.json
             ${{ runner.temp }}/pr-reviewer-out/sbom.cdx.json
 
       - name: Enforce fail_level (warning check never blocks)

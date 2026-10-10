@@ -24574,6 +24574,7 @@ function filterForPrompt(files) {
     return true;
   });
 }
+var PER_FILE_CAP = 8e3;
 var TRUNC_NOTE = "\n[... truncated ...]\n";
 function truncateDiff(files, maxChars, perFile) {
   const parts = [];
@@ -24613,7 +24614,7 @@ function readPrMeta(dir) {
     throw new Error(`Invalid ${PR_META_FILE} in ${dir}`);
   }
   const v = parsed;
-  if (typeof v.pr_number !== "number" || typeof v.head_sha !== "string" || typeof v.base_sha !== "string" || typeof v.head_repo_full_name !== "string" || typeof v.is_fork !== "boolean") {
+  if (typeof v.pr_number !== "number" || typeof v.head_sha !== "string" || typeof v.base_sha !== "string" || typeof v.head_repo_full_name !== "string" || typeof v.is_fork !== "boolean" || !Number.isInteger(v.pr_number) || v.pr_number < 1 || !/^[0-9a-f]{40}$/i.test(v.head_sha)) {
     throw new Error(`Invalid ${PR_META_FILE} in ${dir}`);
   }
   return {
@@ -25874,6 +25875,9 @@ async function runGitleaks(dir) {
 // lib/src/main.js
 var SHA_RE = /^[0-9a-f]{40}$/;
 var SEVERITIES2 = /* @__PURE__ */ new Set(["info", "warning", "high"]);
+var MSG_CAP = 2e3;
+var SUGGESTION_CAP = 4e3;
+var TRUNC_MARK = "\u2026[truncated]";
 var MANIFEST_FOR = {
   "package-lock.json": "package.json",
   "npm-shrinkwrap.json": "package.json",
@@ -25892,6 +25896,45 @@ var MANIFEST_FOR = {
   "Podfile.lock": "Podfile",
   "flake.lock": "flake.nix"
 };
+var EXEC_ALLOW = /* @__PURE__ */ new Set([
+  "PATH",
+  "HOME",
+  "USER",
+  "LANG",
+  "LC_ALL",
+  "TZ",
+  "TMPDIR",
+  "GITHUB_WORKSPACE",
+  "SYSTEMROOT",
+  "PATHEXT",
+  "DOCKER_HOST"
+]);
+var EXEC_ALLOW_PREFIX = ["RUNNER_"];
+var EXEC_DENY = /TOKEN|KEY|SECRET|PASSWORD|AUTH|^GITHUB_TOKEN$|^ACTIONS_/i;
+function cleanEnvForExec(env) {
+  const out = {};
+  for (const [k, v] of Object.entries(env)) {
+    if (v === void 0 || EXEC_DENY.test(k))
+      continue;
+    if (EXEC_ALLOW.has(k) || EXEC_ALLOW_PREFIX.some((p) => k.startsWith(p)))
+      out[k] = v;
+  }
+  return out;
+}
+async function withScrubbedEnv(fn) {
+  const saved = { ...process.env };
+  const clean = cleanEnvForExec(saved);
+  for (const k of Object.keys(process.env))
+    delete process.env[k];
+  Object.assign(process.env, clean);
+  try {
+    return await fn();
+  } finally {
+    for (const k of Object.keys(process.env))
+      delete process.env[k];
+    Object.assign(process.env, saved);
+  }
+}
 function newOutcome() {
   return { posted: false, summaryWritten: false, exitCode: 0, findingsFrom: "fastpath", slowPathSkipped: false };
 }
@@ -25914,14 +25957,50 @@ function sizeOf(workDir, file) {
     return 0;
   }
 }
+function unquoteGitPath(s) {
+  if (s.length < 2 || !s.startsWith('"') || !s.endsWith('"'))
+    return s;
+  const body = s.slice(1, -1);
+  const simple = { n: 10, t: 9, r: 13, a: 7, b: 8, f: 12, v: 11, '"': 34, "\\": 92 };
+  const bytes = [];
+  for (let i = 0; i < body.length; i++) {
+    const c = body[i];
+    if (c !== "\\") {
+      bytes.push(...Buffer.from(c, "utf8"));
+      continue;
+    }
+    const octal = body.slice(i + 1, i + 4);
+    if (/^[0-7]{3}$/.test(octal)) {
+      bytes.push(parseInt(octal, 8));
+      i += 3;
+      continue;
+    }
+    const next = body[i + 1];
+    if (next === void 0)
+      break;
+    bytes.push(simple[next] ?? Buffer.from(next, "utf8")[0]);
+    i += 1;
+  }
+  return Buffer.from(bytes).toString("utf8");
+}
+function headerFile(line) {
+  const quoted = /^diff --git ("(?:[^"\\]|\\.)*"|\S+) ("(?:[^"\\]|\\.)*"|\S+)$/.exec(line);
+  if (quoted) {
+    const b = unquoteGitPath(quoted[2]);
+    return b.startsWith("b/") ? b.slice(2) : void 0;
+  }
+  const plain = /^diff --git a\/(.+) b\/(.+)$/.exec(line);
+  return plain ? plain[2] : void 0;
+}
 function parseDiffFiles(text, workDir) {
   const sections = [];
   let cur;
   for (const line of text.split("\n")) {
-    const head = /^diff --git a\/(.+) b\/(.+)$/.exec(line);
-    if (head) {
-      cur = { file: head[2], lines: [], binary: false };
-      sections.push(cur);
+    if (line.startsWith("diff --git ")) {
+      const file = headerFile(line);
+      cur = file === void 0 ? void 0 : { file, lines: [], binary: false };
+      if (cur !== void 0)
+        sections.push(cur);
       continue;
     }
     if (cur === void 0)
@@ -25962,6 +26041,24 @@ function readFindings(dir) {
 }
 function writeFindings(dir, findings) {
   writeFileSync2(join4(dir, "findings.json"), JSON.stringify(findings, null, 2) + "\n", "utf8");
+}
+function capText(s, cap) {
+  return s.length <= cap ? s : s.slice(0, cap - TRUNC_MARK.length) + TRUNC_MARK;
+}
+function unsafePath(file) {
+  return file.startsWith("/") || file.startsWith("\\") || /^[A-Za-z]:[\\/]/.test(file) || file.split(/[\\/]/).includes("..");
+}
+function sanitizeFinding(f) {
+  let out = { ...f };
+  if (out.file !== "" && unsafePath(out.file)) {
+    const { line: _line, ...rest } = out;
+    void _line;
+    out = { ...rest, file: "", message: `artifact path rejected: ${out.message}` };
+  }
+  out.message = capText(out.message, MSG_CAP);
+  if (out.suggestion !== void 0)
+    out.suggestion = capText(out.suggestion, SUGGESTION_CAP);
+  return out;
 }
 function fields(env) {
   return env.payload;
@@ -26049,12 +26146,13 @@ async function slowPath(env, deps, pr, fast, promptText, issueBody, skipped) {
   return res.findings;
 }
 async function publishReview(a) {
-  const { inline, general } = mapToComments(a.findings, parseHunks(a.hunks));
-  const body = buildBody(general, summaryFor(a.findings));
+  const findings = a.findings.map(sanitizeFinding);
+  const { inline, general } = mapToComments(findings, parseHunks(a.hunks));
+  const body = buildBody(general, summaryFor(findings));
   const payload = {
     commit_id: a.headSha,
     body,
-    event: eventFor(a.env.inputs.failLevel, a.findings),
+    event: eventFor(a.env.inputs.failLevel, findings),
     comments: inline
   };
   if (a.env.summaryPath !== void 0) {
@@ -26087,9 +26185,34 @@ async function publishReview(a) {
       warning("issue fallback unavailable (not enabled, or token lacks issues: write); nothing posted");
       return;
     }
-    await a.deps.gh.createIssueComment(a.pr, body, { enabled: a.env.issueFallback, issuesWrite });
-    a.out.posted = true;
+    try {
+      await a.deps.gh.createIssueComment(a.pr, body, { enabled: a.env.issueFallback, issuesWrite });
+      a.out.posted = true;
+    } catch (fallbackErr) {
+      warning(`issue fallback failed: ${fallbackErr.message}`);
+    }
   }
+}
+function toSarif(findings) {
+  const level = (s) => s === "high" ? "error" : s === "warning" ? "warning" : "note";
+  const results = findings.filter((f) => f.file !== "" && !unsafePath(f.file)).map((f) => ({
+    ruleId: f.rule,
+    level: level(f.severity),
+    message: { text: f.message },
+    locations: [
+      {
+        physicalLocation: {
+          artifactLocation: { uri: f.file },
+          ...f.line !== void 0 ? { region: { startLine: f.line } } : {}
+        }
+      }
+    ]
+  }));
+  return {
+    $schema: "https://json.schemastore.org/sarif-2.1.0.json",
+    version: "2.1.0",
+    runs: [{ tool: { driver: { name: "pr-reviewer" } }, results }]
+  };
 }
 async function runFlowA(env, deps, out) {
   out.slowPathSkipped = true;
@@ -26122,25 +26245,30 @@ async function runFlowA(env, deps, out) {
     }
   });
   const lockfiles = files.filter((f) => isLockfile(f.file)).map((f) => f.file);
-  const scan = await deps.analysis.runScanners({
-    dir: env.workDir,
-    baselineSha: env.baseSha,
-    hasSemgrepToken: env.hasSemgrepToken,
-    sbom: true,
-    lockfiles,
-    outDir: env.artifactDir
+  const { scan, l2 } = await withScrubbedEnv(async () => {
+    const s = await deps.analysis.runScanners({
+      dir: env.workDir,
+      baselineSha: env.baseSha,
+      hasSemgrepToken: false,
+      sbom: true,
+      lockfiles,
+      outDir: env.artifactDir
+    });
+    const l = await deps.analysis.runL2(env.workDir);
+    return { scan: s, l2: l };
   });
   if (scan.sbomPath !== void 0) {
     try {
       copyFileSync(scan.sbomPath, join4(env.artifactDir, "sbom.cdx.json"));
+    } catch (e) {
+      warning(`sbom not copied to the artifact: ${e.message}`);
     } finally {
       rmSync(dirname(scan.sbomPath), { recursive: true, force: true });
     }
   }
-  const l2 = await deps.analysis.runL2(env.workDir);
   const fast = [...l0, ...scan.findings, ...l2];
   writeFindings(env.artifactDir, fast);
-  const prompt = truncateDiff(filterForPrompt(files), env.inputs.maxDiffChars, env.inputs.maxDiffChars);
+  const prompt = truncateDiff(filterForPrompt(files), env.inputs.maxDiffChars, PER_FILE_CAP);
   let issueBody;
   const issueNo = linkedIssueNumber(pull.body);
   if (issueNo !== null) {
@@ -26154,8 +26282,9 @@ async function runFlowA(env, deps, out) {
   const llm = await slowPath(env, deps, pr, fast, prompt.text, issueBody, prompt.skipped);
   out.slowPathSkipped = llm === void 0;
   out.findingsFrom = llm === void 0 ? "fastpath" : "llm";
-  const all = [...fast, ...llm ?? []];
+  const all = [...fast, ...llm ?? []].map(sanitizeFinding);
   writeFindings(env.artifactDir, all);
+  writeFileSync2(join4(env.artifactDir, "sarif.json"), JSON.stringify(toSarif(all), null, 2) + "\n", "utf8");
   await publishReview({ env, deps, out, pr, isFork: pull.isFork, findings: all, hunks: files, headSha: env.headSha });
   out.exitCode = exitFor(env.inputs.failLevel, all);
 }
@@ -26165,13 +26294,22 @@ async function runFlowB(env, deps, out) {
   if (meta === void 0) {
     throw new Error(`pr-reviewer: pr-meta.json not found in ${env.artifactDir}; refusing to post without the PR run's artifact`);
   }
-  const runHead = fields(env).workflow_run?.head_sha;
-  if (runHead !== meta.head_sha) {
+  const wr = fields(env).workflow_run;
+  if (wr?.head_sha !== meta.head_sha) {
     throw new Error("pr-reviewer: artifact head_sha does not match workflow_run.head_sha; refusing to post");
+  }
+  const live = await deps.gh.getPr(meta.pr_number);
+  if (live.headRepo !== (wr?.head_repository?.full_name ?? "")) {
+    throw new Error("pr-reviewer: PR head repository does not match workflow_run.head_repository; refusing to post");
+  }
+  if (live.headSha !== wr?.head_sha) {
+    throw new Error("pr-reviewer: live PR head does not match workflow_run.head_sha; refusing to post");
+  }
+  if (live.headRef !== wr?.head_branch) {
+    throw new Error("pr-reviewer: PR head branch does not match workflow_run.head_branch; refusing to post");
   }
   const findings = readFindings(env.artifactDir);
   const hunks = parseDiffFiles(readDiff(env.artifactDir));
-  const live = await deps.gh.getPr(meta.pr_number);
   await publishReview({
     env,
     deps,
@@ -26203,6 +26341,7 @@ function realGateway(token) {
         body: r.data.body ?? "",
         headSha: r.data.head.sha,
         headRepo,
+        headRef: r.data.head.ref,
         isFork: headRepo !== r.data.base.repo.full_name
       };
     },
@@ -26238,7 +26377,6 @@ function readRunEnv() {
     headSha: process.env.PR_REVIEWER_HEAD_SHA ?? "",
     tokenIsApp: process.env.PR_REVIEWER_TOKEN_TYPE === "app",
     issueFallback: process.env.PR_REVIEWER_ISSUE_FALLBACK === "true",
-    hasSemgrepToken: (process.env.SEMGREP_APP_TOKEN ?? "") !== "",
     ...process.env.GITHUB_STEP_SUMMARY ? { summaryPath: process.env.GITHUB_STEP_SUMMARY } : {}
   };
 }
@@ -26255,9 +26393,13 @@ if (isEntry) {
   });
 }
 export {
+  cleanEnvForExec,
   main,
   readRunEnv,
-  run2 as run
+  run2 as run,
+  sanitizeFinding,
+  toSarif,
+  unquoteGitPath
 };
 /*! Bundled license information:
 

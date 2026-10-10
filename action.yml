@@ -61,6 +61,9 @@ inputs:
     description: "Maximum tokens the LLM may generate"
     required: false
     default: "2000"
+outputs:
+  exit-code:
+    description: "fail_level gate result: 0 pass, 2 warning findings, 1 high-severity findings"
 runs:
   using: node24
   main: dist/index.js

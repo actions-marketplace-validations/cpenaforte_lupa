@@ -131,6 +131,9 @@ export function parseRename(nameStatus: string): { oldPath: string; newPath: str
   return out;
 }
 
+/** Per-file cap for the prompt diff (chars). Used by the orchestrator's truncateDiff call. */
+export const PER_FILE_CAP = 8000;
+
 const TRUNC_NOTE = "\n[... truncated ...]\n";
 
 /**
@@ -199,7 +202,10 @@ export function readPrMeta(dir: string): PrMeta | undefined {
     typeof v.head_sha !== "string" ||
     typeof v.base_sha !== "string" ||
     typeof v.head_repo_full_name !== "string" ||
-    typeof v.is_fork !== "boolean"
+    typeof v.is_fork !== "boolean" ||
+    !Number.isInteger(v.pr_number) ||
+    v.pr_number < 1 ||
+    !/^[0-9a-f]{40}$/i.test(v.head_sha)
   ) {
     throw new Error(`Invalid ${PR_META_FILE} in ${dir}`);
   }

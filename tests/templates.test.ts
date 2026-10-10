@@ -60,4 +60,42 @@ describe("workflow templates", () => {
     expect(p).not.toMatch(/^\s*-\s*uses:\s*actions\/checkout\b/m);
     expect(p).not.toMatch(/run:\s*.*\b(checkout|semgrep|trivy|osv-scanner|ollama pull|chat\/completions)\b/m);
   });
+
+  it("explicit fetches authenticate in memory via GIT_CONFIG env, anonymous otherwise", () => {
+    const t = fs.readFileSync("docs/workflow-template.yml", "utf8");
+    expect(t).toContain("http.extraheader");
+    expect(t).toContain("GIT_CONFIG_KEY_0=http.extraheader");
+    expect(t).toContain("AUTHORIZATION: basic");
+    expect(t).toContain("x-access-token");
+    expect(t).toContain('if [ -n "${FETCH_TOKEN:-}" ]');
+    expect(t).toMatch(/Without a token the fetch is anonymous/);
+    expect(t).not.toMatch(/-c\s+http\.extraheader/);
+    expect(t).toContain("persist-credentials: false");
+  });
+
+  it("diff uses core.quotePath=false", () => {
+    const t = fs.readFileSync("docs/workflow-template.yml", "utf8");
+    expect(t).toContain("GIT_CONFIG_PARAMETERS=\"'core.quotePath=false'\"");
+    expect(t).toContain("git diff -U3");
+  });
+
+  it("issues: write is commented out by default, with the fallback explanation", () => {
+    const t = fs.readFileSync("docs/workflow-template.yml", "utf8");
+    expect(t).toMatch(/^\s*#\s*issues:\s*write/m);
+    expect(t).not.toMatch(/^ {2}issues:\s*write/m);
+    expect(t).not.toMatch(/^ {2}security-events:\s*write/m);
+  });
+
+  it("unprivileged template uploads SARIF behind same-repo and permission guards", () => {
+    const t = fs.readFileSync("docs/workflow-template.yml", "utf8");
+    expect(t).toMatch(/upload-sarif@[0-9a-f]{40}/);
+    expect(t).toContain("github.event.pull_request.head.repo.full_name == github.repository");
+    expect(t).toContain("sarif_file:");
+    expect(t).toContain("sarif.json");
+    expect(t).toMatch(/#\s*security-events:\s*write/);
+    expect(t).not.toContain("SEMGREP_APP_TOKEN");
+    const p = fs.readFileSync("docs/workflow-template-privileged.yml", "utf8");
+    expect(p).not.toContain("upload-sarif");
+    expect(p).not.toMatch(/^ {2}issues:\s*write/m);
+  });
 });
