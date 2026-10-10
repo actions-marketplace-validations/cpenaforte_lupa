@@ -1,7 +1,7 @@
 import os from "node:os";
 import { execFile } from "node:child_process";
-import { writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { join, resolve as resolvePath } from "node:path";
 import type { Finding } from "./fastpath.js";
 import type { PrMeta } from "./diff.js";
 
@@ -31,6 +31,7 @@ export function resolveJobs(): number {
 /**
  * Token → `ci` (diff-aware via SEMGREP_BASELINE_COMMIT env, which must be the merge-base).
  * No token → `scan` with `--baseline-commit`; `ci` is never claimed diff-aware without a token.
+ * Both branches pass `--sarif` so stdout is SARIF.
  */
 export function semgrepArgv(o: { baselineSha: string; jobs: number; hasToken: boolean }): {
   argv: string[];
@@ -38,18 +39,29 @@ export function semgrepArgv(o: { baselineSha: string; jobs: number; hasToken: bo
 } {
   if (o.hasToken) {
     return {
-      argv: ["ci", "--metrics=off", "--jobs", String(o.jobs)],
+      argv: ["ci", "--sarif", "--metrics=off", "--jobs", String(o.jobs)],
       env: { SEMGREP_BASELINE_COMMIT: o.baselineSha },
     };
   }
   return {
-    argv: ["scan", "--config", "auto", "--metrics=off", "--jobs", String(o.jobs), "--baseline-commit", o.baselineSha],
+    argv: [
+      "scan",
+      "--config",
+      "auto",
+      "--sarif",
+      "--metrics=off",
+      "--jobs",
+      String(o.jobs),
+      "--baseline-commit",
+      o.baselineSha,
+    ],
     env: {},
   };
 }
 
-export function gitleaksArgv(dir: string): string[] {
-  return ["dir", dir, "--report-format", "sarif"];
+/** gitleaks writes SARIF to a file (`--report-path`), not to stdout. */
+export function gitleaksArgv(dir: string, reportPath: string): string[] {
+  return ["dir", dir, "--report-format", "sarif", "--report-path", reportPath];
 }
 
 export function trivyArgv(target: string): string[] {
@@ -93,69 +105,132 @@ export function shouldUploadSarif(o: {
   return o.isSameRepo && o.hasPermission && o.codeScanningEnabled;
 }
 
-// ---- execution -----------------------------------------------------------
+// ---- parsing -------------------------------------------------------------
 
-interface RunResult {
-  ok: boolean; // binary found and ran (exit code is ignored: scanners exit 1 on findings)
-  stdout: string;
-  error?: string;
+type Obj = Record<string, unknown>;
+
+function isObj(v: unknown): v is Obj {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
 }
 
-function run(file: string, args: string[], cwd: string, env?: NodeJS.ProcessEnv): Promise<RunResult> {
-  return new Promise((resolve) => {
-    execFile(file, args, { cwd, env: { ...process.env, ...env }, maxBuffer: MAX_BUFFER }, (err, stdout) => {
-      if (!err) return resolve({ ok: true, stdout: String(stdout) });
-      const e = err as NodeJS.ErrnoException & { stdout?: string | Buffer };
-      if (e.code === "ENOENT") return resolve({ ok: false, stdout: "", error: `${file} not found` });
-      // Non-zero exit (e.g. findings present): keep stdout, which may hold SARIF.
-      resolve({ ok: true, stdout: e.stdout ? String(e.stdout) : "", error: e.message });
-    });
-  });
+function firstPhysicalLocation(locations: unknown): { file: string; line?: number } {
+  if (!Array.isArray(locations) || !isObj(locations[0])) return { file: "" };
+  const phys = locations[0].physicalLocation;
+  if (!isObj(phys)) return { file: "" };
+  const art = isObj(phys.artifactLocation) ? phys.artifactLocation : undefined;
+  const region = isObj(phys.region) ? phys.region : undefined;
+  const file = typeof art?.uri === "string" ? art.uri : "";
+  const line = typeof region?.startLine === "number" ? region.startLine : undefined;
+  return { file, line };
 }
 
-function dockerArgs(dir: string, image: string, digest: string, args: string[]): string[] {
-  return ["run", "--rm", "-v", `${dir}:/src`, "-w", "/src", `${image}@${digest}`, ...args];
+/** SARIF 2.1.0 level → severity. A missing level defaults to "warning" per the spec. */
+function severityOf(level: unknown): Finding["severity"] {
+  if (level === undefined) return "warning";
+  if (level === "error") return "high";
+  if (level === "note" || level === "none") return "info";
+  return "warning";
 }
 
-function warning(rule: string, message: string): Finding {
-  return { severity: "warning", file: "", rule, message };
-}
-
-/** Convert a SARIF 2.1.0 log to Findings. Unparseable input yields [] (caller decides). */
-export function sarifToFindings(sarif: string, tool: string): Finding[] {
+/**
+ * Parse a SARIF 2.1.0 log into Findings. Returns `undefined` when the text is not
+ * a SARIF log (invalid JSON or no `runs` array) so the caller can fail loudly.
+ * Malformed runs/results/locations are skipped, never thrown on.
+ */
+export function parseSarif(text: string): Finding[] | undefined {
   let log: unknown;
   try {
-    log = JSON.parse(sarif);
+    log = JSON.parse(text);
   } catch {
-    return [];
+    return undefined;
   }
+  if (!isObj(log) || !Array.isArray(log.runs)) return undefined;
+
   const out: Finding[] = [];
-  const runs = (log as { runs?: unknown[] })?.runs;
-  if (!Array.isArray(runs)) return out;
-  for (const r of runs as Array<{ results?: unknown[] }>) {
-    for (const res of (r.results ?? []) as Array<Record<string, unknown>>) {
-      const level = res.level as string | undefined;
-      const loc = (res.locations as Array<Record<string, any>> | undefined)?.[0]?.physicalLocation;
-      const file: string = loc?.artifactLocation?.uri ?? "";
-      const line: number | undefined = loc?.region?.startLine;
-      const message = (res.message as { text?: string } | undefined)?.text ?? `${tool} finding`;
+  for (const run of log.runs) {
+    if (!isObj(run) || !Array.isArray(run.results)) continue;
+    for (const res of run.results) {
+      if (!isObj(res)) continue;
+      const { file, line } = firstPhysicalLocation(res.locations);
+      const msg = isObj(res.message) ? res.message.text : undefined;
       out.push({
-        severity: level === "error" ? "high" : level === "warning" ? "warning" : "info",
+        severity: severityOf(res.level),
         file,
         line,
-        rule: String(res.ruleId ?? tool),
-        message,
+        rule: typeof res.ruleId === "string" ? res.ruleId : "unknown",
+        message: typeof msg === "string" ? msg : "scanner finding",
       });
     }
   }
   return out;
 }
 
+// ---- execution -----------------------------------------------------------
+
+interface Exec {
+  missing: boolean; // ENOENT: binary not on PATH
+  code: number | null; // 0 on success; numeric exit code otherwise (null if killed by signal)
+  stdout: string;
+}
+
+function run(file: string, args: string[], cwd: string, env?: NodeJS.ProcessEnv): Promise<Exec> {
+  return new Promise((resolve) => {
+    execFile(file, args, { cwd, env: { ...process.env, ...env }, maxBuffer: MAX_BUFFER }, (err, stdout) => {
+      if (!err) return resolve({ missing: false, code: 0, stdout: String(stdout) });
+      const e = err as NodeJS.ErrnoException;
+      if (e.code === "ENOENT") return resolve({ missing: true, code: null, stdout: "" });
+      // Non-zero exit (scanners exit 1 when findings exist): keep stdout, which may hold SARIF.
+      const code = typeof e.code === "number" ? e.code : null;
+      resolve({ missing: false, code, stdout: stdout ? String(stdout) : "" });
+    });
+  });
+}
+
+function warning(rule: string, message: string): Finding {
+  return { severity: "warning", file: "", rule, message };
+}
+
 /**
- * Runs the L1 scanners. Never throws: a missing binary, or a scanner that
- * produces nothing parseable, becomes a warning finding.
- * Optional: `hasSemgrepToken`, `jobs`, `sbom` (default false), `lockfiles` (OSV targets).
- * Semgrep runs from the PyPI binary; trivy/osv/gitleaks run from digest-pinned images.
+ * Interpret a scanner whose SARIF arrives on stdout. Fail-open: a non-zero exit (or
+ * any exit) with empty/unparseable stdout is a `scanner-failed` warning, never a clean pass.
+ */
+function fromStdout(tool: string, label: string, r: Exec): Finding[] {
+  if (r.missing) return [warning("scanner-missing", `${label} unavailable: ${tool} not found`)];
+  const parsed = r.stdout.trim() ? parseSarif(r.stdout) : undefined;
+  if (!parsed) {
+    return [warning("scanner-failed", `${label} exited ${r.code ?? "abnormally"} without parseable SARIF`)];
+  }
+  return parsed;
+}
+
+/**
+ * Docker invocation for digest-pinned images. `extraMounts` are `host:container` pairs.
+ * Known limitation: a `:` in `dir` breaks the `-v` volume argument. The docker path is
+ * not used on Windows runners in v1.
+ */
+function dockerArgs(
+  dir: string,
+  image: string,
+  digest: string,
+  args: string[],
+  extraMounts: string[] = [],
+): string[] {
+  const mounts = [`${dir}:/src`, ...extraMounts].flatMap((m) => ["-v", m]);
+  return ["run", "--rm", ...mounts, "-w", "/src", `${image}@${digest}`, ...args];
+}
+
+export interface ScannerResult {
+  findings: Finding[];
+  /** Path of the CycloneDX SBOM when `sbom` was requested and generated. */
+  sbomPath?: string;
+}
+
+/**
+ * Runs the L1 scanners. Never throws: a missing binary becomes `scanner-missing`,
+ * an unusable scanner result becomes `scanner-failed` (fail-open warning).
+ * Optional: `hasSemgrepToken`, `jobs`, `sbom` (default false), `lockfiles` (OSV targets),
+ * `outDir` (where the SBOM is written; defaults to `os.tmpdir()`).
+ * Semgrep runs the PyPI binary; trivy/osv/gitleaks run from digest-pinned docker images.
  */
 export async function runScanners(o: {
   dir: string;
@@ -164,56 +239,89 @@ export async function runScanners(o: {
   jobs?: number;
   sbom?: boolean;
   lockfiles?: string[];
-}): Promise<Finding[]> {
+  outDir?: string;
+}): Promise<ScannerResult> {
   const findings: Finding[] = [];
   const jobs = o.jobs ?? resolveJobs();
+  const dir = resolvePath(o.dir);
 
   // semgrep (binary, not docker)
   const sg = semgrepArgv({ baselineSha: o.baselineSha, jobs, hasToken: !!o.hasSemgrepToken });
-  const sgRes = await run("semgrep", sg.argv, o.dir, sg.env);
-  if (!sgRes.ok) findings.push(warning("scanner-missing", `semgrep unavailable: ${sgRes.error}`));
-  else findings.push(...sarifToFindingsOrWarn(sgRes.stdout, "semgrep"));
+  findings.push(...fromStdout("semgrep", "semgrep", await run("semgrep", sg.argv, dir, sg.env)));
 
   // trivy (docker image pinned by digest)
-  const tv = await run("docker", dockerArgs(o.dir, TRIVY_IMAGE, TRIVY_DIGEST, trivyArgv(".")), o.dir);
-  if (!tv.ok) findings.push(warning("scanner-missing", `trivy unavailable: ${tv.error}`));
-  else findings.push(...sarifToFindingsOrWarn(tv.stdout, "trivy"));
+  const tv = await run("docker", dockerArgs(dir, TRIVY_IMAGE, TRIVY_DIGEST, trivyArgv(".")), dir);
+  findings.push(...fromStdout("docker", "trivy", tv));
 
-  // gitleaks (docker image pinned by digest)
-  const gl = await run("docker", dockerArgs(o.dir, GITLEAKS_IMAGE, GITLEAKS_DIGEST, gitleaksArgv("/src")), o.dir);
-  if (!gl.ok) findings.push(warning("scanner-missing", `gitleaks unavailable: ${gl.error}`));
-  else findings.push(...sarifToFindingsOrWarn(gl.stdout, "gitleaks"));
+  // gitleaks (docker image pinned by digest; SARIF goes to a report file in a temp dir)
+  findings.push(...(await runGitleaks(dir)));
 
   // osv-scanner (docker image pinned by digest), one run per lockfile
   for (const lock of o.lockfiles ?? []) {
-    const osv = await run("docker", dockerArgs(o.dir, OSV_IMAGE, OSV_DIGEST, osvArgv(lock)), o.dir);
-    if (!osv.ok) findings.push(warning("scanner-missing", `osv-scanner unavailable: ${osv.error}`));
-    else findings.push(...sarifToFindingsOrWarn(osv.stdout, "osv-scanner"));
+    const osv = await run("docker", dockerArgs(dir, OSV_IMAGE, OSV_DIGEST, osvArgv(lock)), dir);
+    findings.push(...fromStdout("docker", `osv-scanner (${lock})`, osv));
   }
 
-  // SBOM (trivy fs --format cyclonedx), written next to the checkout
+  // SBOM (trivy fs --format cyclonedx), written to outDir
+  let sbomPath: string | undefined;
   if (o.sbom) {
-    const sb = await run("docker", dockerArgs(o.dir, TRIVY_IMAGE, TRIVY_DIGEST, sbomArgv(".")), o.dir);
-    if (!sb.ok) findings.push(warning("scanner-missing", `sbom unavailable: ${sb.error}`));
-    else if (sb.stdout.trim()) {
-      const out = join(o.dir, "sbom.cdx.json");
+    const sb = await run("docker", dockerArgs(dir, TRIVY_IMAGE, TRIVY_DIGEST, sbomArgv(".")), dir);
+    if (sb.missing) {
+      findings.push(warning("scanner-missing", "sbom unavailable: docker not found"));
+    } else if (sb.code !== 0 || !isJson(sb.stdout)) {
+      findings.push(warning("scanner-failed", `sbom exited ${sb.code ?? "abnormally"} without a CycloneDX document`));
+    } else {
+      const out = join(o.outDir ?? os.tmpdir(), "sbom.cdx.json");
       try {
         await writeFile(out, sb.stdout, "utf8");
-        findings.push({ severity: "info", file: "sbom.cdx.json", rule: "sbom", message: "CycloneDX SBOM generated" });
+        sbomPath = out;
       } catch (e) {
         findings.push(warning("sbom-write", `could not write SBOM: ${(e as Error).message}`));
       }
     }
   }
 
-  return findings;
+  return { findings, sbomPath };
 }
 
-function sarifToFindingsOrWarn(stdout: string, tool: string): Finding[] {
-  if (!stdout.trim()) return [];
-  const parsed = sarifToFindings(stdout, tool);
-  if (parsed.length === 0 && !stdout.includes('"runs"')) {
-    return [warning("scanner-output", `${tool} produced no parseable SARIF`)];
+function isJson(text: string): boolean {
+  try {
+    JSON.parse(text);
+    return true;
+  } catch {
+    return false;
   }
-  return parsed;
+}
+
+/**
+ * gitleaks writes its SARIF report to a file. The report lives in a temp dir mounted at
+ * /out inside the container and is removed afterwards (best-effort). gitleaks exits 0
+ * when clean and may not create the report; exit 0 with no report is therefore clean.
+ */
+async function runGitleaks(dir: string): Promise<Finding[]> {
+  const reportDir = await mkdtemp(join(os.tmpdir(), "gitleaks-"));
+  const hostReport = join(reportDir, "report.sarif");
+  try {
+    const gl = await run(
+      "docker",
+      dockerArgs(dir, GITLEAKS_IMAGE, GITLEAKS_DIGEST, gitleaksArgv("/src", "/out/report.sarif"), [
+        `${reportDir}:/out`,
+      ]),
+      dir,
+    );
+    if (gl.missing) return [warning("scanner-missing", "gitleaks unavailable: docker not found")];
+    let text: string | undefined;
+    try {
+      text = await readFile(hostReport, "utf8");
+    } catch {
+      text = undefined;
+    }
+    if (text === undefined) {
+      return gl.code === 0 ? [] : [warning("scanner-failed", `gitleaks exited ${gl.code ?? "abnormally"} with no report`)];
+    }
+    const parsed = parseSarif(text);
+    return parsed ?? [warning("scanner-failed", "gitleaks report is not parseable SARIF")];
+  } finally {
+    await rm(reportDir, { recursive: true, force: true }).catch(() => undefined);
+  }
 }
