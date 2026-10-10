@@ -48,7 +48,6 @@ jobs:
     runs-on: ubuntu-latest
     env:
       PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number || inputs.pr_number }}
-      OUT_DIR: ${{ runner.temp }}/pr-reviewer-out
     steps:
       - name: Checkout (full history, no persisted credentials)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -93,6 +92,7 @@ jobs:
 
       - name: Write diff (base...head, never the runner HEAD)
         env:
+          OUT_DIR: ${{ runner.temp }}/pr-reviewer-out
           BASE_SHA: ${{ steps.shas.outputs.base_sha }}
           HEAD_SHA: ${{ steps.shas.outputs.head_sha }}
         run: |

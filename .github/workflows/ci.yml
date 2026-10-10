@@ -52,6 +52,29 @@ jobs:
       - name: Committed dist matches the build
         run: git diff --exit-code -- dist/index.js
 
+  actionlint:
+    name: actionlint (workflows and templates)
+    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (no persisted credentials)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download actionlint v1.7.12 and verify its sha256
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          curl -fsSL -o actionlint.tar.gz https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz
+          echo "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  actionlint.tar.gz" | sha256sum -c -
+          tar -xzf actionlint.tar.gz actionlint
+
+      - name: Lint ci.yml and both templates
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/actionlint" .github/workflows/ci.yml docs/workflow-template.yml docs/workflow-template-privileged.yml
+
   smoke:
     name: "smoke on ${{ matrix.os }}"
     needs: build
@@ -107,8 +130,6 @@ jobs:
       contents: read
       pull-requests: read
       security-events: write
-    env:
-      PR_REVIEWER_ARTIFACT_DIR: ${{ runner.temp }}/pr-reviewer-out
     steps:
       - name: Checkout (no persisted credentials)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -117,6 +138,8 @@ jobs:
 
       - name: Run the action (dry-run, no comment)
         uses: ./
+        env:
+          PR_REVIEWER_ARTIFACT_DIR: ${{ runner.temp }}/pr-reviewer-out
         with:
           post_comment: "false"
           fail_level: none

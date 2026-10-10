@@ -29,6 +29,19 @@ function jobKeys(c: string): string[] {
   return [...jobs.matchAll(/^  ([A-Za-z0-9_-]+):\s*$/gm)].map((m) => m[1]);
 }
 
+/** Lines of every job-level `env:` block (exactly four spaces of indent) in a workflow file. */
+function jobEnvBlocks(text: string): string[] {
+  const lines = text.split("\n");
+  const blocks: string[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (!/^    env:\s*$/.test(lines[i])) continue;
+    const body: string[] = [];
+    for (let j = i + 1; j < lines.length && (lines[j].trim() === "" || /^ {6,}/.test(lines[j])); j++) body.push(lines[j]);
+    blocks.push(body.join("\n"));
+  }
+  return blocks;
+}
+
 /** Every .ts file under a directory, recursively. */
 function tsFiles(dir: string): string[] {
   return fs.readdirSync(dir, { withFileTypes: true }).flatMap((e) => {
@@ -90,6 +103,7 @@ describe("ci workflow", () => {
     const c = fs.readFileSync(CI, "utf8");
     const expected: Record<string, number> = {
       build: 20,
+      actionlint: 10,
       smoke: 30,
       "no-secret-smoke": 20,
       sarif: 20,
@@ -137,7 +151,25 @@ describe("ci workflow", () => {
     expect(a).toMatch(/^branding:\s*\n\s*icon:\s*"git-pull-request"\s*\n\s*color:\s*"blue"\s*$/m);
   });
 
-  it("release docs: immutable tag, SHA substitution in both templates, v1 move, canary, marketplace, in that order", () => {
+  it("no job-level env uses the runner context (not allowed there by actionlint)", () => {
+    for (const f of [CI, "docs/workflow-template.yml", "docs/workflow-template-privileged.yml"]) {
+      for (const block of jobEnvBlocks(fs.readFileSync(f, "utf8"))) {
+        expect(block, `runner. in job-level env of ${f}`).not.toMatch(/\$\{\{\s*runner\./);
+      }
+    }
+  });
+
+  it("actionlint job downloads v1.7.12, verifies the sha256, and lints ci.yml and both templates", () => {
+    const c = fs.readFileSync(CI, "utf8");
+    const job = jobBlock(c, "actionlint");
+    expect(job).toContain("https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz");
+    expect(job).toContain("8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8");
+    expect(job).toContain("sha256sum -c");
+    expect(job).toContain(".github/workflows/ci.yml docs/workflow-template.yml docs/workflow-template-privileged.yml");
+    expect(job).toContain("runs-on: ubuntu-latest");
+  });
+
+  it("release docs: tag, canary on the tag, substitution, v1 move, marketplace, in that order, no rollback", () => {
     const d = fs.readFileSync("docs/e2e-checklist.md", "utf8");
     expect(d).toContain("git tag -a v0.1.0");
     expect(d).toContain("v1");
@@ -146,8 +178,9 @@ describe("ci workflow", () => {
     expect(d).toMatch(/marketplace/i);
     expect(d).toContain("docs/workflow-template.yml docs/workflow-template-privileged.yml");
     expect(d).toMatch(/never copy them from the v0\.1\.0 tag/i);
+    expect(d).not.toMatch(/roll ?back/i);
     const release = d.slice(d.indexOf("## Release procedure")).toLowerCase();
-    const order = ["git tag -a v0.1.0", "rev-parse", "docs/workflow-template-privileged.yml", "git tag -f v1", "canary", "marketplace"];
+    const order = ["git tag -a v0.1.0", "canary", "rev-parse", "docs/workflow-template-privileged.yml", "git tag -f v1", "marketplace"];
     const idx = order.map((s) => release.indexOf(s));
     for (const i of idx) expect(i).toBeGreaterThan(-1);
     expect([...idx].sort((a, b) => a - b)).toEqual(idx);

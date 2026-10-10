@@ -63,31 +63,30 @@ checks `src/`, `.github/workflows/ci.yml` and `action.yml` for placeholders):
 grep -cE '^export const (TRIVY|OSV|GITLEAKS)_DIGEST = "sha256:[0-9a-f]{64}";' src/scanners.ts   # must print 3
 ```
 
-Release order (strict):
+Release order (strict; `v1` moves exactly once, as the last tag move):
 
-1. **Release commit R** on `main`. CI is green (`build`, `smoke`, `no-secret-smoke`, `ollama`,
-   `guards`), and `dist/index.js` matches the build. Branding is already declared in `action.yml`
-   (`branding:` icon `git-pull-request`, color `blue`).
-2. **Immutable tag.** Create an annotated tag on R and push it. The tag is never moved:
+1. **Release commit** on `main`. CI is green (`build`, `actionlint`, `smoke`, `no-secret-smoke`,
+   `ollama`, `guards`), and `dist/index.js` matches the build. Branding is already declared in
+   `action.yml` (`branding:` icon `git-pull-request`, color `blue`).
+2. **Immutable tag.** Create an annotated tag on the release commit and push it. The tag is never moved:
 
    ```bash
-   git tag -a v0.1.0 -m "pr-reviewer v0.1.0" R
+   git tag -a v0.1.0 -m "pr-reviewer v0.1.0"
    git push origin v0.1.0
    ```
 
-3. **Get the SHA.** Never type a SHA by hand:
+3. **Canary on the tag.** In the consumer test repository, pin the workflow to
+   `OWNER/pr-reviewer@v0.1.0` and run every case above, including live Ollama. All must pass. Do not
+   touch `v0.1.0`. If a case fails, fix on `main`, cut a new tag (`v0.1.1`), and restart from step 2.
+   `v1` has not moved yet, so nothing consumes the failed release.
+4. **Substitute the tag's commit SHA into BOTH templates**, then commit on `main` (follow-up commit C).
+   Get the SHA from the tag, never type it by hand. The first `sed` replaces the placeholder with the
+   owner and the SHA; the second drops the stale `# replace with a released SHA` comment. Replace
+   `OWNER` with the real owner login before running:
 
    ```bash
    SHA=$(git rev-parse "v0.1.0^{commit}")
-   echo "$SHA"   # 40 hex; the pin consumers use
-   ```
-
-4. **Substitute the placeholder in BOTH templates**, then commit on `main` (a follow-up commit C,
-   not R). The first `sed` replaces the placeholder with the owner and the SHA; the second drops the
-   stale `# replace with a released SHA` instruction comment. Replace `OWNER` with the real owner
-   login before running:
-
-   ```bash
+   echo "$SHA"   # 40 hex
    OWNER=your-login
    sed -i "s#OWNER/pr-reviewer@0000000000000000000000000000000000000000#$OWNER/pr-reviewer@$SHA#" docs/workflow-template.yml docs/workflow-template-privileged.yml
    sed -i 's/ # replace with a released SHA$//' docs/workflow-template.yml docs/workflow-template-privileged.yml
@@ -98,20 +97,15 @@ Release order (strict):
    git push origin main
    ```
 
-5. **Move the floating major tag `v1`** to the same commit R as `v0.1.0` (not to C):
+5. **Move the floating major tag `v1`** to that commit C on `main` (the one that pins the templates).
+   The action code at C is identical to the tag's, because the commit only changes docs. Check it:
 
    ```bash
-   git tag -f v1 "$SHA"
+   git diff --quiet v0.1.0 HEAD -- action.yml dist src   # must exit 0
+   git tag -f v1 HEAD   # HEAD is C
    git push --force origin v1
    ```
 
-   If the canary in step 6 fails, roll back by moving `v1` to the previous good release, then fix
-   on `main` and cut `v0.1.1`.
-
-6. **Canary.** In the consumer test repository, pin the workflow to `OWNER/pr-reviewer@$SHA` and run
-   every case above, including live Ollama. All must pass. Do not touch `v0.1.0`.
-
-7. **Marketplace.** Only after the canary is green, on the GitHub release for `v0.1.0`, tick
-   "Publish this Action to the GitHub Marketplace". Check the listing copy against `action.yml`
-   (`name: "PR Reviewer"`, the `description` field, the inputs and outputs, and the `branding:` block
-   from step 1).
+6. **Marketplace.** On the GitHub release for `v0.1.0`, tick "Publish this Action to the GitHub
+   Marketplace". Check the listing copy against `action.yml` (`name: "PR Reviewer"`, the `description`
+   field, the inputs and outputs, and the `branding:` block from step 1).
