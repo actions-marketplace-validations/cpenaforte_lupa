@@ -1,0 +1,153 @@
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { callResponses } from "../src/adapters/responses.js";
+import { PR_REVIEW_SCHEMA } from "../src/prompt.js";
+import type { ResolvedEndpoint } from "../src/providers.js";
+
+// ---------- helpers ----------
+
+type Call = { url: string; init: RequestInit };
+let calls: Call[] = [];
+
+function stubFetch(h: (c: Call, n: number) => Promise<Response> | Response): void {
+  calls = [];
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (url: string | URL, init: RequestInit = {}) => {
+      const c = { url: String(url), init };
+      calls.push(c);
+      return h(c, calls.length);
+    }),
+  );
+}
+
+const json = (status: number, body: unknown, headers: Record<string, string> = {}): Response =>
+  new Response(JSON.stringify(body), {
+    status,
+    headers: { "content-type": "application/json", ...headers },
+  });
+
+/** Minimal completed Responses-API envelope carrying one output_text part. */
+const okResponses = (text: string, extra: Record<string, unknown> = {}) => ({
+  status: "completed",
+  output: [{ type: "message", content: [{ type: "output_text", text }] }],
+  ...extra,
+});
+
+function lastBody(): any {
+  return JSON.parse(String(calls.at(-1)!.init.body));
+}
+
+/** Endpoint mirroring resolveEndpoint for the responses path. */
+function fakeResponsesEp(key = "k"): ResolvedEndpoint {
+  return {
+    baseUrl: "https://opencode.ai/zen/v1",
+    path: "/responses",
+    headers: { Authorization: `Bearer ${key}`, "User-Agent": "pr-reviewer/1.0" },
+  };
+}
+
+function msgs(): { system: string; user: string } {
+  return { system: "s", user: '{"findings":[]}' };
+}
+
+function opts() {
+  return { model: "gpt-6-luna", apiKey: "k", maxTokens: 50, timeoutSeconds: 5 };
+}
+
+beforeEach(() => {
+  calls = [];
+  stubFetch(() => json(200, okResponses('{"findings":[]}')));
+});
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+  vi.restoreAllMocks();
+});
+
+// ---------- tests ----------
+
+describe("callResponses", () => {
+  it("posts input array + max_output_tokens + strict format", async () => {
+    const r = await callResponses(fakeResponsesEp(), msgs(), opts());
+    expect(r).toEqual({ ok: true, findings: [] });
+    expect(calls.at(-1)!.url).toBe("https://opencode.ai/zen/v1/responses");
+    const body = lastBody();
+    expect(body.model).toBe("gpt-6-luna");
+    expect(body.input).toEqual([
+      { role: "system", content: "s" },
+      { role: "user", content: '{"findings":[]}' },
+    ]);
+    expect(body.max_output_tokens).toBe(50);
+    expect(body.text).toEqual({
+      format: {
+        type: "json_schema",
+        name: "pr_review",
+        schema: PR_REVIEW_SCHEMA.schema,
+        strict: true,
+      },
+    });
+    expect(body.temperature).toBeUndefined();
+    expect(body.top_p).toBeUndefined();
+  });
+
+  it("falls back without format on 400", async () => {
+    stubFetch((_c, n) =>
+      n === 1 ? json(400, { error: "unsupported format" }) : json(200, okResponses('{"findings":[]}')),
+    );
+    const r = await callResponses(fakeResponsesEp(), msgs(), opts());
+    expect(r).toEqual({ ok: true, findings: [] });
+    expect(calls.length).toBe(2);
+    expect(JSON.parse(String(calls[0]!.init.body)).text).toBeDefined();
+    expect(JSON.parse(String(calls[1]!.init.body))).not.toHaveProperty("text");
+  });
+
+  it("joins output_text parts and parses findings", async () => {
+    stubFetch(() =>
+      json(200, {
+        status: "completed",
+        output: [
+          { type: "message", content: [{ type: "output_text", text: '{"findings":[' }] },
+          { type: "message", content: [{ type: "text", text: "]}" }] },
+        ],
+      }),
+    );
+    expect(await callResponses(fakeResponsesEp(), msgs(), opts())).toEqual({ ok: true, findings: [] });
+  });
+
+  it("refusal item → content-filter skip; incomplete → degrade", async () => {
+    stubFetch(() =>
+      json(200, {
+        status: "completed",
+        output: [{ type: "message", content: [{ type: "refusal", refusal: "sorry" }] }],
+      }),
+    );
+    expect(await callResponses(fakeResponsesEp(), msgs(), opts())).toMatchObject({
+      ok: false,
+      reason: "content-filter",
+    });
+    stubFetch(() =>
+      json(200, {
+        status: "incomplete",
+        incomplete_details: { reason: "max_output_tokens" },
+        output: [{ type: "message", content: [{ type: "output_text", text: '{"findings":[]}' }] }],
+      }),
+    );
+    expect(await callResponses(fakeResponsesEp(), msgs(), opts())).toMatchObject({
+      ok: false,
+      reason: "invalid-json",
+    });
+  });
+
+  it("reasoning model maps max_completion_tokens→max_output_tokens", async () => {
+    await callResponses(fakeResponsesEp(), msgs(), { ...opts(), model: "gpt-6-luna" });
+    const body = lastBody();
+    expect(body.max_output_tokens).toBe(50);
+    expect(body.max_completion_tokens).toBeUndefined();
+    expect(body.max_tokens).toBeUndefined();
+    await callResponses(fakeResponsesEp(), msgs(), { ...opts(), model: "deepseek-v4.1-flash" });
+    const body2 = lastBody();
+    expect(body2.max_output_tokens).toBe(50);
+    expect(body2.max_completion_tokens).toBeUndefined();
+    expect(body2.max_tokens).toBeUndefined();
+  });
+});

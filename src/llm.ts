@@ -15,7 +15,7 @@ const FULL_SCHEMA_PROVIDERS: ReadonlySet<string> = new Set(["openai", "opencode-
 const REQUEST_TIMEOUT_HEALTH_MS = 10_000;
 const RETRY_BACKOFF_MS = 500;
 const MAX_RETRY_AFTER_MS = 5_000;
-const SNIPPET_CHARS = 200;
+export const SNIPPET_CHARS = 200;
 
 export type LlmResult =
   | { ok: true; findings: Finding[] }
@@ -27,7 +27,7 @@ export type LlmResult =
 
 type ResponseFormat = { type: "json_schema"; json_schema: typeof PR_REVIEW_SCHEMA } | { type: "json_object" };
 
-function errMessage(e: unknown): string {
+export function errMessage(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
 
@@ -112,7 +112,7 @@ const SEVERITIES: ReadonlySet<unknown> = new Set(["info", "warning", "high"]);
  * Returns undefined when the response is invalid. Line is coerced rather than
  * rejected: only an integer >= 1 is kept, anything else becomes undefined.
  */
-function toFindings(v: unknown): Finding[] | undefined {
+export function toFindings(v: unknown): Finding[] | undefined {
   if (typeof v !== "object" || v === null || Array.isArray(v)) return undefined;
   const list = (v as { findings?: unknown }).findings;
   if (!Array.isArray(list)) return undefined;
@@ -144,7 +144,7 @@ function responseFormatFor(provider: string): ResponseFormat | undefined {
 
 // Requires a non-empty key: callLlm's early no-key return guarantees it, and ensureOllama guards
 // empty keys in its scrub wrapper, so split("") never runs.
-function redact(text: string, key: string): string {
+export function redact(text: string, key: string): string {
   return text.split(key).join("[REDACTED]");
 }
 
@@ -152,7 +152,7 @@ function redact(text: string, key: string): string {
  * Missing, empty, whitespace-only, non-numeric, or negative Retry-After falls back to the backoff.
  * Values above the cap are clamped to MAX_RETRY_AFTER_MS.
  */
-function retryDelayMs(raw: string | null): number {
+export function retryDelayMs(raw: string | null): number {
   const trimmed = raw?.trim() ?? "";
   if (trimmed === "") return RETRY_BACKOFF_MS;
   const secs = Number(trimmed);
@@ -160,9 +160,9 @@ function retryDelayMs(raw: string | null): number {
   return Math.min(secs * 1000, MAX_RETRY_AFTER_MS);
 }
 
-const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+export const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
-type Attempt =
+export type Attempt =
   | { kind: "fail"; result: LlmResult }
   | { kind: "response"; status: number; ok: boolean; retryAfter: string | null; text: string };
 
@@ -170,7 +170,7 @@ type Attempt =
  * One HTTP attempt. The abort timer covers the headers AND the body read, and is
  * cleared only after the body is fully read.
  */
-async function attempt(ep: ResolvedEndpoint, payload: string, o: { timeoutSeconds: number; apiKey: string }): Promise<Attempt> {
+export async function attempt(ep: ResolvedEndpoint, payload: string, o: { timeoutSeconds: number; apiKey: string }): Promise<Attempt> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), o.timeoutSeconds * 1000);
   try {
