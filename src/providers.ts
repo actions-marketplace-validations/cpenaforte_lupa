@@ -91,8 +91,20 @@ const V2_STYLES: ReadonlySet<string> = new Set<NonChatStyle>([
   "google-models",
 ]);
 
-/** Matches only when the path itself starts with a non-chat segment, e.g. "/messages". */
-const PATH_ONLY_NON_CHAT = /^\/(messages|responses|models)(?=\/|$|\?)/;
+/** Last path segments that identify a non-chat endpoint (path-only misuse). */
+const NON_CHAT_PATH_SEGMENTS: ReadonlySet<string> = new Set(["messages", "responses", "models"]);
+
+/**
+ * True iff the path starts with "/" and its last segment (ignoring query and
+ * trailing slashes) is exactly messages, responses, or models.
+ * `/v1/messages` → true; `/openai/models/chat/completions` → false.
+ */
+function isPathOnlyNonChat(path: string): boolean {
+  if (!path.startsWith("/")) return false;
+  const pathname = path.split("?")[0].replace(/\/+$/, "");
+  const last = pathname.slice(pathname.lastIndexOf("/") + 1);
+  return NON_CHAT_PATH_SEGMENTS.has(last);
+}
 
 export interface ResolveEndpointOptions {
   llmProvider: ActionInputs["llmProvider"];
@@ -132,13 +144,15 @@ export function resolveEndpoint(o: ResolveEndpointOptions): ResolvedEndpoint {
     throw new Error(`llm_api_style "custom-path" requires llm_path`);
   }
 
-  const path = o.llmPath !== "" ? o.llmPath : CHAT_PATH;
-  if (PATH_ONLY_NON_CHAT.test(path)) {
+  const rawPath = o.llmPath !== "" ? o.llmPath : CHAT_PATH;
+  if (isPathOnlyNonChat(rawPath)) {
     throw new UnsupportedModelError(
-      `llm_path "${path}" is path-only: it names a non-chat endpoint. llm_path only overrides the path; ` +
+      `llm_path "${rawPath}" is path-only: it names a non-chat endpoint. llm_path only overrides the path; ` +
         `a non-chat body adapter requires a v2 llm_api_style, which is not supported in v1.`,
     );
   }
+  // Ensure baseUrl + path joins with exactly one "/".
+  const path = rawPath.startsWith("/") ? rawPath : `/${rawPath}`;
 
   const headers: Record<string, string> = {
     Authorization: `Bearer ${o.llmApiKey}`,
@@ -174,8 +188,12 @@ export async function validateModelExists(
       headers: { Authorization: `Bearer ${apiKey}`, "User-Agent": USER_AGENT },
       signal: controller.signal,
     });
-    if (res.status === 404) return false;
+    if (res.status === 404) {
+      await res.body?.cancel().catch(() => undefined);
+      return false;
+    }
     if (!res.ok) {
+      await res.body?.cancel().catch(() => undefined);
       throw new Error(`GET ${url} failed with HTTP ${res.status}`);
     }
     let body: unknown;

@@ -8,7 +8,7 @@ import {
 
 const base = { llmBaseUrl: "", llmApiStyle: "auto", llmPath: "", llmApiKey: "k", prNumber: 1 } as const;
 
-const ZEN_CHAT = ["deepseek-v4.1-flash","deepseek-v4-pro","deepseek-v4-flash","glm-5.3-flash","glm-5.3","glm-5.2","kimi-k3","kimi-k2.7-code","kimi-k2.6","minimax-m3","minimax-m2.7","mistral-large-4","qwen3.8-max","big-pickle","space-bunny-free","mimo-v2.6-flash-free"];
+const ZEN_CHAT = ["deepseek-v4.1-flash", "deepseek-v4-pro", "deepseek-v4-flash", "glm-5.3-flash", "glm-5.3", "glm-5.2", "kimi-k3", "kimi-k2.7-code", "kimi-k2.6", "minimax-m3", "minimax-m2.7", "mistral-large-4", "qwen3.8-max", "big-pickle", "space-bunny-free", "mimo-v2.6-flash-free"];
 const ZEN_NON_CHAT = ["gpt-6-luna", "gpt-6.1-sol", "gpt-6-astra", "grok-4.7", "grok-4.6", "claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5-5", "qwen3.7-max", "qwen3.7-plus", "gemini-3.8-flash", "gemini-3.5-flash-lite"];
 const GO_CHAT = ["glm-5.3-flash", "glm-5.3", "glm-5.2", "kimi-k3", "kimi-k2.7-code", "kimi-k2.6", "deepseek-v4-flash", "deepseek-v4-pro", "deepseek-v4.1-flash", "deepseek-v4-flash-vision-exp", "mimo-v2.6-flash", "mimo-v2.5", "mimo-v2.6-pro", "hy4-preview", "hy3", "longcat-2.0", "space-bunny"];
 const GO_NON_CHAT = ["grok-4.7", "grok-4.6", "gpt-6-luna", "gpt-5.6-luna", "gpt-6.1-sol", "gpt-6-astra", "muse-spark-1.3-contributor", "claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5-5", "minimax-m3", "minimax-m2.7", "qwen3.8-max", "qwen3.8-flash", "qwen3.7-max", "qwen3.7-plus", "gemini-3.8-flash", "gemini-3.5-flash-lite"];
@@ -146,12 +146,35 @@ describe("resolveEndpoint", () => {
     expect(r.path).toBe("/openai/models/chat/completions");
   });
 
-  it("path without leading slash does NOT throw path-only", () => {
-    expect(resolveEndpoint({ ...base, llmProvider: "openai", llmModel: "m", llmPath: "messages" }).path).toBe("messages");
+  it("path without leading slash does NOT throw path-only and joins with one slash", () => {
+    const r = resolveEndpoint({ ...base, llmProvider: "custom", llmBaseUrl: "https://x", llmModel: "m", llmPath: "messages" });
+    expect(r.path).toBe("/messages");
+    expect(r.baseUrl + r.path).toBe("https://x/messages");
   });
 
-  it.each(["/messages", "/responses", "/models", "/messages/x", "/models?x=1"])("path %s throws path-only", (p) => {
+  it("joins baseUrl and path with exactly one slash", () => {
+    const r = resolveEndpoint({ ...base, llmProvider: "custom", llmBaseUrl: "https://x/v1/", llmModel: "m", llmPath: "/chat/completions" });
+    expect(r.baseUrl + r.path).toBe("https://x/v1/chat/completions");
+  });
+
+  it("/v1/chat/completions resolves", () => {
+    expect(resolveEndpoint({ ...base, llmProvider: "custom", llmBaseUrl: "https://x", llmModel: "m", llmPath: "/v1/chat/completions" }).path).toBe("/v1/chat/completions");
+  });
+
+  it("/openai/models/chat/completions resolves (last segment is completions)", () => {
+    expect(resolveEndpoint({ ...base, llmProvider: "custom", llmBaseUrl: "https://x", llmModel: "m", llmPath: "/openai/models/chat/completions" }).path).toBe("/openai/models/chat/completions");
+  });
+
+  it("/v1/messages throws path-only (last segment)", () => {
+    expect(() => resolveEndpoint({ ...base, llmProvider: "custom", llmBaseUrl: "https://x", llmModel: "m", llmPath: "/v1/messages" })).toThrow(/path-only/);
+  });
+
+  it.each(["/messages", "/responses", "/models", "/v1/responses", "/models?x=1", "/v1/messages/", "/messages/?x=1"])("path %s throws path-only", (p) => {
     expect(() => resolveEndpoint({ ...base, llmProvider: "custom", llmBaseUrl: "https://x", llmModel: "m", llmPath: p })).toThrow(/path-only/);
+  });
+
+  it("/messages/x resolves (last segment is x)", () => {
+    expect(resolveEndpoint({ ...base, llmProvider: "custom", llmBaseUrl: "https://x", llmModel: "m", llmPath: "/messages/x" }).path).toBe("/messages/x");
   });
 });
 
@@ -176,6 +199,11 @@ describe("validateModelExists", () => {
 
   it("500 throws naming the status", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => new Response("boom", { status: 500 })));
+    await expect(validateModelExists("https://x", "m", "k")).rejects.toThrow(/500/);
+  });
+
+  it("500 with null body still throws naming the status", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(null, { status: 500 })));
     await expect(validateModelExists("https://x", "m", "k")).rejects.toThrow(/500/);
   });
 
