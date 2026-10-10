@@ -1,0 +1,185 @@
+# CI for pr-reviewer itself. Every third-party `uses:` is pinned by a full commit SHA (tests/ci.test.ts
+# enforces this). Only `uses: ./` (the action under test) is unpinned by design.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: build (npm ci, vitest, bundle)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (no persisted credentials)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node 24
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: npm ci
+        run: npm ci
+
+      - name: Unit tests (vitest run)
+        run: npx vitest run
+
+      - name: Build bundle
+        run: npm run build
+
+      - name: Syntax-check the bundle
+        run: |
+          set -euo pipefail
+          test -s dist/index.js
+          node --check dist/index.js
+
+      - name: Committed dist matches the build
+        run: git diff --exit-code -- dist/index.js
+
+  smoke:
+    name: "smoke on ${{ matrix.os }}"
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout (no persisted credentials)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run the action without an LLM key (dry-run, no comment)
+        uses: ./
+        with:
+          post_comment: "false"
+          fail_level: none
+          llm_api_key: ""
+
+  fork-sim:
+    name: fork simulation (no secrets, summary-only, no POST)
+    needs: build
+    runs-on: ubuntu-latest
+    # Deliberately no secrets: a fork PR has none. The action must not post; it writes the summary.
+    steps:
+      - name: Checkout (no persisted credentials)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run the action as a fork PR would (summary only)
+        uses: ./
+        with:
+          post_comment: "false"
+          fail_level: none
+          llm_api_key: ""
+
+      - name: Assert the summary was written
+        run: test -s "$GITHUB_STEP_SUMMARY"
+
+  sarif:
+    name: SARIF upload (same-repo PRs only)
+    needs: build
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      security-events: write
+    env:
+      PR_REVIEWER_ARTIFACT_DIR: ${{ runner.temp }}/pr-reviewer-out
+    steps:
+      - name: Checkout (no persisted credentials)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run the action (dry-run, no comment)
+        uses: ./
+        with:
+          post_comment: "false"
+          fail_level: none
+          llm_api_key: ""
+
+      - name: Upload SARIF
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
+        with:
+          sarif_file: ${{ runner.temp }}/pr-reviewer-out/sarif.json
+
+  ollama:
+    name: ollama (local server reachable, provider tests)
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (no persisted credentials)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node 24
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: npm ci
+        run: npm ci
+
+      - name: Install and start ollama
+        run: |
+          set -euo pipefail
+          curl -fsSL https://ollama.com/install.sh | sh
+          nohup ollama serve > "$RUNNER_TEMP/ollama.log" 2>&1 &
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:11434/api/version >/dev/null 2>&1; then exit 0; fi
+            sleep 2
+          done
+          cat "$RUNNER_TEMP/ollama.log" || true
+          exit 1
+
+      - name: Ollama provider tests
+        run: npx vitest run tests/llm.test.ts tests/providers.test.ts
+
+  guards:
+    name: guards (template and pin invariants)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (no persisted credentials)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node 24
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: npm ci
+        run: npm ci
+
+      - name: Template, CI and README invariants
+        run: npx vitest run tests/templates.test.ts tests/ci.test.ts tests/readme.test.ts
+
+      - name: No mutable action refs anywhere
+        run: |
+          set -euo pipefail
+          if grep -RInE 'uses:[[:space:]]*[^#[:space:]]+@(v[0-9]|main|master|latest)' .github docs; then
+            echo "mutable action ref found" >&2
+            exit 1
+          fi
