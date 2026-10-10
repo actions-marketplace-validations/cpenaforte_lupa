@@ -8,9 +8,15 @@ import {
 
 const base = { llmBaseUrl: "", llmApiStyle: "auto", llmPath: "", llmApiKey: "k", prNumber: 1 } as const;
 
+const ZEN_CHAT = ["deepseek-v4.1-flash","deepseek-v4-pro","deepseek-v4-flash","glm-5.3-flash","glm-5.3","glm-5.2","kimi-k3","kimi-k2.7-code","kimi-k2.6","minimax-m3","minimax-m2.7","mistral-large-4","qwen3.8-max","big-pickle","space-bunny-free","mimo-v2.6-flash-free"];
+const ZEN_NON_CHAT = ["gpt-6-luna", "gpt-6.1-sol", "gpt-6-astra", "grok-4.7", "grok-4.6", "claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5-5", "qwen3.7-max", "qwen3.7-plus", "gemini-3.8-flash", "gemini-3.5-flash-lite"];
+const GO_CHAT = ["glm-5.3-flash", "glm-5.3", "glm-5.2", "kimi-k3", "kimi-k2.7-code", "kimi-k2.6", "deepseek-v4-flash", "deepseek-v4-pro", "deepseek-v4.1-flash", "deepseek-v4-flash-vision-exp", "mimo-v2.6-flash", "mimo-v2.5", "mimo-v2.6-pro", "hy4-preview", "hy3", "longcat-2.0", "space-bunny"];
+const GO_NON_CHAT = ["grok-4.7", "grok-4.6", "gpt-6-luna", "gpt-5.6-luna", "gpt-6.1-sol", "gpt-6-astra", "muse-spark-1.3-contributor", "claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5-5", "minimax-m3", "minimax-m2.7", "qwen3.8-max", "qwen3.8-flash", "qwen3.7-max", "qwen3.7-plus", "gemini-3.8-flash", "gemini-3.5-flash-lite"];
+
 afterEach(() => {
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
+  vi.useRealTimers();
 });
 
 describe("resolveEndpoint", () => {
@@ -34,7 +40,7 @@ describe("resolveEndpoint", () => {
   });
 
   it("matrix: documented chat models resolve, non-chat fail-fast", () => {
-    for (const m of ["deepseek-v4.1-flash","deepseek-v4-pro","deepseek-v4-flash","glm-5.3-flash","glm-5.3","glm-5.2","kimi-k3","kimi-k2.7-code","kimi-k2.6","minimax-m3","minimax-m2.7","mistral-large-4","qwen3.8-max","big-pickle","space-bunny-free","mimo-v2.6-flash-free"]) {
+    for (const m of ZEN_CHAT) {
       expect(resolveEndpoint({ ...base, llmProvider: "opencode-zen", llmModel: m }).path).toBe("/chat/completions");
     }
     expect(() => resolveEndpoint({ ...base, llmProvider: "opencode-zen", llmModel: "gpt-6-luna" })).toThrow(UnsupportedModelError);
@@ -42,16 +48,16 @@ describe("resolveEndpoint", () => {
   });
 
   it("zen non-chat fail-fast covers v2 list", () => {
-    for (const m of ["gpt-6-luna", "gpt-6.1-sol", "gpt-6-astra", "grok-4.7", "grok-4.6", "claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5-5", "qwen3.7-max", "qwen3.7-plus", "gemini-3.8-flash", "gemini-3.5-flash-lite"]) {
+    for (const m of ZEN_NON_CHAT) {
       expect(() => resolveEndpoint({ ...base, llmProvider: "opencode-zen", llmModel: m })).toThrow(UnsupportedModelError);
     }
   });
 
   it("go chat models resolve, go non-chat fail-fast", () => {
-    for (const m of ["glm-5.3-flash", "glm-5.3", "glm-5.2", "kimi-k3", "kimi-k2.7-code", "kimi-k2.6", "deepseek-v4-flash", "deepseek-v4-pro", "deepseek-v4.1-flash", "deepseek-v4-flash-vision-exp", "mimo-v2.6-flash", "mimo-v2.5", "mimo-v2.6-pro", "hy4-preview", "hy3", "longcat-2.0", "space-bunny"]) {
+    for (const m of GO_CHAT) {
       expect(resolveEndpoint({ ...base, llmProvider: "opencode-go", llmModel: m }).path).toBe("/chat/completions");
     }
-    for (const m of ["grok-4.7", "grok-4.6", "gpt-6-luna", "gpt-5.6-luna", "gpt-6.1-sol", "gpt-6-astra", "muse-spark-1.3-contributor", "claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5-5", "minimax-m3", "minimax-m2.7", "qwen3.8-max", "qwen3.8-flash", "qwen3.7-max", "qwen3.7-plus", "gemini-3.8-flash", "gemini-3.5-flash-lite"]) {
+    for (const m of GO_NON_CHAT) {
       expect(() => resolveEndpoint({ ...base, llmProvider: "opencode-go", llmModel: m })).toThrow(UnsupportedModelError);
     }
   });
@@ -77,21 +83,127 @@ describe("resolveEndpoint", () => {
     expect(NON_CHAT.get("opencode-zen:gemini-3.8-flash")).toBe("google-models");
     expect(NON_CHAT.has("opencode-zen:qwen3.8-max")).toBe(false);
   });
+
+  // F10: no chat-capable pair may be in NON_CHAT.
+  it("NON_CHAT has no key for any chat-supported zen or go model", () => {
+    for (const m of ZEN_CHAT) expect(NON_CHAT.has(`opencode-zen:${m}`)).toBe(false);
+    for (const m of GO_CHAT) expect(NON_CHAT.has(`opencode-go:${m}`)).toBe(false);
+  });
+
+  // F9: preset table, all nine presets.
+  it.each([
+    ["openai", "https://api.openai.com/v1"],
+    ["anthropic", "https://api.anthropic.com/v1"],
+    ["google", "https://generativelanguage.googleapis.com/v1beta/openai"],
+    ["groq", "https://api.groq.com/openai/v1"],
+    ["mistral", "https://api.mistral.ai/v1"],
+    ["openrouter", "https://openrouter.ai/api/v1"],
+    ["ollama", "http://localhost:11434/v1"],
+    ["opencode-zen", "https://opencode.ai/zen/v1"],
+    ["opencode-go", "https://opencode.ai/zen/go/v1"],
+  ] as const)("preset %s baseUrl is exact and path-free", (provider, expected) => {
+    const r = resolveEndpoint({ ...base, llmProvider: provider, llmModel: "m" });
+    expect(r.baseUrl).toBe(expected);
+    expect(r.path).toBe("/chat/completions");
+  });
+
+  it("custom requires llm_base_url", () => {
+    expect(() => resolveEndpoint({ ...base, llmProvider: "custom", llmModel: "m" })).toThrow(/requires llm_base_url/);
+    expect(resolveEndpoint({ ...base, llmProvider: "custom", llmBaseUrl: "https://c.example/v1/", llmModel: "m" }).baseUrl).toBe("https://c.example/v1");
+  });
+
+  // F1 / F12: explicit openai-chat on a non-chat pair fails fast.
+  it("explicit openai-chat on a NON_CHAT pair throws UnsupportedModelError", () => {
+    expect(() => resolveEndpoint({ ...base, llmProvider: "opencode-zen", llmModel: "gpt-6-luna", llmApiStyle: "openai-chat" })).toThrow(UnsupportedModelError);
+    expect(() => resolveEndpoint({ ...base, llmProvider: "opencode-go", llmModel: "qwen3.8-max", llmApiStyle: "openai-chat" })).toThrow(UnsupportedModelError);
+  });
+
+  it("explicit openai-chat on a chat pair resolves", () => {
+    expect(resolveEndpoint({ ...base, llmProvider: "opencode-zen", llmModel: "qwen3.8-max", llmApiStyle: "openai-chat" }).path).toBe("/chat/completions");
+  });
+
+  // F12: explicit v2 styles throw in v1.
+  it.each(["openai-responses", "google-models"] as const)("explicit %s throws UnsupportedModelError in v1", (style) => {
+    expect(() => resolveEndpoint({ ...base, llmProvider: "openai", llmModel: "m", llmApiStyle: style })).toThrow(UnsupportedModelError);
+  });
+
+  // F12: custom-path needs llm_path; plain Error (R2).
+  it("explicit custom-path with empty llm_path throws plain Error", () => {
+    let caught: unknown;
+    try {
+      resolveEndpoint({ ...base, llmProvider: "custom", llmBaseUrl: "https://x", llmModel: "m", llmApiStyle: "custom-path" });
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(Error);
+    expect(caught).not.toBeInstanceOf(UnsupportedModelError);
+    expect((caught as Error).message).toMatch(/requires llm_path/);
+  });
+
+  // F5: path-segment matching.
+  it("path containing /models mid-path does NOT throw path-only", () => {
+    const r = resolveEndpoint({ ...base, llmProvider: "openai", llmModel: "m", llmPath: "/openai/models/chat/completions" });
+    expect(r.path).toBe("/openai/models/chat/completions");
+  });
+
+  it("path without leading slash does NOT throw path-only", () => {
+    expect(resolveEndpoint({ ...base, llmProvider: "openai", llmModel: "m", llmPath: "messages" }).path).toBe("messages");
+  });
+
+  it.each(["/messages", "/responses", "/models", "/messages/x", "/models?x=1"])("path %s throws path-only", (p) => {
+    expect(() => resolveEndpoint({ ...base, llmProvider: "custom", llmBaseUrl: "https://x", llmModel: "m", llmPath: p })).toThrow(/path-only/);
+  });
 });
 
 describe("validateModelExists", () => {
-  it("checks id presence only", async () => {
+  it("checks id presence only and sends Bearer auth", async () => {
     const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) =>
       new Response(JSON.stringify({ data: [{ id: "m" }, { id: "other" }] }), { status: 200 }),
     );
     vi.stubGlobal("fetch", fetchMock);
     expect(await validateModelExists("https://x", "m", "k")).toBe(true);
     expect(fetchMock.mock.calls[0][0]).toBe("https://x/models");
+    const init = fetchMock.mock.calls[0][1] as RequestInit;
+    expect((init.headers as Record<string, string>).Authorization).toBe("Bearer k");
     expect(await validateModelExists("https://x", "missing", "k")).toBe(false);
   });
 
-  it("returns false on non-ok response", async () => {
-    vi.stubGlobal("fetch", vi.fn(async () => new Response("nope", { status: 401 })));
+  // R4 / F2
+  it("404 returns false", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("nope", { status: 404 })));
     expect(await validateModelExists("https://x", "m", "k")).toBe(false);
+  });
+
+  it("500 throws naming the status", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("boom", { status: 500 })));
+    await expect(validateModelExists("https://x", "m", "k")).rejects.toThrow(/500/);
+  });
+
+  it("401 throws naming the status", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("no", { status: 401 })));
+    await expect(validateModelExists("https://x", "m", "k")).rejects.toThrow(/401/);
+  });
+
+  it("invalid JSON on 200 throws", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("<html>", { status: 200 })));
+    await expect(validateModelExists("https://x", "m", "k")).rejects.toThrow(/invalid JSON/);
+  });
+
+  // F4: timeout via AbortController. Fake timers keep this fast.
+  it("aborts a slow request and rejects", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        (_url: string, init?: RequestInit) =>
+          new Promise<Response>((_resolve, reject) => {
+            init?.signal?.addEventListener("abort", () => reject(new Error("aborted")));
+          }),
+      ),
+    );
+    const pending = validateModelExists("https://x", "m", "k");
+    const assertion = expect(pending).rejects.toThrow(/aborted/);
+    await vi.advanceTimersByTimeAsync(15_000);
+    await assertion;
   });
 });

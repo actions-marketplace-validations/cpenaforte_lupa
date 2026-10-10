@@ -1,14 +1,12 @@
-import type { ActionInputs } from "./inputs.js";
+import type { ActionInputs, LlmApiStyle } from "./inputs.js";
 
 export class UnsupportedModelError extends Error {}
 
-export type ApiStyle =
-  | "auto"
-  | "openai-chat"
-  | "openai-responses"
-  | "anthropic-messages"
-  | "google-models"
-  | "custom-path";
+/** Same six members as LlmApiStyle in inputs.ts (identical union). */
+export type ApiStyle = LlmApiStyle;
+
+/** API styles that need a non-chat body adapter (v2 only). */
+export type NonChatStyle = Exclude<ApiStyle, "auto" | "openai-chat" | "custom-path">;
 
 export interface ResolvedEndpoint {
   /** Base URL only; never includes the request path. */
@@ -35,10 +33,13 @@ const PRESET_BASE_URLS: Record<string, string> = {
 
 const CHAT_PATH = "/chat/completions";
 const USER_AGENT = "pr-reviewer/1.0";
+/** Timeout for the GET {base}/models existence check. */
+const VALIDATE_TIMEOUT_MS = 15_000;
 
 /**
  * Provider:model pairs that are NOT served by the OpenAI chat-completions
- * endpoint. `auto` fails fast for these in v1. Chat-supported pairs
+ * endpoint. `auto` fails fast for these in v1, and so does an explicit
+ * `openai-chat` (both throw UnsupportedModelError). Chat-supported pairs
  * (e.g. opencode-zen:qwen3.8-max) must NOT appear here.
  *
  * Non-chat styles listed here are v2-only: explicitly selecting them in v1
@@ -49,49 +50,49 @@ const USER_AGENT = "pr-reviewer/1.0";
  * When a Go subscription limit is hit, the Zen balance is used as fallback
  * by the provider; this action does not switch providers on its own.
  */
-export const NON_CHAT: ReadonlyMap<string, Exclude<ApiStyle, "auto" | "openai-chat" | "custom-path">> =
-  new Map<string, Exclude<ApiStyle, "auto" | "openai-chat" | "custom-path">>([
-    // opencode-go
-    ["opencode-go:qwen3.8-max", "anthropic-messages"],
-    ["opencode-go:qwen3.8-flash", "anthropic-messages"],
-    ["opencode-go:qwen3.7-max", "anthropic-messages"],
-    ["opencode-go:qwen3.7-plus", "anthropic-messages"],
-    ["opencode-go:minimax-m3", "anthropic-messages"],
-    ["opencode-go:minimax-m2.7", "anthropic-messages"],
-    ["opencode-go:claude-haiku-5-5", "anthropic-messages"],
-    ["opencode-go:claude-sonnet-5-5", "anthropic-messages"],
-    ["opencode-go:claude-opus-5-5", "anthropic-messages"],
-    ["opencode-go:grok-4.7", "openai-responses"],
-    ["opencode-go:grok-4.6", "openai-responses"],
-    ["opencode-go:gpt-6-luna", "openai-responses"],
-    ["opencode-go:gpt-5.6-luna", "openai-responses"],
-    ["opencode-go:gpt-6.1-sol", "openai-responses"],
-    ["opencode-go:gpt-6-astra", "openai-responses"],
-    ["opencode-go:muse-spark-1.3-contributor", "openai-responses"],
-    ["opencode-go:gemini-3.8-flash", "google-models"],
-    ["opencode-go:gemini-3.5-flash-lite", "google-models"],
-    // opencode-zen
-    ["opencode-zen:gpt-6-luna", "openai-responses"],
-    ["opencode-zen:gpt-6.1-sol", "openai-responses"],
-    ["opencode-zen:gpt-6-astra", "openai-responses"],
-    ["opencode-zen:grok-4.7", "openai-responses"],
-    ["opencode-zen:grok-4.6", "openai-responses"],
-    ["opencode-zen:claude-haiku-5-5", "anthropic-messages"],
-    ["opencode-zen:claude-sonnet-5-5", "anthropic-messages"],
-    ["opencode-zen:claude-opus-5-5", "anthropic-messages"],
-    ["opencode-zen:qwen3.7-max", "anthropic-messages"],
-    ["opencode-zen:qwen3.7-plus", "anthropic-messages"],
-    ["opencode-zen:gemini-3.8-flash", "google-models"],
-    ["opencode-zen:gemini-3.5-flash-lite", "google-models"],
-  ]);
+export const NON_CHAT: ReadonlyMap<string, NonChatStyle> = new Map<string, NonChatStyle>([
+  // opencode-go
+  ["opencode-go:qwen3.8-max", "anthropic-messages"],
+  ["opencode-go:qwen3.8-flash", "anthropic-messages"],
+  ["opencode-go:qwen3.7-max", "anthropic-messages"],
+  ["opencode-go:qwen3.7-plus", "anthropic-messages"],
+  ["opencode-go:minimax-m3", "anthropic-messages"],
+  ["opencode-go:minimax-m2.7", "anthropic-messages"],
+  ["opencode-go:claude-haiku-5-5", "anthropic-messages"],
+  ["opencode-go:claude-sonnet-5-5", "anthropic-messages"],
+  ["opencode-go:claude-opus-5-5", "anthropic-messages"],
+  ["opencode-go:grok-4.7", "openai-responses"],
+  ["opencode-go:grok-4.6", "openai-responses"],
+  ["opencode-go:gpt-6-luna", "openai-responses"],
+  ["opencode-go:gpt-5.6-luna", "openai-responses"],
+  ["opencode-go:gpt-6.1-sol", "openai-responses"],
+  ["opencode-go:gpt-6-astra", "openai-responses"],
+  ["opencode-go:muse-spark-1.3-contributor", "openai-responses"],
+  ["opencode-go:gemini-3.8-flash", "google-models"],
+  ["opencode-go:gemini-3.5-flash-lite", "google-models"],
+  // opencode-zen
+  ["opencode-zen:gpt-6-luna", "openai-responses"],
+  ["opencode-zen:gpt-6.1-sol", "openai-responses"],
+  ["opencode-zen:gpt-6-astra", "openai-responses"],
+  ["opencode-zen:grok-4.7", "openai-responses"],
+  ["opencode-zen:grok-4.6", "openai-responses"],
+  ["opencode-zen:claude-haiku-5-5", "anthropic-messages"],
+  ["opencode-zen:claude-sonnet-5-5", "anthropic-messages"],
+  ["opencode-zen:claude-opus-5-5", "anthropic-messages"],
+  ["opencode-zen:qwen3.7-max", "anthropic-messages"],
+  ["opencode-zen:qwen3.7-plus", "anthropic-messages"],
+  ["opencode-zen:gemini-3.8-flash", "google-models"],
+  ["opencode-zen:gemini-3.5-flash-lite", "google-models"],
+]);
 
-const V2_STYLES: ReadonlySet<string> = new Set([
+const V2_STYLES: ReadonlySet<string> = new Set<NonChatStyle>([
   "openai-responses",
   "anthropic-messages",
   "google-models",
 ]);
 
-const PATH_ONLY_NON_CHAT = /\/(messages|responses|models)(\/|$|\?)/;
+/** Matches only when the path itself starts with a non-chat segment, e.g. "/messages". */
+const PATH_ONLY_NON_CHAT = /^\/(messages|responses|models)(?=\/|$|\?)/;
 
 export interface ResolveEndpointOptions {
   llmProvider: ActionInputs["llmProvider"];
@@ -116,12 +117,12 @@ export function resolveEndpoint(o: ResolveEndpointOptions): ResolvedEndpoint {
     );
   }
 
-  if (o.llmApiStyle === "auto") {
+  if (o.llmApiStyle === "auto" || o.llmApiStyle === "openai-chat") {
     const nonChat = NON_CHAT.get(`${o.llmProvider}:${o.llmModel}`);
     if (nonChat !== undefined) {
       throw new UnsupportedModelError(
         `Model "${o.llmModel}" on "${o.llmProvider}" requires "${nonChat}", which is not supported in v1. ` +
-          `Supported API styles: openai-chat (auto resolves to openai-chat for chat-capable models).`,
+          `Supported API styles: openai-chat (chat-capable models only).`,
       );
     }
   }
@@ -153,6 +154,12 @@ export function resolveEndpoint(o: ResolveEndpointOptions): ResolvedEndpoint {
 /**
  * Checks that `model` is listed by GET {baseUrl}/models. Checks id presence
  * only; never infers or changes the endpoint used for chat requests.
+ *
+ * - 2xx with a JSON `data` array: true iff some entry has id === model.
+ * - 404: false (model list endpoint absent / model not found).
+ * - Other non-2xx: throws, naming the HTTP status.
+ * - Invalid JSON, or missing `data` array on 2xx: throws.
+ * - Timeout (VALIDATE_TIMEOUT_MS) or network error: throws.
  */
 export async function validateModelExists(
   baseUrl: string,
@@ -160,10 +167,29 @@ export async function validateModelExists(
   apiKey: string,
 ): Promise<boolean> {
   const url = `${baseUrl.replace(/\/+$/, "")}/models`;
-  const res = await fetch(url, {
-    headers: { Authorization: `Bearer ${apiKey}`, "User-Agent": USER_AGENT },
-  });
-  if (!res.ok) return false;
-  const body = (await res.json()) as { data?: Array<{ id?: unknown }> };
-  return Array.isArray(body.data) && body.data.some((m) => m.id === model);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), VALIDATE_TIMEOUT_MS);
+  try {
+    const res = await fetch(url, {
+      headers: { Authorization: `Bearer ${apiKey}`, "User-Agent": USER_AGENT },
+      signal: controller.signal,
+    });
+    if (res.status === 404) return false;
+    if (!res.ok) {
+      throw new Error(`GET ${url} failed with HTTP ${res.status}`);
+    }
+    let body: unknown;
+    try {
+      body = await res.json();
+    } catch {
+      throw new Error(`GET ${url} returned invalid JSON`);
+    }
+    const data = (body as { data?: unknown } | null)?.data;
+    if (!Array.isArray(data)) {
+      throw new Error(`GET ${url} returned no "data" array`);
+    }
+    return data.some((m) => (m as { id?: unknown } | null)?.id === model);
+  } finally {
+    clearTimeout(timer);
+  }
 }
