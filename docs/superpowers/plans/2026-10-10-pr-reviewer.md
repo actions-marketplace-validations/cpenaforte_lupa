@@ -1143,3 +1143,31 @@ it("redaction holds across every probe attempt", ...);
   - Update `tests/providers.test.ts` + `tests/adapters-routing.test.ts` removing map tests; keep chat/explicit-style tests.
 - [ ] **Step 4: Run → PASS** (full `npx vitest run` + `npm run build` + `node --check dist/index.js` + `GITHUB_EVENT_NAME=push node dist/index.js` exit 0)
 - [ ] **Step 5: Commit** (`refactor: error-driven style routing (probe) replaces NON_CHAT map`)
+
+---
+
+### Task 20: Canary fixes — semgrep config + container path normalization (bugs do canário v0.2.0)
+
+**Files:**
+- Modify: `src/scanners.ts` (semgrepArgv config + path normalization), `docs/superpowers/specs/2026-10-10-pr-reviewer-design.md` (§2 semgrep line + §9.6 notA new), `README.md` (scanner notes)
+- Test: extend `tests/scanners.test.ts`
+
+**Bugs (evidência do canário em cpenaforte/test-lupa PRs 1 e 2):**
+
+1. `semgrep exited 2 without parseable SARIF` — repro local determinístico: `semgrep scan --config auto --metrics=off` retorna exit 2 com `[ERROR]: Cannot create auto config when metrics are off. Please allow metrics or run with a specific config.` FIX: no-token branch usa `--config p/default` (registry pack curado, respeita `--metrics=off`); repro validado local com semgrep 1.180.0: exit 0 + SARIF com results. Manter `--sarif`, `--jobs`, `--baseline-commit`. Token branch (`semgrep ci`) inalterada.
+2. `artifact path rejected: generic-api-key has detected secret for file /src/config.py` — scanners rodam em docker com o repo montado em `/src`; SARIF reporta paths absolutos `/src/<rel>`; `unsafePath()` rejeita absoluto e o finding vira nota repository-level (perde o inline). FIX: em `parseSarif`, normalizar URI de artifactLocation antes de validar: strip do prefixo do mount `/src/` do container + strip `file://` URI scheme → `<rel>`; findings relativos ao repo continuam intactos. Aplicar apenas quando o path começa com `/src/` (mount conhecido) ou `file:///src/`.
+3. Dedupe (opcional, se barato): trivy e gitleaks reportam o mesmo segredo; se o FIX 2 fizer ambos inline, adicionar dedupe por (file,line,rule-family) OU deixar e documentar. Ruling: documentar como limitação conhecida se dedupe não for trivial; NÃO bloquear.
+
+- [ ] **Step 1: Write failing tests**
+
+```ts
+it("semgrep no-token argv uses --config p/default (auto+metrics=off is invalid)", ...);
+it("parseSarif normalizes /src/ container paths to repo-relative", ...); // uri "/src/config.py" → file "config.py"
+it("parseSarif normalizes file:///src/ URIs", ...);
+it("parseSarif leaves repo-relative and non-/src absolute paths untouched", ...);
+```
+
+- [ ] **Step 2: Run → FAIL** (`npx vitest run tests/scanners.test.ts`)
+- [ ] **Step 3: Implement** + update spec §2 semgrep line (auto→p/default with note) + README
+- [ ] **Step 4: Run → PASS** (full suite + build + node --check + non-triggering exit 0)
+- [ ] **Step 5: Commit** (`fix: semgrep p/default config + container path normalization (canary findings)`)
