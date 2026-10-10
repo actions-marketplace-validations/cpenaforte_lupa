@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { buildBody, eventFor, exitFor, mapToComments, parseHunks } from "../src/review.js";
+import { buildBody, eventFor, exitFor, mapToComments } from "../src/review.js";
+import { parseHunks } from "../src/diff.js";
 import type { Finding } from "../src/fastpath.js";
 
 // a.ts: line 3 is a deletion (LEFT 3), line 4 an addition (RIGHT 4); line 99 is outside every hunk.
@@ -27,17 +28,60 @@ describe("mapToComments", () => {
     expect(off.general.map((f) => f.file)).toContain("a.ts");
   });
 
-  it("multi-line pairs start_line+start_side", () => {
-    const r = mapToComments([{ severity: "warning", file: "a.ts", line: 10, rule: "r", message: "m", suggestion: "s" }], rangeFixture());
-    expect(r.inline[0].start_line).toBe(8);
-    expect(r.inline[0].start_side).toBe("RIGHT");
+  it("v1 never emits start_line/start_side, even for a suggestion on a multi-line run", () => {
+    const r = mapToComments(
+      [{ severity: "warning", file: "a.ts", line: 10, rule: "r", message: "m", suggestion: "s" }],
+      rangeFixture(),
+    );
+    expect(r.inline).toHaveLength(1);
     expect(r.inline[0].line).toBe(10);
+    expect(r.inline[0].side).toBe("RIGHT");
+    expect("start_line" in r.inline[0]).toBe(false);
+    expect("start_side" in r.inline[0]).toBe(false);
   });
 
   it("single-line finding without suggestion carries no start fields", () => {
     const r = mapToComments([{ severity: "warning", file: "a.ts", line: 10, rule: "r", message: "m" }], rangeFixture());
     expect(r.inline[0].start_line).toBeUndefined();
     expect(r.inline[0].start_side).toBeUndefined();
+  });
+
+  it("RIGHT suggestion renders a ```suggestion fence", () => {
+    const r = mapToComments(
+      [{ severity: "warning", file: "a.ts", line: 10, rule: "r", message: "m", suggestion: "fixed" }],
+      rangeFixture(),
+    );
+    expect(r.inline[0].body).toContain("```suggestion\nfixed\n```");
+  });
+
+  it("LEFT suggestion renders plain text, never a fence", () => {
+    const r = mapToComments(
+      [{ severity: "high", file: "a.ts", line: 3, rule: "r", message: "m", suggestion: "fixed" }],
+      hunksFixture(),
+    );
+    expect(r.inline[0].side).toBe("LEFT");
+    expect(r.inline[0].body).not.toContain("```");
+    expect(r.inline[0].body).not.toContain("suggestion");
+    expect(r.inline[0].body).toContain("Suggested: fixed");
+  });
+
+  it("suggestion containing backticks gets a longer fence that cannot be closed early", () => {
+    const suggestion = "a ```js\nx\n```";
+    const r = mapToComments(
+      [{ severity: "warning", file: "a.ts", line: 10, rule: "r", message: "m", suggestion }],
+      rangeFixture(),
+    );
+    const body = r.inline[0].body;
+    expect(body).toContain("````suggestion\n" + suggestion + "\n````");
+    expect(body.endsWith("````")).toBe(true);
+  });
+
+  it("same line number on both sides: RIGHT wins deterministically", () => {
+    // Hunk turns old line 3 into new line 3: LEFT 3 (del) and RIGHT 3 (add) both exist.
+    const hunks = parseHunks([{ file: "a.ts", hunks: "@@ -3,1 +3,1 @@\n-old\n+new\n" }]);
+    const r = mapToComments([{ severity: "info", file: "a.ts", line: 3, rule: "r", message: "m" }], hunks);
+    expect(r.inline).toHaveLength(1);
+    expect(r.inline[0].side).toBe("RIGHT");
   });
 
   it("repo-level (file \"\") and line-less findings go general", () => {
@@ -52,11 +96,21 @@ describe("mapToComments", () => {
     expect(r.general).toHaveLength(2);
   });
 
-  it("defensively treats null-ish line/suggestion as absent", () => {
-    const f = { severity: "info", file: "a.ts", line: null, suggestion: null, rule: "r", message: "m" } as unknown as Finding;
+  it("null line + suggestion goes general and the suggestion is plain text there", () => {
+    const f = {
+      severity: "info",
+      file: "a.ts",
+      line: null,
+      suggestion: "s",
+      rule: "r",
+      message: "m",
+    } as unknown as Finding;
     const r = mapToComments([f], hunksFixture());
     expect(r.inline).toEqual([]);
     expect(r.general).toHaveLength(1);
+    const body = buildBody(r.general, "sum");
+    expect(body).toContain("Suggested: s");
+    expect(body).not.toContain("```");
   });
 });
 
@@ -71,6 +125,31 @@ describe("parseHunks", () => {
       { side: "RIGHT", line: 2, kind: "add" },
     ]);
   });
+
+  it("multi-hunk: each hunk restarts numbering from its own header", () => {
+    const h = parseHunks([
+      { file: "m.ts", hunks: "@@ -1,2 +1,2 @@\n a\n-b\n+c\n@@ -50,1 +60,2 @@\n-d\n+e\n+f\n" },
+    ]);
+    expect(h).toHaveLength(2);
+    expect(h[0].lines).toEqual([
+      { side: "RIGHT", line: 1, kind: "ctx" },
+      { side: "LEFT", line: 2, kind: "del" },
+      { side: "RIGHT", line: 2, kind: "add" },
+    ]);
+    expect(h[1].lines).toEqual([
+      { side: "LEFT", line: 50, kind: "del" },
+      { side: "RIGHT", line: 60, kind: "add" },
+      { side: "RIGHT", line: 61, kind: "add" },
+    ]);
+  });
+
+  it("count-less header `@@ -3 +9 @@` is parsed (count defaults to 1)", () => {
+    const h = parseHunks([{ file: "c.ts", hunks: "@@ -3 +9 @@\n-x\n+y\n" }]);
+    expect(h[0].lines).toEqual([
+      { side: "LEFT", line: 3, kind: "del" },
+      { side: "RIGHT", line: 9, kind: "add" },
+    ]);
+  });
 });
 
 describe("buildBody", () => {
@@ -79,10 +158,23 @@ describe("buildBody", () => {
     expect(buildBody([], "   ").length).toBeGreaterThan(0);
   });
 
-  it("appends general findings to the summary", () => {
+  it("appends general findings to the summary with file:line locators", () => {
     const body = buildBody([{ severity: "warning", file: "a.ts", line: 99, rule: "r", message: "off diff" }], "Summary");
     expect(body).toContain("Summary");
     expect(body).toContain("off diff");
+    expect(body).toContain("a.ts:99");
+  });
+
+  it("locator: file without line, and (repository) for repo-level", () => {
+    const body = buildBody(
+      [
+        { severity: "info", file: "b.ts", rule: "r", message: "no line" },
+        { severity: "info", file: "", rule: "r", message: "repo wide" },
+      ],
+      "S",
+    );
+    expect(body).toContain("b.ts [r] no line");
+    expect(body).toContain("(repository) [r] repo wide");
   });
 });
 

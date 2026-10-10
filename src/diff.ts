@@ -11,6 +11,60 @@ export interface FileDiff {
   size?: number;
 }
 
+/** One commentable diff line. LEFT = old-file line number (deletion); RIGHT = new-file line number. */
+export interface HunkLine {
+  side: "LEFT" | "RIGHT";
+  line: number;
+  kind: "add" | "del" | "ctx";
+}
+
+/** One unified-diff hunk of a file, with the commentable lines it exposes. */
+export interface ParsedHunk {
+  file: string;
+  lines: HunkLine[];
+}
+
+const HUNK_HEADER = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/;
+
+/**
+ * Parses unified-diff hunk text (as stored in FileDiff.hunks) into commentable lines.
+ * `-` lines are LEFT (old numbering), `+` and context lines are RIGHT (new numbering).
+ * Lines before the first `@@` and `\ No newline` markers are ignored. Blank lines are
+ * skipped: real `git diff` output always prefixes context lines with a space.
+ */
+export function parseHunks(files: { file: string; hunks: string }[]): ParsedHunk[] {
+  const out: ParsedHunk[] = [];
+  for (const f of files) {
+    let current: ParsedHunk | undefined;
+    let oldLine = 0;
+    let newLine = 0;
+    for (const raw of f.hunks.split("\n")) {
+      const header = HUNK_HEADER.exec(raw);
+      if (header) {
+        oldLine = Number(header[1]);
+        newLine = Number(header[2]);
+        current = { file: f.file, lines: [] };
+        out.push(current);
+        continue;
+      }
+      if (current === undefined || raw === "" || raw.startsWith("\\")) continue;
+      const tag = raw[0];
+      if (tag === "-") {
+        current.lines.push({ side: "LEFT", line: oldLine, kind: "del" });
+        oldLine++;
+      } else if (tag === "+") {
+        current.lines.push({ side: "RIGHT", line: newLine, kind: "add" });
+        newLine++;
+      } else if (tag === " ") {
+        current.lines.push({ side: "RIGHT", line: newLine, kind: "ctx" });
+        oldLine++;
+        newLine++;
+      }
+    }
+  }
+  return out;
+}
+
 /** Lockfile basenames (any ecosystem). Prompt-filtered only. */
 const LOCKFILES: ReadonlySet<string> = new Set([
   "package-lock.json",

@@ -1,11 +1,14 @@
 import type { Finding } from "./fastpath.js";
 import type { FailLevel } from "./inputs.js";
+import type { HunkLine, ParsedHunk } from "./diff.js";
 
 export interface InlineComment {
   path: string;
   line: number;
   side: "LEFT" | "RIGHT";
+  /** Reserved for v2 multi-line ranges. Never set in v1 (see mapToComments). */
   start_line?: number;
+  /** Reserved for v2 multi-line ranges. Never set in v1 (see mapToComments). */
   start_side?: "LEFT" | "RIGHT";
   body: string;
 }
@@ -17,59 +20,6 @@ export interface ReviewPayload {
   comments: InlineComment[];
 }
 
-/** One commentable diff line. LEFT = old-file line number (deletion); RIGHT = new-file line number. */
-export interface HunkLine {
-  side: "LEFT" | "RIGHT";
-  line: number;
-  kind: "add" | "del" | "ctx";
-}
-
-/** One unified-diff hunk of a file, with the commentable lines it exposes. */
-export interface ParsedHunk {
-  file: string;
-  lines: HunkLine[];
-}
-
-const HUNK_HEADER = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/;
-
-/**
- * Parses unified-diff hunk text (as stored in FileDiff.hunks) into commentable lines.
- * `-` lines are LEFT (old numbering), `+` and context lines are RIGHT (new numbering).
- * Lines before the first `@@` and `\ No newline` markers are ignored.
- */
-export function parseHunks(files: { file: string; hunks: string }[]): ParsedHunk[] {
-  const out: ParsedHunk[] = [];
-  for (const f of files) {
-    let current: ParsedHunk | undefined;
-    let oldLine = 0;
-    let newLine = 0;
-    for (const raw of f.hunks.split("\n")) {
-      const header = HUNK_HEADER.exec(raw);
-      if (header) {
-        oldLine = Number(header[1]);
-        newLine = Number(header[2]);
-        current = { file: f.file, lines: [] };
-        out.push(current);
-        continue;
-      }
-      if (current === undefined || raw === "" || raw.startsWith("\\")) continue;
-      const tag = raw[0];
-      if (tag === "-") {
-        current.lines.push({ side: "LEFT", line: oldLine, kind: "del" });
-        oldLine++;
-      } else if (tag === "+") {
-        current.lines.push({ side: "RIGHT", line: newLine, kind: "add" });
-        newLine++;
-      } else if (tag === " ") {
-        current.lines.push({ side: "RIGHT", line: newLine, kind: "ctx" });
-        oldLine++;
-        newLine++;
-      }
-    }
-  }
-  return out;
-}
-
 function keyOf(side: "LEFT" | "RIGHT", line: number): string {
   return `${side}:${line}`;
 }
@@ -78,10 +28,34 @@ function isValidLine(v: unknown): v is number {
   return typeof v === "number" && Number.isInteger(v) && v >= 1;
 }
 
-function formatBody(f: Finding): string {
+function hasSuggestion(f: Finding): f is Finding & { suggestion: string } {
+  return typeof f.suggestion === "string" && f.suggestion !== "";
+}
+
+/**
+ * Fence for a ```suggestion block: one backtick longer than the longest backtick run in
+ * the suggestion (minimum three), so the suggestion can never close its own fence.
+ */
+function fenceFor(suggestion: string): string {
+  let longest = 0;
+  for (const run of suggestion.matchAll(/`+/g)) longest = Math.max(longest, run[0].length);
+  return "`".repeat(Math.max(3, longest + 1));
+}
+
+/**
+ * Inline body. Only RIGHT-side hits get a ```suggestion fence (a suggestion replaces the
+ * commented line, which only exists on the new side). LEFT hits show the suggestion as
+ * plain text instead.
+ */
+function formatBody(f: Finding, side: "LEFT" | "RIGHT"): string {
   let body = `**${f.severity}** [${f.rule}] ${f.message}`;
-  if (typeof f.suggestion === "string" && f.suggestion !== "") {
-    body += `\n\n\`\`\`suggestion\n${f.suggestion}\n\`\`\``;
+  if (hasSuggestion(f)) {
+    if (side === "RIGHT") {
+      const fence = fenceFor(f.suggestion);
+      body += `\n\n${fence}suggestion\n${f.suggestion}\n${fence}`;
+    } else {
+      body += `\n\nSuggested: ${f.suggestion}`;
+    }
   }
   return body;
 }
@@ -90,8 +64,12 @@ function formatBody(f: Finding): string {
  * Maps findings onto commentable diff lines. A finding becomes an inline comment only when
  * its file and line are both present in the hunks; everything else (repo-level, line-less,
  * off-diff) goes to the general list, which the caller folds into the review body.
- * Prefers RIGHT when a line number exists on both sides. A suggestion pairs start_line /
- * start_side with the contiguous run of same-side change lines ending at the finding's line.
+ *
+ * Same line number on both sides: RIGHT wins deterministically. Findings reference new-file
+ * line numbers, and a LEFT hit is used only when no RIGHT line carries that number.
+ *
+ * v1 never emits multi-line ranges: start_line/start_side stay unset, so a suggestion
+ * replaces only the single flagged line.
  */
 export function mapToComments(
   findings: Finding[],
@@ -124,19 +102,7 @@ export function mapToComments(
       general.push(f);
       continue;
     }
-    const c: InlineComment = { path: f.file, line, side: hit.side, body: formatBody(f) };
-    if (typeof f.suggestion === "string" && f.suggestion !== "" && hit.kind !== "ctx") {
-      const changeKind = hit.side === "RIGHT" ? "add" : "del";
-      let start = line;
-      for (;;) {
-        const prev = byKey.get(keyOf(hit.side, start - 1));
-        if (prev === undefined || prev.kind !== changeKind) break;
-        start--;
-      }
-      c.start_line = start;
-      c.start_side = hit.side;
-    }
-    inline.push(c);
+    inline.push({ path: f.file, line, side: hit.side, body: formatBody(f, hit.side) });
   }
   return { inline, general };
 }
@@ -159,15 +125,23 @@ export function exitFor(failLevel: FailLevel, findings: Finding[]): number {
 
 const FALLBACK_SUMMARY = "pr-reviewer: review complete.";
 
+/** `file:line`, `file` when there is no line, `(repository)` for repo-level findings. */
 function locate(f: Finding): string {
   if (f.file === "") return "(repository)";
   return isValidLine(f.line) ? `${f.file}:${f.line}` : f.file;
 }
 
-/** Review body: summary plus any findings that could not be placed inline. Never empty. */
+/**
+ * Review body: summary plus any findings that could not be placed inline. Suggestions are
+ * rendered as plain text here (never as a fence). Never empty.
+ */
 export function buildBody(general: Finding[], summary: string): string {
   const head = summary.trim() === "" ? FALLBACK_SUMMARY : summary.trim();
   if (general.length === 0) return head;
-  const items = general.map((f) => `- **${f.severity}** ${locate(f)} [${f.rule}] ${f.message}`);
+  const items = general.map((f) => {
+    let item = `- **${f.severity}** ${locate(f)} [${f.rule}] ${f.message}`;
+    if (hasSuggestion(f)) item += `\n  Suggested: ${f.suggestion.replace(/\n/g, "\n  ")}`;
+    return item;
+  });
   return `${head}\n\n**Findings not placed inline:**\n${items.join("\n")}`;
 }
