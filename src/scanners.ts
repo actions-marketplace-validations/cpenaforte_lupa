@@ -271,7 +271,8 @@ export async function runScanners(o: {
     if (sb.missing) {
       findings.push(warning("scanner-missing", "sbom unavailable: docker not found"));
     } else if (!isCycloneDx(sb.stdout)) {
-      // Parity with SARIF (R2/R14): the exit code is not decisive; a valid document is accepted.
+      // The exit code is not decisive: a valid CycloneDX document is accepted even on non-zero
+      // exit (scanners exit non-zero when they report findings), matching the SARIF rule.
       findings.push(warning("scanner-failed", `sbom exited ${sb.code ?? "abnormally"} without a CycloneDX document`));
     } else {
       let sbomDir: string | undefined;
@@ -281,7 +282,7 @@ export async function runScanners(o: {
         await writeFile(out, sb.stdout, "utf8");
         sbomPath = out;
       } catch (e) {
-        // Remove the half-created dir so a failed write leaves nothing behind (R15).
+        // A failed write must not leave a half-created dir behind: remove it best-effort.
         if (sbomDir) await rm(sbomDir, { recursive: true, force: true }).catch(() => undefined);
         findings.push(warning("sbom-write", `could not write SBOM: ${(e as Error).message}`));
       }

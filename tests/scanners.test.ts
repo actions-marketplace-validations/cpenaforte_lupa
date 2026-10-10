@@ -183,7 +183,7 @@ printf '%s' '{"runs":[]}'
 exit "\${FAKE_EXIT:-0}"
 `;
 
-/** Temp dirs created during a test; removed in afterEach (R12 hygiene). */
+/** Temp dirs created during a test; removed in afterEach so no run leaves scratch dirs behind. */
 let created: string[] = [];
 
 function makeBin(scripts: Record<string, string>): string {
