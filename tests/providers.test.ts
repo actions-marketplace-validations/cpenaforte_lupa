@@ -1,4 +1,5 @@
-import { describe, it, expect, vi, afterEach } from "vitest";
+import { describe, it, expect, vi, afterEach, beforeEach } from "vitest";
+import * as core from "@actions/core";
 import {
   resolveEndpoint,
   UnsupportedModelError,
@@ -6,12 +7,18 @@ import {
   NON_CHAT,
 } from "../src/providers.js";
 
+vi.mock("@actions/core", () => ({ warning: vi.fn() }));
+
 const base = { llmBaseUrl: "", llmApiStyle: "auto", llmPath: "", llmApiKey: "k", prNumber: 1 } as const;
 
 const ZEN_CHAT = ["deepseek-v4.1-flash", "deepseek-v4-pro", "deepseek-v4-flash", "glm-5.3-flash", "glm-5.3", "glm-5.2", "kimi-k3", "kimi-k2.7-code", "kimi-k2.6", "minimax-m3", "minimax-m2.7", "mistral-large-4", "qwen3.8-max", "big-pickle", "space-bunny-free", "mimo-v2.6-flash-free"];
 const ZEN_NON_CHAT = ["gpt-6-luna", "gpt-6.1-sol", "gpt-6-astra", "grok-4.7", "grok-4.6", "claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5-5", "qwen3.7-max", "qwen3.7-plus", "gemini-3.8-flash", "gemini-3.5-flash-lite"];
 const GO_CHAT = ["glm-5.3-flash", "glm-5.3", "glm-5.2", "kimi-k3", "kimi-k2.7-code", "kimi-k2.6", "deepseek-v4-flash", "deepseek-v4-pro", "deepseek-v4.1-flash", "deepseek-v4-flash-vision-exp", "mimo-v2.6-flash", "mimo-v2.5", "mimo-v2.6-pro", "hy4-preview", "hy3", "longcat-2.0", "space-bunny"];
 const GO_NON_CHAT = ["grok-4.7", "grok-4.6", "gpt-6-luna", "gpt-5.6-luna", "gpt-6.1-sol", "gpt-6-astra", "muse-spark-1.3-contributor", "claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5-5", "minimax-m3", "minimax-m2.7", "qwen3.8-max", "qwen3.8-flash", "qwen3.7-max", "qwen3.7-plus", "gemini-3.8-flash", "gemini-3.5-flash-lite"];
+
+beforeEach(() => {
+  vi.mocked(core.warning).mockClear();
+});
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -165,9 +172,35 @@ describe("resolveEndpoint", () => {
     expect(() => resolveEndpoint({ ...base, llmProvider: "custom", llmBaseUrl: "https://x", llmModel: "m", llmPath: "messages?x=1" })).toThrow(/path-only/);
   });
 
-  it("path-only message quotes both raw llm_path and normalized path", () => {
-    expect(() => resolveEndpoint({ ...base, llmProvider: "custom", llmBaseUrl: "https://x", llmModel: "m", llmPath: "messages?x=1" }))
-      .toThrow(/llm_path "messages\?x=1" normalizes to "\/messages\?x=1"/);
+  it("path-only message quotes raw (query stripped) and normalized path, never the query", () => {
+    let msg = "";
+    try {
+      resolveEndpoint({ ...base, llmProvider: "custom", llmBaseUrl: "https://x", llmModel: "m", llmPath: "messages?key=SECRET" });
+    } catch (e) {
+      msg = (e as Error).message;
+    }
+    expect(msg).toContain('llm_path "messages" normalizes to "/messages"');
+    expect(msg).not.toContain("SECRET");
+    expect(msg).not.toContain("key=");
+  });
+
+  it("warns once naming the stripped query string, without its value", () => {
+    resolveEndpoint({ ...base, llmProvider: "custom", llmBaseUrl: "https://x", llmModel: "m", llmPath: "/chat/completions?a=SECRET" });
+    expect(core.warning).toHaveBeenCalledTimes(1);
+    const msg = vi.mocked(core.warning).mock.calls[0][0] as string;
+    expect(msg).toContain("query string");
+    expect(msg).not.toContain("SECRET");
+  });
+
+  it("warns naming the stripped fragment", () => {
+    resolveEndpoint({ ...base, llmProvider: "custom", llmBaseUrl: "https://x", llmModel: "m", llmPath: "/chat/completions#frag" });
+    expect(core.warning).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(core.warning).mock.calls[0][0]).toContain("fragment");
+  });
+
+  it("no warning for a clean path", () => {
+    resolveEndpoint({ ...base, llmProvider: "custom", llmBaseUrl: "https://x", llmModel: "m", llmPath: "/chat/completions" });
+    expect(core.warning).not.toHaveBeenCalled();
   });
 
   it('"/messages#x" throws path-only (fragment stripped)', () => {

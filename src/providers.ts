@@ -1,3 +1,4 @@
+import * as core from "@actions/core";
 import type { ActionInputs, LlmApiStyle } from "./inputs.js";
 
 export class UnsupportedModelError extends Error {}
@@ -95,9 +96,10 @@ const V2_STYLES: ReadonlySet<string> = new Set<NonChatStyle>([
 const NON_CHAT_PATH_SEGMENTS: ReadonlySet<string> = new Set(["messages", "responses", "models"]);
 
 /**
- * True iff the (already normalized, leading-slash) path's last segment,
- * ignoring query, #fragment, and trailing slashes, is exactly messages,
- * responses, or models.
+ * Contract: the caller passes a path that is already normalized (leading "/")
+ * and already cleaned (no query or #fragment). This helper only trims trailing
+ * slashes and checks whether the LAST segment is exactly messages, responses,
+ * or models.
  * `/v1/messages` → true; `/openai/models/chat/completions` → false.
  */
 function isPathOnlyNonChat(path: string): boolean {
@@ -149,9 +151,17 @@ export function resolveEndpoint(o: ResolveEndpointOptions): ResolvedEndpoint {
   // path; the path-only guard runs on that same returned path.
   const normalized = rawPath.startsWith("/") ? rawPath : `/${rawPath}`;
   const path = normalized.split(/[?#]/)[0];
+  // Never echo the query or fragment (may carry secrets); name only the parts dropped.
+  const strippedParts: string[] = [];
+  if (normalized.includes("?")) strippedParts.push("query string");
+  if (normalized.includes("#")) strippedParts.push("fragment");
+  if (strippedParts.length > 0) {
+    core.warning(`llm_path ${strippedParts.join(" and ")} ignored; only the path is used`);
+  }
   if (isPathOnlyNonChat(path)) {
+    const rawClean = rawPath.split(/[?#]/)[0];
     throw new UnsupportedModelError(
-      `llm_path "${rawPath}" normalizes to "${normalized}", which is path-only: it names a non-chat endpoint. ` +
+      `llm_path "${rawClean}" normalizes to "${path}", which is path-only: it names a non-chat endpoint. ` +
         `llm_path only overrides the path; a non-chat body adapter requires a v2 llm_api_style, which is not supported in v1.`,
     );
   }
