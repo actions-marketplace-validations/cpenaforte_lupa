@@ -1,0 +1,26 @@
+{
+  "name": "pr-reviewer",
+  "version": "0.1.0",
+  "description": "Reusable GitHub Action that reviews pull requests with an LLM",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json && esbuild lib/main.js --bundle --platform=node --target=node24 --format=esm --outfile=dist/index.js",
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@actions/core": "3.0.1",
+    "@actions/github": "9.1.1"
+  },
+  "devDependencies": {
+    "@tsconfig/node24": "24.0.5",
+    "@types/node": "26.6.5",
+    "esbuild": "0.28.2",
+    "typescript": "5.9.3",
+    "vitest": "5.0.3"
+  }
+}

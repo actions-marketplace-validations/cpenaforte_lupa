@@ -1,0 +1,66 @@
+name: "PR Reviewer"
+description: "Reviews pull requests with an LLM and posts findings as a review comment"
+inputs:
+  github_token:
+    description: "GitHub token used to read the PR diff and post the review comment"
+    required: false
+    default: ${{ github.token }}
+  llm_provider:
+    description: "LLM provider identifier"
+    required: false
+    default: "openai"
+  llm_base_url:
+    description: "Base URL of the LLM API (empty = provider default)"
+    required: false
+    default: ""
+  llm_api_style:
+    description: "API style: auto, openai, or anthropic"
+    required: false
+    default: "auto"
+  llm_path:
+    description: "Request path override (empty = provider default)"
+    required: false
+    default: ""
+  llm_model:
+    description: "Model name to use for the review"
+    required: false
+    default: ""
+  llm_api_key:
+    description: "API key for the LLM provider"
+    required: false
+    default: ""
+  llm_temperature:
+    description: "Sampling temperature (empty = provider default)"
+    required: false
+    default: ""
+  llm_top_p:
+    description: "Nucleus sampling top_p (empty = provider default)"
+    required: false
+    default: ""
+  pr_number:
+    description: "PR number to review (only used for workflow_dispatch)"
+    required: false
+    default: ""
+  fail_level:
+    description: "Lowest finding severity that fails the action: warning or error"
+    required: false
+    default: "warning"
+  max_diff_chars:
+    description: "Maximum number of diff characters sent to the LLM"
+    required: false
+    default: "60000"
+  post_comment:
+    description: "Whether to post the review comment on the PR"
+    required: false
+    default: "true"
+  timeout_seconds:
+    description: "Timeout for the LLM request in seconds"
+    required: false
+    default: "90"
+  llm_max_tokens:
+    description: "Maximum tokens the LLM may generate"
+    required: false
+    default: "2000"
+runs:
+  using: node24
+  main: dist/index.js
