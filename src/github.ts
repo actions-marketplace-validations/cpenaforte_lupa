@@ -94,7 +94,10 @@ function foldComments(body: string, comments: InlineComment[]): string {
   const items = comments.map((c) => {
     // Drop trailing whitespace-only lines so a body ending in "\r" or "\n" adds no bare "  " line.
     const text = c.body.replace(/\r\n?/g, "\n").replace(/(\n[ \t]*)+$/, "");
-    return `- ${c.path}:${c.line}\n  ${text.replace(/\n/g, "\n  ")}`;
+    const head = `- ${c.path}:${c.line}`;
+    // A body that is empty or whitespace-only gets no continuation line at all.
+    if (text.trim() === "") return head;
+    return `${head}\n  ${text.replace(/\n/g, "\n  ")}`;
   });
   return `${body}\n\n**Findings not placed inline:**\n${items.join("\n")}`;
 }

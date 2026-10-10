@@ -227,6 +227,20 @@ describe("postReview", () => {
     expect(body).not.toMatch(/\n[ \t]+$/);
   });
 
+  it("an empty or all-newline comment body folds to the item line only, with no whitespace line", async () => {
+    for (const body of ["", "\n", "\r\n\r\n"]) {
+      const empty: ReviewPayload = {
+        ...payload,
+        comments: [{ path: "e.ts", line: 6, side: "RIGHT", body }],
+      };
+      const f = fakeOctokit([httpError(422, OFF_DIFF_MSG, OFF_DIFF_ERRORS), "ok"]);
+      await postReview(f.octokit, 1, empty);
+      const folded = String(f.reviewArgs[1].body);
+      expect(folded.endsWith("- e.ts:6")).toBe(true);
+      expect(folded).not.toMatch(/\n[ \t]*$/);
+    }
+  });
+
   it("stale then off-diff: three POSTs, ends as a general-only COMMENT with empty comments", async () => {
     const f = fakeOctokit([httpError(422, STALE_MSG), httpError(422, OFF_DIFF_MSG, OFF_DIFF_ERRORS), "ok"]);
     const r = await postReview(f.octokit, 1, payload);
