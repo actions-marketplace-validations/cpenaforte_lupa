@@ -267,4 +267,24 @@ describe("callWithProbe: auto discovers the style from 400/404 errors", () => {
     const headers = (vi.mocked(fetch).mock.calls[0][1] as RequestInit).headers as Record<string, string>;
     expect(headers["x-opencode-session"]).toBe("pr-7");
   });
+
+  // R3-warning fix regression pin: the probe's preset-derived base must not
+  // read as user-supplied when google-models strips the /openai suffix.
+  it("probe on the google preset never misfires the /openai rewrite warning", async () => {
+    stubProbe(3, GOOGLE_OK);
+    const r = await callWithProbe(
+      "google",
+      "probe-google-misfire",
+      "https://generativelanguage.googleapis.com/v1beta/openai",
+      "k",
+      msgs,
+      o,
+    );
+    expect(r.result).toEqual({ ok: true, findings: [FINDING] });
+    expect(r.via).toBe("google-models");
+    expect(urls().at(-1)).toBe(
+      "https://generativelanguage.googleapis.com/v1beta/models/probe-google-misfire:generateContent",
+    );
+    expect(warnings()).toHaveLength(0);
+  });
 });

@@ -504,6 +504,9 @@ async function slowPath(
     timeoutSeconds: i.timeoutSeconds,
     provider: i.llmProvider,
     prNumber: pr,
+    // R3: only the user's llm_base_url input may trigger the rewrite warning —
+    // a preset-derived base rebuilt during the probe must stay silent.
+    userBase: i.llmBaseUrl !== "",
   };
   // Spec §9.5: plain `auto` (no llm_path override) is error-driven — the probe
   // walks the styles and learns from 400/404. An explicit llm_api_style — and

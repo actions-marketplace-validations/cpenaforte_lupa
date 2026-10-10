@@ -1,5 +1,7 @@
 # PR Reviewer Implementation Plan
 
+> **Superseded (2026-10-10):** Tasks 3/18's versioned NON_CHAT map was superseded by Task 19 (spec §9.5 — error-driven probe routing); the task text below is kept as an append-only historical record.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Build the v1 reusable TypeScript GitHub Action that posts hybrid fast-path + BYOK LLM reviews on PRs.

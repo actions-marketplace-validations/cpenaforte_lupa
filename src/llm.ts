@@ -380,6 +380,12 @@ export interface ProbeOptions {
   topP?: number;
   /** Preserves the opencode-go x-opencode-session header across probe attempts. */
   prNumber?: number | null;
+  /**
+   * True when the base came from the user's llm_base_url input. Keeps the R3
+   * /openai-rewrite warning honest: only a USER-supplied base may trigger it,
+   * never the probe's rebuild of a preset-derived base.
+   */
+  userBase?: boolean;
 }
 
 export interface ProbeOutcome {
@@ -422,7 +428,7 @@ export async function callWithProbe(
   };
 
   const run = async (style: ResolvedApiStyle): Promise<ProbeOutcome> => {
-    const ep = buildEndpointForStyle(provider, model, baseUrl, key, style, o.prNumber ?? null);
+    const ep = buildEndpointForStyle(provider, model, baseUrl, key, style, o.prNumber ?? null, o.userBase ?? false);
     return { result: await callByStyle(ep, messages, callOpts), via: style };
   };
 

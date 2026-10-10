@@ -67,6 +67,13 @@ export interface ResolveEndpointOptions {
   llmModel: string;
   llmApiKey: string;
   prNumber: number | null;
+  /**
+   * Did the user type this base URL (vs. it being derived, e.g. a preset base
+   * or a probe rebuilding a preset-derived base)? Drives the R3 rewrite
+   * warning, which must only surface rewrites of USER-SUPPLIED bases. When
+   * omitted, falls back to `llmBaseUrl !== ""`.
+   */
+  userBase?: boolean;
 }
 
 /** Default request path for each resolved API style; llm_path overrides it. */
@@ -114,7 +121,10 @@ export function resolveEndpoint(o: ResolveEndpointOptions): ResolvedEndpoint {
   const effectiveBase =
     apiStyle === "google-models" && baseUrl.endsWith("/openai") ? baseUrl.slice(0, -"/openai".length) : baseUrl;
   // R3: surface the rewrite when it changes a USER-SUPPLIED custom base URL.
-  if (effectiveBase !== baseUrl && o.llmBaseUrl !== "") {
+  // A probe rebuilding a preset-derived base is not user input: it must not
+  // warn (userBase marker; default heuristic: non-empty llm_base_url input).
+  const userBase = o.userBase ?? o.llmBaseUrl !== "";
+  if (effectiveBase !== baseUrl && userBase) {
     core.warning(
       `llm_base_url "${baseUrl}" rewritten to "${effectiveBase}": google-models needs the API root, not the OpenAI-compat "/openai" suffix`,
     );
@@ -159,7 +169,10 @@ export function resolveEndpoint(o: ResolveEndpointOptions): ResolvedEndpoint {
  * driver in llm.ts to walk PROBE_ORDER. Thin wrapper over resolveEndpoint with
  * an empty llm_path (the probe always uses each style's default path), so the
  * base rewrite, normalization and header rules stay in one place. `prNumber`
- * preserves the opencode-go session header across probe attempts.
+ * preserves the opencode-go session header across probe attempts. `userBase`
+ * must be true only when the base came from the user's llm_base_url: the
+ * probe's synthetic rebuild of a preset-derived base must not trigger the R3
+ * rewrite warning.
  */
 export function buildEndpointForStyle(
   provider: string,
@@ -168,6 +181,7 @@ export function buildEndpointForStyle(
   apiKey: string,
   style: ResolvedApiStyle,
   prNumber: number | null = null,
+  userBase = false,
 ): ResolvedEndpoint {
   return resolveEndpoint({
     llmProvider: provider as ActionInputs["llmProvider"],
@@ -177,6 +191,7 @@ export function buildEndpointForStyle(
     llmModel: model,
     llmApiKey: apiKey,
     prNumber,
+    userBase,
   });
 }
 

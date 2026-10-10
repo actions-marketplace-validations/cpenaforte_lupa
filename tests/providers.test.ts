@@ -2,6 +2,7 @@ import { describe, it, expect, vi, afterEach, beforeEach } from "vitest";
 import * as core from "@actions/core";
 import {
   resolveEndpoint,
+  buildEndpointForStyle,
   UnsupportedModelError,
   validateModelExists,
   authHeaderFor,
@@ -79,6 +80,33 @@ describe("resolveEndpoint", () => {
   it("preset google base rewrite (not user-supplied) does not warn", () => {
     resolveEndpoint({ ...base, llmProvider: "google", llmModel: "gemini-x", llmApiStyle: "google-models" });
     expect(core.warning).not.toHaveBeenCalled();
+  });
+
+  // Explicit marker: resolveEndpoint warns iff the base came from the user AND was stripped.
+  it("resolveEndpoint honors an explicit userBase=false even with a non-empty llm_base_url", () => {
+    const r = resolveEndpoint({
+      ...base,
+      llmProvider: "custom",
+      llmBaseUrl: "https://x/v1beta/openai",
+      llmModel: "gemini-x",
+      llmApiStyle: "google-models",
+      userBase: false,
+    });
+    expect(r.baseUrl).toBe("https://x/v1beta");
+    expect(core.warning).not.toHaveBeenCalled();
+  });
+
+  it("resolveEndpoint honors an explicit userBase=true (warns on the strip)", () => {
+    const r = resolveEndpoint({
+      ...base,
+      llmProvider: "custom",
+      llmBaseUrl: "https://x/v1beta/openai",
+      llmModel: "gemini-x",
+      llmApiStyle: "google-models",
+      userBase: true,
+    });
+    expect(r.baseUrl).toBe("https://x/v1beta");
+    expect(core.warning).toHaveBeenCalledTimes(1);
   });
 
   it("prNumber null ok, go without number omits session header", () => {
@@ -229,6 +257,39 @@ describe("resolveEndpoint", () => {
 
   it("/messages/x resolves (last segment is x)", () => {
     expect(resolveEndpoint({ ...base, llmProvider: "custom", llmBaseUrl: "https://x", llmModel: "m", llmPath: "/messages/x" }).path).toBe("/messages/x");
+  });
+});
+
+describe("buildEndpointForStyle", () => {
+  // R3-warning fix: the probe's synthetic base must not read as user-supplied.
+  it("a preset-derived base stripped for google-models does NOT warn (probe misfire)", () => {
+    const r = buildEndpointForStyle(
+      "google",
+      "gemini-x",
+      "https://generativelanguage.googleapis.com/v1beta/openai",
+      "k",
+      "google-models",
+    );
+    expect(r.baseUrl).toBe("https://generativelanguage.googleapis.com/v1beta");
+    expect(r.path).toBe("/models/gemini-x:generateContent");
+    expect(core.warning).not.toHaveBeenCalled();
+  });
+
+  it("a user-supplied base stripped for google-models DOES warn (userBase: true)", () => {
+    const r = buildEndpointForStyle("custom", "gemini-x", "https://x/v1beta/openai", "k", "google-models", null, true);
+    expect(r.baseUrl).toBe("https://x/v1beta");
+    expect(core.warning).toHaveBeenCalledTimes(1);
+    const msg = vi.mocked(core.warning).mock.calls[0][0] as string;
+    expect(msg).toContain("https://x/v1beta/openai");
+    expect(msg).toContain("https://x/v1beta");
+  });
+
+  it("no strip and no warning for a base without the /openai suffix", () => {
+    const r = buildEndpointForStyle("opencode-go", "m", "https://opencode.ai/zen/go/v1", "k", "openai-responses", 7);
+    expect(r.baseUrl).toBe("https://opencode.ai/zen/go/v1");
+    expect(r.path).toBe("/responses");
+    expect(r.headers["x-opencode-session"]).toBe("pr-7");
+    expect(core.warning).not.toHaveBeenCalled();
   });
 });
 

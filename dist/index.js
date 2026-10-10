@@ -25223,7 +25223,8 @@ function resolveEndpoint(o) {
     apiStyle = "openai-chat";
   }
   const effectiveBase = apiStyle === "google-models" && baseUrl2.endsWith("/openai") ? baseUrl2.slice(0, -"/openai".length) : baseUrl2;
-  if (effectiveBase !== baseUrl2 && o.llmBaseUrl !== "") {
+  const userBase = o.userBase ?? o.llmBaseUrl !== "";
+  if (effectiveBase !== baseUrl2 && userBase) {
     warning(`llm_base_url "${baseUrl2}" rewritten to "${effectiveBase}": google-models needs the API root, not the OpenAI-compat "/openai" suffix`);
   }
   const rawPath = o.llmPath !== "" ? o.llmPath : defaultPathFor(apiStyle, o.llmModel);
@@ -25250,7 +25251,7 @@ function resolveEndpoint(o) {
   }
   return { baseUrl: effectiveBase, path, headers, apiStyle };
 }
-function buildEndpointForStyle(provider, model, baseUrl2, apiKey, style, prNumber = null) {
+function buildEndpointForStyle(provider, model, baseUrl2, apiKey, style, prNumber = null, userBase = false) {
   return resolveEndpoint({
     llmProvider: provider,
     llmBaseUrl: baseUrl2,
@@ -25258,7 +25259,8 @@ function buildEndpointForStyle(provider, model, baseUrl2, apiKey, style, prNumbe
     llmPath: "",
     llmModel: model,
     llmApiKey: apiKey,
-    prNumber
+    prNumber,
+    userBase
   });
 }
 function authHeaderFor(provider, apiStyle) {
@@ -25918,7 +25920,7 @@ async function callWithProbe(provider, model, baseUrl2, key, messages, o, explic
     provider
   };
   const run2 = async (style) => {
-    const ep = buildEndpointForStyle(provider, model, baseUrl2, key, style, o.prNumber ?? null);
+    const ep = buildEndpointForStyle(provider, model, baseUrl2, key, style, o.prNumber ?? null, o.userBase ?? false);
     return { result: await callByStyle(ep, messages, callOpts), via: style };
   };
   if (explicitStyle !== void 0 && explicitStyle !== "auto") {
@@ -26620,7 +26622,10 @@ async function slowPath(env, deps, pr, fast, promptText, issueBody, skipped) {
     maxTokens: i.llmMaxTokens,
     timeoutSeconds: i.timeoutSeconds,
     provider: i.llmProvider,
-    prNumber: pr
+    prNumber: pr,
+    // R3: only the user's llm_base_url input may trigger the rewrite warning —
+    // a preset-derived base rebuilt during the probe must stay silent.
+    userBase: i.llmBaseUrl !== ""
   };
   const res = i.llmApiStyle === "auto" && i.llmPath === "" ? await deps.analysis.callWithProbe(i.llmProvider, i.llmModel, ep.baseUrl, i.llmApiKey, messages, llmOpts) : await deps.analysis.callByStyle(ep, messages, llmOpts);
   if (!res.ok) {

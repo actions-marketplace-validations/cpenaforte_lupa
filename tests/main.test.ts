@@ -73,6 +73,8 @@ interface Rec {
   getPrCalls: number;
   issueBodyFetched?: number;
   llmCalled: number;
+  /** Which seam served the slow-path LLM call (spec §9.5 wiring). */
+  llmVia?: "probe" | "style";
   ollamaCalled: number;
   validateAuth?: { header?: string };
   scanEnv?: NodeJS.ProcessEnv;
@@ -237,6 +239,7 @@ async function runWithMocks(o: MockOpts = {}) {
       },
       callByStyle: async () => {
         rec.llmCalled += 1;
+        rec.llmVia = "style";
         return { ok: true, findings: o.llm ?? [LLM_FINDING] };
       },
       callWithProbe:
@@ -245,6 +248,7 @@ async function runWithMocks(o: MockOpts = {}) {
               (await callWithProbe(provider, model, baseUrl, apiKey, messages, opts)).result
           : async () => {
               rec.llmCalled += 1;
+              rec.llmVia = "probe";
               return { ok: true, findings: o.llm ?? [LLM_FINDING] };
             },
     },
@@ -261,6 +265,7 @@ async function runWithMocks(o: MockOpts = {}) {
     validateAuth: rec.validateAuth,
     body: rec.reviews.at(-1)?.body,
     llmCalled: rec.llmCalled,
+    llmVia: rec.llmVia,
     scanEnv: rec.scanEnv,
     l2Env: rec.l2Env,
     artifactDir,
@@ -540,6 +545,22 @@ describe("run() orchestration", () => {
   it("the LLM slow path keeps its key (not scrubbed; it is intended API use)", async () => {
     const r = await runWithMocks({ llmApiKey: "sk-live" });
     expect(r.llmCalled).toBe(1);
+  });
+
+  // Spec §9.5 seam selection: plain auto → the probe seam; an explicit
+  // llm_api_style → the resolved endpoint's adapter, no probe.
+  it("slow path: plain auto routes through the probe seam (callWithProbe)", async () => {
+    const r = await runWithMocks({});
+    expect(r.posted).toBe(true);
+    expect(r.llmCalled).toBe(1);
+    expect(r.llmVia).toBe("probe");
+  });
+
+  it("slow path: an explicit llm_api_style routes through callByStyle, no probe", async () => {
+    const r = await runWithMocks({ llmApiStyle: "openai-responses" });
+    expect(r.posted).toBe(true);
+    expect(r.llmCalled).toBe(1);
+    expect(r.llmVia).toBe("style");
   });
 
   // Task 19 wiring: with plain `auto` the slow path probes (error-driven, spec §9.5) —
