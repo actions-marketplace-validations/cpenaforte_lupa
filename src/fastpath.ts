@@ -71,19 +71,48 @@ export function runL0(
       });
     }
 
-    const lines = f.hunks.split("\n");
-    lines.forEach((text, i) => {
-      if (TODO_RE.test(text)) {
-        out.push({
-          severity: "info",
-          file: f.file,
-          line: i + 1,
-          rule: "todo-marker",
-          message: `TODO/FIXME/XXX marker: ${text.trim()}`,
-        });
-      }
-    });
+    for (const { line, text } of todoMarkers(f.hunks)) {
+      out.push({
+        severity: "info",
+        file: f.file,
+        line,
+        rule: "todo-marker",
+        message: `TODO/FIXME/XXX marker: ${text.trim()}`,
+      });
+    }
   }
 
+  return out;
+}
+
+const HUNK_HEADER_RE = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/;
+
+/**
+ * Scans unified-diff hunks for TODO/FIXME/XXX on ADDED or CONTEXT lines and
+ * reports real new-file line numbers. Removed (`-`) lines are skipped entirely.
+ * Input with no `@@` header is treated as new-file content counted from 1.
+ */
+function todoMarkers(hunks: string): { line: number; text: string }[] {
+  const out: { line: number; text: string }[] = [];
+  let newLine: number | undefined; // next new-file line; undefined until a header
+  let fallback = 1;
+  for (const raw of hunks.split("\n")) {
+    const header = HUNK_HEADER_RE.exec(raw);
+    if (header) {
+      newLine = Number(header[1]);
+      continue;
+    }
+    if (raw.startsWith("-") || raw.startsWith("\\")) continue;
+    const text = raw.startsWith("+") || raw.startsWith(" ") ? raw.slice(1) : raw;
+    let line: number;
+    if (newLine !== undefined) {
+      line = newLine;
+      newLine += 1;
+    } else {
+      line = fallback;
+      fallback += 1;
+    }
+    if (TODO_RE.test(text)) out.push({ line, text });
+  }
   return out;
 }

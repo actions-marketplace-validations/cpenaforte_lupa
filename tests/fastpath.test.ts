@@ -84,11 +84,56 @@ describe("runL0", () => {
     expect(clean.some((x) => x.rule === "sensitive-path")).toBe(false);
   });
 
-  it("todo-marker reports the line number of the marker", () => {
+  it("todo-marker reports the line number of the marker (headerless input counts from 1)", () => {
     const f = runL0([{ file: "a.ts", hunks: "const a = 1;\n// FIXME later\n", truncated: false }]);
     const t = f.find((x) => x.rule === "todo-marker");
     expect(t?.severity).toBe("info");
     expect(t?.file).toBe("a.ts");
     expect(t?.line).toBe(2);
+  });
+
+  describe("todo-marker real new-file line numbers", () => {
+    const todoLines = (hunks: string) =>
+      runL0([{ file: "a.ts", hunks, truncated: false }])
+        .filter((x) => x.rule === "todo-marker")
+        .map((x) => x.line);
+
+    it("uses the new-file start from the @@ header and counts added lines", () => {
+      const hunks = ["@@ -10,2 +40,3 @@", " const a = 1;", "+// TODO wire this", " const b = 2;"].join("\n");
+      expect(todoLines(hunks)).toEqual([41]);
+    });
+
+    it("reports a TODO on a context line at its new-file line number", () => {
+      const hunks = ["@@ -5,3 +7,3 @@", " keep", " // FIXME ctx", "+added"].join("\n");
+      expect(todoLines(hunks)).toEqual([8]);
+    });
+
+    it("skips TODO on removed lines entirely (no finding)", () => {
+      const hunks = ["@@ -1,2 +1,1 @@", "-// TODO gone", " kept"].join("\n");
+      expect(todoLines(hunks)).toEqual([]);
+    });
+
+    it("removed lines do not advance the new-file counter", () => {
+      const hunks = ["@@ -1,3 +1,2 @@", "-old one", "-old two", "+// XXX new"].join("\n");
+      expect(todoLines(hunks)).toEqual([1]);
+    });
+
+    it("applies per-hunk offsets across multiple hunks", () => {
+      const hunks = [
+        "@@ -1,2 +1,2 @@",
+        " a",
+        "+// TODO first",
+        "@@ -50,2 +100,3 @@",
+        " b",
+        "+// FIXME second",
+        " c",
+      ].join("\n");
+      expect(todoLines(hunks)).toEqual([2, 101]);
+    });
+
+    it("hunk header without explicit counts still parses", () => {
+      const hunks = ["@@ -3 +9 @@", "+// TODO single"].join("\n");
+      expect(todoLines(hunks)).toEqual([9]);
+    });
   });
 });
