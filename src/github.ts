@@ -37,7 +37,7 @@ export interface PostReviewOptions {
 
 const OFF_DIFF = /could not be resolved|part of the diff|line.*(diff|resolve)/i;
 // Commit-centric only: a bare "sha" would also match unrelated text such as "sha256:...".
-const STALE_SHA = /commit_id|head[- ]commit|not a valid commit/i;
+const STALE_SHA = /commit[ _]id|head[- ]commit|not a valid commit/i;
 
 interface HttpLikeError {
   status?: unknown;
@@ -84,12 +84,17 @@ function repoOf(): { owner: string; repo: string } {
 
 /**
  * Off-diff fallback: inline comments move into the review body as a plain list, so the
- * retry posts a general-only review. Multi-line bodies keep their lines indented under the
- * list item. Fences inside the bodies are kept as-is.
+ * retry posts a general-only review. Each item is `- path:line`, and every line of the
+ * comment body follows indented by two spaces under it, so a multi-line body stays inside
+ * its list item. CRLF and stray CR characters are normalized to LF first, so no `\r` leaks
+ * into the body. Code fences are not special-cased: they are indented like any other line.
  */
 function foldComments(body: string, comments: InlineComment[]): string {
   if (comments.length === 0) return body;
-  const items = comments.map((c) => `- ${c.path}:${c.line}\n  ${c.body.replace(/\n/g, "\n  ")}`);
+  const items = comments.map((c) => {
+    const text = c.body.replace(/\r\n?/g, "\n");
+    return `- ${c.path}:${c.line}\n  ${text.replace(/\n/g, "\n  ")}`;
+  });
   return `${body}\n\n**Findings not placed inline:**\n${items.join("\n")}`;
 }
 

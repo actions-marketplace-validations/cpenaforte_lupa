@@ -203,6 +203,18 @@ describe("postReview", () => {
     expect(body).toContain("- b.ts:9\n  **medium** [r] first\n  second line\n  third line");
   });
 
+  it("CRLF and stray CR in a comment body are normalized before the fold indent", async () => {
+    const crlf: ReviewPayload = {
+      ...payload,
+      comments: [{ path: "c.ts", line: 2, side: "RIGHT", body: "first\r\nsecond\rthird" }],
+    };
+    const f = fakeOctokit([httpError(422, OFF_DIFF_MSG, OFF_DIFF_ERRORS), "ok"]);
+    await postReview(f.octokit, 1, crlf);
+    const body = String(f.reviewArgs[1].body);
+    expect(body).toContain("- c.ts:2\n  first\n  second\n  third");
+    expect(body).not.toContain("\r");
+  });
+
   it("stale then off-diff: three POSTs, ends as a general-only COMMENT with empty comments", async () => {
     const f = fakeOctokit([httpError(422, STALE_MSG), httpError(422, OFF_DIFF_MSG, OFF_DIFF_ERRORS), "ok"]);
     const r = await postReview(f.octokit, 1, payload);
@@ -242,6 +254,22 @@ describe("postReview", () => {
     await expect(postReview(f.octokit, 1, payload)).rejects.toThrow();
     expect(f.createReview).toHaveBeenCalledTimes(2);
     expect(f.calls).toEqual(["post", "get", "post"]);
+  });
+
+  it("a 422 whose message says 'Commit ID' (with a space) takes the stale path", async () => {
+    const f = fakeOctokit([httpError(422, "Unprocessable Entity: Commit ID is out of date"), "ok"]);
+    const r = await postReview(f.octokit, 1, payload);
+    expect(f.calls).toEqual(["post", "get", "post"]);
+    expect(r.retriedWithNewSha).toBe(true);
+  });
+
+  it("a single 422 matching both off-diff and stale patterns takes the stale path first", async () => {
+    const both = "Unprocessable Entity: commit_id is not the head commit; Line could not be resolved";
+    const f = fakeOctokit([httpError(422, both, OFF_DIFF_ERRORS), "ok"]);
+    const r = await postReview(f.octokit, 1, payload);
+    expect(f.calls).toEqual(["post", "get", "post"]);
+    expect(f.reviewArgs[1].comments).toEqual(payload.comments);
+    expect(r).toEqual({ degraded: false, retriedWithNewSha: true });
   });
 
   it("a 422 mentioning sha256 does not take the stale path", async () => {
