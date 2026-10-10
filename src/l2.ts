@@ -100,7 +100,7 @@ export function l2Argv(name: string): { cmd: string; args: string[] } {
 }
 
 /** Real runner: `execFile` with args array (no shell). Resolves `undefined` on success. */
-export const execTool: Spawner = (cmd, args, cwd) =>
+const execTool: Spawner = (cmd, args, cwd) =>
   new Promise((resolve) => {
     execFile(cmd, args, { cwd, maxBuffer: MAX_BUFFER }, (err, stdout, stderr) => {
       if (!err) return resolve(undefined);

@@ -130,10 +130,18 @@ describe("runL2 behavior", () => {
     expect(findings[0].message).toContain("could not run (EACCES)");
   });
 
-  it("clean run (exit 0) → no findings", async () => {
-    const bin = makeTmp({ gofmt: "#!/bin/sh\nexit 0\n" });
-    chmodSync(join(bin, "gofmt"), 0o755);
-    process.env.PATH = bin;
-    expect(await runL2("tests/fixtures/go")).toEqual([]);
+  it("clean run (exit 0) → tool invoked via the seam, yields no findings", async () => {
+    // Spawner returns undefined === exit 0. Recording the call proves the tool was
+    // actually invoked (not silently skipped as ENOENT).
+    const calls: Array<{ cmd: string; args: string[]; cwd: string }> = [];
+    const spawn = async (cmd: string, args: string[], cwd: string): Promise<ToolFailure | undefined> => {
+      calls.push({ cmd, args, cwd });
+      return undefined;
+    };
+    expect(await runL2("tests/fixtures/go", spawn)).toEqual([]);
+    expect(calls).toEqual([
+      { cmd: "gofmt", args: ["-l", "."], cwd: "tests/fixtures/go" },
+      { cmd: "go", args: ["vet", "./..."], cwd: "tests/fixtures/go" },
+    ]);
   });
 });
