@@ -88,6 +88,7 @@ function repoOf(): { owner: string; repo: string } {
  * comment body follows indented by two spaces under it, so a multi-line body stays inside
  * its list item. CRLF and stray CR characters are normalized to LF first, so no `\r` leaks
  * into the body. Code fences are not special-cased: they are indented like any other line.
+ * An empty or whitespace-only body emits the bare `- path:line` item with no continuation line.
  */
 function foldComments(body: string, comments: InlineComment[]): string {
   if (comments.length === 0) return body;
