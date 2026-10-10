@@ -5,8 +5,8 @@ Manual checks against a disposable consumer repository, run on the **canary** (t
 assertions to verify. The unit tests cover the mapping logic (`eventFor`, `exitFor`, `buildBody`);
 these cases cover the wiring in a real GitHub run, including live Ollama, which CI does not run.
 
-Setup: a private test repository with the workflow from `docs/workflow-template.yml` pointing at the
-canary SHA, `vars.PR_REVIEWER_MODEL` and `secrets.LLM_API_KEY` set, and `fail_level: warning`
+Setup: a private test repository with the workflow from `docs/workflow-template.yml` pointing at
+`@v0.1.0`, `vars.PR_REVIEWER_MODEL` and `secrets.LLM_API_KEY` set, and `fail_level: warning`
 unless a case says otherwise. Read the review body on the PR, the job summary, and the
 `pr-reviewer-out` artifact.
 

@@ -29,11 +29,19 @@ function jobKeys(c: string): string[] {
   return [...jobs.matchAll(/^  ([A-Za-z0-9_-]+):\s*$/gm)].map((m) => m[1]);
 }
 
-/** Lines of every job-level `env:` block (exactly four spaces of indent) in a workflow file. */
+/**
+ * Contents of every job-level `env:` (exactly four spaces of indent): the block form (indented body
+ * below it) and the single-line inline flow form `env: { KEY: value }`.
+ */
 function jobEnvBlocks(text: string): string[] {
   const lines = text.split("\n");
   const blocks: string[] = [];
   for (let i = 0; i < lines.length; i++) {
+    const inline = /^    env:\s*\{(.*)\}\s*$/.exec(lines[i]);
+    if (inline) {
+      blocks.push(inline[1]);
+      continue;
+    }
     if (!/^    env:\s*$/.test(lines[i])) continue;
     const body: string[] = [];
     for (let j = i + 1; j < lines.length && (lines[j].trim() === "" || /^ {6,}/.test(lines[j])); j++) body.push(lines[j]);
@@ -152,6 +160,9 @@ describe("ci workflow", () => {
   });
 
   it("no job-level env uses the runner context (not allowed there by actionlint)", () => {
+    // Negative control: the inline flow form must be detected too.
+    const inlineSample = '    env: { OUT_DIR: "${{ runner.temp }}/pr-reviewer-out" }\n';
+    expect(jobEnvBlocks(inlineSample).join("\n")).toMatch(/\$\{\{\s*runner\./);
     for (const f of [CI, "docs/workflow-template.yml", "docs/workflow-template-privileged.yml"]) {
       for (const block of jobEnvBlocks(fs.readFileSync(f, "utf8"))) {
         expect(block, `runner. in job-level env of ${f}`).not.toMatch(/\$\{\{\s*runner\./);
