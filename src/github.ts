@@ -4,10 +4,21 @@ import type { InlineComment, ReviewPayload } from "./review.js";
 export type Octokit = ReturnType<typeof getOctokit>;
 
 /**
- * Token cannot write reviews (fork PR with read-only token). The caller degrades to
- * summary + artifact and does not treat this as a failed run.
+ * Token cannot write reviews (fork PR with a read-only token, or a 403 from the API).
+ * `status` and `detail` (the API's own message) are kept so the caller can log why.
+ * The caller degrades to summary + artifact and does not treat this as a failed run.
  */
-export class ReadonlyTokenError extends Error {}
+export class ReadonlyTokenError extends Error {
+  readonly status: number | undefined;
+  readonly detail: string;
+
+  constructor(message: string, status?: number, detail = "") {
+    super(message);
+    this.name = "ReadonlyTokenError";
+    this.status = status;
+    this.detail = detail;
+  }
+}
 
 export interface PostReviewResult {
   /** True when inline comments were folded into the review body after an off-diff 422. */
@@ -16,8 +27,17 @@ export interface PostReviewResult {
   retriedWithNewSha: boolean;
 }
 
+export interface PostReviewOptions {
+  /**
+   * Computed by the caller (fork PR + token type). When explicitly false, throws
+   * ReadonlyTokenError before any POST is attempted.
+   */
+  canWrite?: boolean;
+}
+
 const OFF_DIFF = /could not be resolved|part of the diff|line.*(diff|resolve)/i;
-const STALE_SHA = /commit_id|head commit|sha/i;
+// Commit-centric only: a bare "sha" would also match unrelated text such as "sha256:...".
+const STALE_SHA = /commit_id|head[- ]commit|not a valid commit/i;
 
 interface HttpLikeError {
   status?: unknown;
@@ -30,6 +50,11 @@ function statusOf(e: unknown): number | undefined {
   return typeof s === "number" ? s : undefined;
 }
 
+function messageOf(e: unknown): string {
+  const m = (e as HttpLikeError | null)?.message;
+  return typeof m === "string" ? m : "";
+}
+
 /** Text used only for classifying a 422. Never copied into thrown errors. */
 function detailOf(e: unknown): string {
   const err = e as HttpLikeError | null;
@@ -39,8 +64,18 @@ function detailOf(e: unknown): string {
   } catch {
     data = "";
   }
-  const msg = typeof err?.message === "string" ? err.message : "";
-  return `${msg} ${data}`;
+  return `${messageOf(e)} ${data}`;
+}
+
+/** The API's own message for a 403, kept on ReadonlyTokenError for the caller's log. */
+function apiMessageOf(e: unknown): string {
+  const data = (e as HttpLikeError | null)?.response?.data as { message?: unknown } | undefined;
+  if (typeof data?.message === "string" && data.message !== "") return data.message;
+  return messageOf(e);
+}
+
+function positiveInt(v: unknown): v is number {
+  return typeof v === "number" && Number.isInteger(v) && v > 0;
 }
 
 function repoOf(): { owner: string; repo: string } {
@@ -49,7 +84,8 @@ function repoOf(): { owner: string; repo: string } {
 
 /**
  * Off-diff fallback: inline comments move into the review body as a plain list, so the
- * retry posts a general-only review. Fences inside the bodies are kept as-is.
+ * retry posts a general-only review. Multi-line bodies keep their lines indented under the
+ * list item. Fences inside the bodies are kept as-is.
  */
 function foldComments(body: string, comments: InlineComment[]): string {
   if (comments.length === 0) return body;
@@ -59,9 +95,11 @@ function foldComments(body: string, comments: InlineComment[]): string {
 
 /**
  * Posts one consolidated review to `pulls/{pr}/reviews`.
- * - 422 line off-diff: inline comments are folded into the body and the POST is retried once.
+ * - `canWrite: false` (caller-computed): throws ReadonlyTokenError before any POST.
  * - 422 stale commit_id: head_sha is re-resolved and the POST is retried once.
- * - 403 (read-only token): throws ReadonlyTokenError.
+ * - 422 line off-diff: inline comments are folded into the body and the POST is retried once.
+ *   At most three POSTs in total (stale, then off-diff, then the final attempt).
+ * - 403 (read-only token): throws ReadonlyTokenError with status and the API message.
  * - Any other failure throws a sanitized Error; the upstream message is never copied,
  *   so tokens or keys echoed by the API cannot leak into logs.
  */
@@ -69,7 +107,11 @@ export async function postReview(
   octokit: Octokit,
   pr: number,
   payload: ReviewPayload,
+  opts?: PostReviewOptions,
 ): Promise<PostReviewResult> {
+  if (opts?.canWrite === false) {
+    throw new ReadonlyTokenError("review post skipped: token cannot write reviews (fork PR)");
+  }
   const { owner, repo } = repoOf();
   let commitId = payload.commit_id;
   let body = payload.body;
@@ -92,22 +134,33 @@ export async function postReview(
     } catch (e) {
       const status = statusOf(e);
       if (status === 403 && !/rate limit/i.test(detailOf(e))) {
-        throw new ReadonlyTokenError("review post refused: token cannot write reviews (HTTP 403)");
+        throw new ReadonlyTokenError(
+          "review post refused: token cannot write reviews (HTTP 403)",
+          403,
+          apiMessageOf(e),
+        );
       }
       if (status !== 422) {
         throw new Error(`review post failed${status === undefined ? "" : ` (HTTP ${status})`}`);
       }
       const detail = detailOf(e);
+      if (!retriedWithNewSha && STALE_SHA.test(detail)) {
+        let head: string;
+        try {
+          const pull = await octokit.rest.pulls.get({ owner, repo, pull_number: pr });
+          head = pull.data.head.sha;
+        } catch (getErr) {
+          const s = statusOf(getErr);
+          throw new Error(`head sha re-resolve failed${s === undefined ? "" : ` (HTTP ${s})`}`);
+        }
+        commitId = head;
+        retriedWithNewSha = true;
+        continue;
+      }
       if (!degraded && comments.length > 0 && OFF_DIFF.test(detail)) {
         body = foldComments(body, comments);
         comments = [];
         degraded = true;
-        continue;
-      }
-      if (!retriedWithNewSha && STALE_SHA.test(detail)) {
-        const pull = await octokit.rest.pulls.get({ owner, repo, pull_number: pr });
-        commitId = pull.data.head.sha;
-        retriedWithNewSha = true;
         continue;
       }
       throw new Error("review post rejected (HTTP 422)");
@@ -127,10 +180,6 @@ export async function postIssueFallback(
   if (!opts.issuesWrite) throw new Error("issue fallback requires issues: write");
   const { owner, repo } = repoOf();
   await octokit.rest.issues.createComment({ owner, repo, issue_number: opts.pr, body: opts.body });
-}
-
-function positiveInt(v: unknown): v is number {
-  return typeof v === "number" && Number.isInteger(v) && v > 0;
 }
 
 /**
@@ -195,13 +244,9 @@ export function shouldTrigger(
         trusted
       );
     case "pull_request_review":
-      return (
-        payload.action === "submitted" &&
-        (payload.reviewBody ?? "").trim() !== "" &&
-        trusted
-      );
+      return payload.action === "submitted" && (payload.reviewBody ?? "").trim() !== "" && trusted;
     case "workflow_dispatch":
-      return payload.prNumber !== null && payload.prNumber !== undefined;
+      return positiveInt(payload.prNumber);
     default:
       return false;
   }

@@ -16,12 +16,26 @@ const payload: ReviewPayload = {
   comments: [{ path: "a.ts", line: 4, side: "RIGHT", body: "**high** [r] m" }],
 };
 
+const OFF_DIFF_MSG = "Unprocessable Entity";
+const OFF_DIFF_ERRORS = [{ message: "Line could not be resolved" }];
+const STALE_MSG = "Unprocessable Entity: commit_id is not the head commit";
+
+beforeEach(() => {
+  process.env.GITHUB_REPOSITORY = "owner/repo";
+});
+afterEach(() => {
+  delete process.env.GITHUB_REPOSITORY;
+});
+
 function httpError(status: number, message: string, errors?: unknown[]): Error {
   return Object.assign(new Error(message), { status, response: { data: { message, errors } } });
 }
 
-/** Fake octokit: createReview runs the scripted outcomes in order; pulls.get returns headSha. */
-function fakeOctokit(outcomes: Array<"ok" | Error>, headSha = "sha-new") {
+/**
+ * Fake octokit. createReview runs the scripted outcomes in order ("ok" or an Error).
+ * pulls.get resolves to headSha, or rejects with getError when given.
+ */
+function fakeOctokit(outcomes: Array<"ok" | Error>, opts: { headSha?: string; getError?: Error } = {}) {
   const calls: string[] = [];
   const reviewArgs: Array<Record<string, unknown>> = [];
   const createReview = vi.fn(async (args: Record<string, unknown>) => {
@@ -33,22 +47,20 @@ function fakeOctokit(outcomes: Array<"ok" | Error>, headSha = "sha-new") {
   });
   const get = vi.fn(async () => {
     calls.push("get");
-    return { data: { head: { sha: headSha } } };
+    if (opts.getError !== undefined) throw opts.getError;
+    return { data: { head: { sha: opts.headSha ?? "sha-new" } } };
   });
   const createComment = vi.fn(async () => {
     calls.push("comment");
     return { data: {} };
   });
   const octokit = { rest: { pulls: { createReview, get }, issues: { createComment } } } as unknown as Octokit;
-  return { octokit, calls, reviewArgs, createReview, createComment };
+  return { octokit, calls, reviewArgs, createReview, get, createComment };
 }
 
 /** First POST rejects 422 line-off-diff, second succeeds. */
 async function postReviewWithMock(calls: string[]) {
-  const f = fakeOctokit([
-    httpError(422, "Unprocessable Entity", [{ message: "Line could not be resolved" }]),
-    "ok",
-  ]);
+  const f = fakeOctokit([httpError(422, OFF_DIFF_MSG, OFF_DIFF_ERRORS), "ok"]);
   const r = await postReview(f.octokit, 1, payload);
   calls.push(...f.calls);
   return r;
@@ -56,7 +68,7 @@ async function postReviewWithMock(calls: string[]) {
 
 /** First POST rejects 422 stale commit_id; head_sha is re-resolved and the retry succeeds. */
 async function postReviewStaleMock() {
-  const f = fakeOctokit([httpError(422, "Unprocessable Entity: commit_id is not the head commit"), "ok"]);
+  const f = fakeOctokit([httpError(422, STALE_MSG), "ok"]);
   const r = await postReview(f.octokit, 1, payload);
   expect(f.calls).toEqual(["post", "get", "post"]);
   expect(f.reviewArgs[1].commit_id).toBe("sha-new");
@@ -127,6 +139,13 @@ describe("shouldTrigger", () => {
     expect(shouldTrigger("workflow_run", {})).toBe(false);
   });
 
+  it("dispatch prNumber uses the same positive-integer rule as resolvePrNumber", () => {
+    expect(shouldTrigger("workflow_dispatch", { prNumber: 0 })).toBe(false);
+    expect(shouldTrigger("workflow_dispatch", { prNumber: -1 })).toBe(false);
+    expect(shouldTrigger("workflow_dispatch", { prNumber: 1.5 })).toBe(false);
+    expect(shouldTrigger("workflow_dispatch", { prNumber: 1 })).toBe(true);
+  });
+
   it("covers review association too", () => {
     expect(
       shouldTrigger("pull_request_review", { action: "submitted", reviewBody: "LGTM", authorAssociation: "MEMBER" }),
@@ -144,18 +163,14 @@ describe("shouldTrigger", () => {
     expect(
       shouldTrigger("pull_request_review", { action: "submitted", reviewBody: "", authorAssociation: "MEMBER" }),
     ).toBe(false);
+    // Whitespace-only review body counts as empty (deliberate).
+    expect(
+      shouldTrigger("pull_request_review", { action: "submitted", reviewBody: "  \n ", authorAssociation: "MEMBER" }),
+    ).toBe(false);
   });
 });
 
-beforeEach(() => {
-  process.env.GITHUB_REPOSITORY = "owner/repo";
-});
-afterEach(() => {
-  delete process.env.GITHUB_REPOSITORY;
-});
-
 describe("postReview", () => {
-
   it("422 off-diff degrades to general and retries once; stale sha re-resolves", async () => {
     const calls: string[] = [];
     const r = await postReviewWithMock(calls);
@@ -166,7 +181,7 @@ describe("postReview", () => {
   });
 
   it("off-diff retry posts with no inline comments and the comments folded into the body", async () => {
-    const f = fakeOctokit([httpError(422, "Unprocessable Entity", [{ message: "Line could not be resolved" }]), "ok"]);
+    const f = fakeOctokit([httpError(422, OFF_DIFF_MSG, OFF_DIFF_ERRORS), "ok"]);
     await postReview(f.octokit, 7, payload);
     const retry = f.reviewArgs[1];
     expect(retry.comments).toEqual([]);
@@ -177,17 +192,40 @@ describe("postReview", () => {
     expect(retry.repo).toBe("repo");
   });
 
+  it("folds a multi-line comment body, indenting its continuation lines under the list item", async () => {
+    const multi: ReviewPayload = {
+      ...payload,
+      comments: [{ path: "b.ts", line: 9, side: "RIGHT", body: "**medium** [r] first\nsecond line\nthird line" }],
+    };
+    const f = fakeOctokit([httpError(422, OFF_DIFF_MSG, OFF_DIFF_ERRORS), "ok"]);
+    await postReview(f.octokit, 1, multi);
+    const body = String(f.reviewArgs[1].body);
+    expect(body).toContain("- b.ts:9\n  **medium** [r] first\n  second line\n  third line");
+  });
+
+  it("stale then off-diff: three POSTs, ends as a general-only COMMENT with empty comments", async () => {
+    const f = fakeOctokit([httpError(422, STALE_MSG), httpError(422, OFF_DIFF_MSG, OFF_DIFF_ERRORS), "ok"]);
+    const r = await postReview(f.octokit, 1, payload);
+    expect(f.calls).toEqual(["post", "get", "post", "post"]);
+    expect(f.createReview).toHaveBeenCalledTimes(3);
+    const last = f.reviewArgs[2];
+    expect(last.event).toBe("COMMENT");
+    expect(last.comments).toEqual([]);
+    expect(last.commit_id).toBe("sha-new");
+    expect(r).toEqual({ degraded: true, retriedWithNewSha: true });
+  });
+
   it("degrades at most once: a second off-diff 422 throws", async () => {
     const f = fakeOctokit([
-      httpError(422, "Unprocessable Entity", [{ message: "Line could not be resolved" }]),
-      httpError(422, "Unprocessable Entity", [{ message: "Line could not be resolved" }]),
+      httpError(422, OFF_DIFF_MSG, OFF_DIFF_ERRORS),
+      httpError(422, OFF_DIFF_MSG, OFF_DIFF_ERRORS),
     ]);
     await expect(postReview(f.octokit, 1, payload)).rejects.toThrow();
     expect(f.createReview).toHaveBeenCalledTimes(2);
   });
 
   it("does not degrade when there are no inline comments", async () => {
-    const f = fakeOctokit([httpError(422, "Unprocessable Entity", [{ message: "Line could not be resolved" }])]);
+    const f = fakeOctokit([httpError(422, OFF_DIFF_MSG, OFF_DIFF_ERRORS)]);
     await expect(postReview(f.octokit, 1, { ...payload, comments: [] })).rejects.toThrow();
     expect(f.createReview).toHaveBeenCalledTimes(1);
   });
@@ -200,18 +238,59 @@ describe("postReview", () => {
   });
 
   it("stale sha retries once only", async () => {
-    const f = fakeOctokit([
-      httpError(422, "Unprocessable Entity: commit_id is not the head commit"),
-      httpError(422, "Unprocessable Entity: commit_id is not the head commit"),
-    ]);
+    const f = fakeOctokit([httpError(422, STALE_MSG), httpError(422, STALE_MSG)]);
     await expect(postReview(f.octokit, 1, payload)).rejects.toThrow();
     expect(f.createReview).toHaveBeenCalledTimes(2);
     expect(f.calls).toEqual(["post", "get", "post"]);
   });
 
-  it("fork read-only token (403) throws ReadonlyTokenError", async () => {
+  it("a 422 mentioning sha256 does not take the stale path", async () => {
+    const f = fakeOctokit([httpError(422, "Unprocessable Entity: sha256:abc is invalid")]);
+    await expect(postReview(f.octokit, 1, payload)).rejects.toThrow();
+    expect(f.get).not.toHaveBeenCalled();
+    expect(f.createReview).toHaveBeenCalledTimes(1);
+  });
+
+  it("pulls.get rejection on the stale path throws a sanitized error and does not retry", async () => {
+    const f = fakeOctokit([httpError(422, STALE_MSG)], { getError: new Error("boom sk-secret-abc") });
+    const err = await postReview(f.octokit, 1, payload).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(Error);
+    expect(String(err)).not.toContain("sk-secret-abc");
+    expect(f.createReview).toHaveBeenCalledTimes(1);
+  });
+
+  it("a 422 whose message carries the key does not leak it into the thrown error", async () => {
+    const f = fakeOctokit([httpError(422, "Unprocessable Entity: bad token sk-secret-abc")]);
+    const err = await postReview(f.octokit, 1, payload).catch((e: unknown) => e);
+    expect(String(err)).not.toContain("sk-secret-abc");
+  });
+
+  it("canWrite false throws ReadonlyTokenError before any POST", async () => {
+    const f = fakeOctokit(["ok"]);
+    const err = await postReview(f.octokit, 1, payload, { canWrite: false }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ReadonlyTokenError);
+    expect(f.createReview).not.toHaveBeenCalled();
+    expect(f.calls).toEqual([]);
+  });
+
+  it("canWrite true or omitted posts normally", async () => {
+    const a = fakeOctokit(["ok"]);
+    await postReview(a.octokit, 1, payload, { canWrite: true });
+    expect(a.createReview).toHaveBeenCalledTimes(1);
+    const b = fakeOctokit(["ok"]);
+    await postReview(b.octokit, 1, payload);
+    expect(b.createReview).toHaveBeenCalledTimes(1);
+  });
+
+  it("403 throws ReadonlyTokenError with status and the API message as detail", async () => {
     const f = fakeOctokit([httpError(403, "Resource not accessible by integration")]);
-    await expect(postReview(f.octokit, 1, payload)).rejects.toBeInstanceOf(ReadonlyTokenError);
+    const err = await postReview(f.octokit, 1, payload).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ReadonlyTokenError);
+    expect(err).toBeInstanceOf(Error);
+    const ro = err as ReadonlyTokenError;
+    expect(ro.name).toBe("ReadonlyTokenError");
+    expect(ro.status).toBe(403);
+    expect(ro.detail).toContain("Resource not accessible by integration");
   });
 
   it("never logs api key in result or throw", async () => {
@@ -231,13 +310,17 @@ describe("postIssueFallback", () => {
 
   it("throws when disabled", async () => {
     const f = fakeOctokit([]);
-    await expect(postIssueFallback(f.octokit, { enabled: false, issuesWrite: true, pr: 4, body: "hi" })).rejects.toThrow();
+    await expect(
+      postIssueFallback(f.octokit, { enabled: false, issuesWrite: true, pr: 4, body: "hi" }),
+    ).rejects.toThrow();
     expect(f.createComment).not.toHaveBeenCalled();
   });
 
   it("throws without issues:write", async () => {
     const f = fakeOctokit([]);
-    await expect(postIssueFallback(f.octokit, { enabled: true, issuesWrite: false, pr: 4, body: "hi" })).rejects.toThrow();
+    await expect(
+      postIssueFallback(f.octokit, { enabled: true, issuesWrite: false, pr: 4, body: "hi" }),
+    ).rejects.toThrow();
     expect(f.createComment).not.toHaveBeenCalled();
   });
 });
