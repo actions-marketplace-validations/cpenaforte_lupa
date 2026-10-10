@@ -1025,3 +1025,86 @@ Tag immutable (`git tag v0.1.0` + SHA), move `v1` only after canary, marketplace
 git add .github/workflows/ci.yml docs/e2e-checklist.md
 git commit -m "ci: integration workflow and e2e checklist"
 ```
+
+---
+
+### Task 15: Responses adapter (`openai-responses`)
+
+**Files:**
+- Create: `src/adapters/responses.ts`
+- Test: `tests/adapters-responses.test.ts`
+
+**Interfaces:**
+- Consumes: `ResolvedEndpoint` (baseUrl+path ending `/responses`), `{system, user}` messages, `PR_REVIEW_SCHEMA`, `{model, apiKey, temperature?, topP?, maxTokens, timeoutSeconds}`
+- Produces: `export async function callResponses(ep, messages, o): Promise<LlmResult>` (same LlmResult union as Task 9) — request `{model, input:[{role,content}...], max_output_tokens?, text:{format:{type:"json_schema",...}} where supported}`; temperature/top_p omitted by default (validateSampling shared); `text.format` 400 → single retry without format + manual parse; response joins `output[].content[]` output_text/text; `refusal` item → content-filter skip; `incomplete` → degrade (length-equivalent); timeout/retry/redact rules identical to Task 9
+
+- [ ] **Step 1: Write the failing tests**
+
+```ts
+it("posts input array + max_output_tokens + strict format", ...); // assert exact body via fetch mock
+it("falls back without format on 400", ...);
+it("joins output_text parts and parses findings", ...);
+it("refusal item → content-filter skip; incomplete → degrade", ...);
+it("reasoning model maps max_completion_tokens→max_output_tokens", ...);
+```
+
+- [ ] **Step 2: Run tests to verify they fail**
+
+Run: `npx vitest run tests/adapters-responses.test.ts`
+Expected: FAIL with "Cannot find module"
+
+- [ ] **Step 3: Implement `src/adapters/responses.ts`**
+
+Per spec §9.1. Reuse Task 9 helpers where importable (redact, retry, timeout, parse/validate); do NOT duplicate them — import from llm.ts (export what's needed first as a tiny refactor of llm.ts with no behavior change, covered by existing tests).
+
+- [ ] **Step 4: Run tests to verify they pass**
+
+Run: `npx vitest run`
+Expected: PASS
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/adapters/responses.ts tests/adapters-responses.test.ts src/llm.ts tests/llm.test.ts
+git commit -m "feat: openai-responses adapter"
+```
+
+### Task 16: Messages adapter (`anthropic-messages`)
+
+**Files:**
+- Create: `src/adapters/messages.ts`
+- Test: `tests/adapters-messages.test.ts`
+
+**Interfaces:**
+- Consumes: same as Task 15
+- Produces: `export async function callMessages(ep, messages, o): Promise<LlmResult>` — headers `x-api-key` + `anthropic-version: 2023-06-01` (+ User-Agent/session from endpoint); body `{model, max_tokens (REQUIRED from maxTokens), system, messages:[{role:"user",content}]}`; NEVER temperature/top_p/n/response_format by default (validateSampling shared); response concatenates `content[].text`; `stop_reason` end_turn→ok, max_tokens→degrade, refusal→skip; same timeout/retry/redact rules
+
+Steps 1-5 mirror Task 15 (failing tests → fail → implement → pass → commit `feat: anthropic-messages adapter`).
+
+### Task 17: Google adapter (`google-models`)
+
+**Files:**
+- Create: `src/adapters/google.ts`
+- Test: `tests/adapters-google.test.ts`
+
+**Interfaces:**
+- Consumes: same as Task 15 (endpoint path contains `/models/`)
+- Produces: `export async function callGoogle(ep, modelId, messages, o): Promise<LlmResult>` — `{contents:[{role:"user",parts:[{text}]}], systemInstruction:{parts:[{text}]}, generationConfig:{responseMimeType:"application/json", responseSchema:<schema>, maxOutputTokens}}`; on 400 retry without responseSchema/responseMimeType + manual parse; response `candidates[0].content.parts[]` text join; `finishReason` STOP→ok, MAX_TOKENS→degrade, SAFETY/other→skip no retry; auth prefer `x-goog-api-key` header (fallback `?key=` — never log); same timeout/retry/redact rules
+
+Steps 1-5 mirror Task 15 (commit `feat: google-models adapter`).
+
+### Task 18: Adapter routing + matrix + docs
+
+**Files:**
+- Modify: `src/providers.ts` (auto resolves NON_CHAT pairs to their adapter instead of fail-fast), `src/llm.ts` (dispatch by resolved apiStyle: openai-chat→callLlm, responses→callResponses, messages→callMessages, google→callGoogle), `README.md` (adapter table + per-provider notes), `docs/workflow-template.yml` (comment documenting llm_api_style values — comment only)
+- Test: `tests/adapters-routing.test.ts`
+
+**Interfaces:**
+- Consumes: all adapter tasks
+- Produces: `auto` end-to-end per pair (zen gpt-6-luna→responses, zen claude-sonnet-5-5→messages, zen gemini-3.8-flash→google, go qwen3.8-max→messages, go gpt-6-luna→responses); explicit styles functional; unknown pairs still fail-fast
+
+- [ ] **Step 1: Write failing tests** (routing table incl. the 5 pairs above + chat pairs unchanged + fail-fast for truly-unknown `custom` model with v2 style... per plan: custom non-chat without v2 → path-only error stays)
+- [ ] **Step 2: Run → FAIL** (`npx vitest run tests/adapters-routing.test.ts`)
+- [ ] **Step 3: Implement** (providers auto-map update + llm.ts dispatcher + README section + template comment)
+- [ ] **Step 4: Run → PASS** (full `npx vitest run` + `npm run build` + `node --check dist/index.js`)
+- [ ] **Step 5: Commit** (`git add` the touched files; `feat: adapter routing, matrix and docs`)

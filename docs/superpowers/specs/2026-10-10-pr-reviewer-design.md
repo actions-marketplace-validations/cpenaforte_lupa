@@ -84,3 +84,33 @@ Prompt injection é LLM01 OWASP. Sem números de taxa como garantia (dependem de
 ## Escopo v1 vs v2
 
 v1: acima (só `openai-chat` suportado; `llm_path` path-only experimental). v2: adapters Responses/Messages/Google nativos, matriz por-família completa, retrieval cross-file (code graph), MCP (Jira/Sentry), fix suggestions auto-commit, dashboard FP.
+
+## 9. Adapters v2 (escopo aprovado 2026-10-10 — só adapters, resto do v2 fica para depois)
+
+Objetivo: `llm_api_style` explícito e `auto` passam a suportar todos os endpoints Zen/Go, sem mudar nada do fast-path, postagem ou fluxos. Mesmo contrato de saída: `{findings: [{severity, file, line?, rule, message, suggestion?}]}` + mesmo `LlmResult` (`ok/timeout/content-filter/invalid-json/http-error/unsupported`).
+
+### 9.1 `openai-responses` — POST `{base}/responses`
+- Request: `{model, input: [{role:"system",content},{role:"user",content}], max_output_tokens?, temperature? (omitido por default, mesmas regras validateSampling)}`. Structured output: `text: {format: {type:"json_schema",name:"pr_review",schema,strict:true}}` onde suportado (OpenAI Responses); se 400 → retry sem format + parse manual.
+- Response: junta `output[].content[]` com `type:"output_text"` (ou `text`) → string JSON → mesmo parse/validação do chat. `refusal` em item → trata como refusal. `incomplete` (max tokens) → equivale a `length`: degradar para resumo.
+- Modelos: GPT/Grok/Muse-Spark via Zen (`.../zen/v1/responses`), Go (`.../zen/go/v1/responses`): `gpt-6-luna`, `gpt-6.1-sol`, `gpt-6-astra`, `grok-4.7/4.6`, `muse-spark-1.3-contributor(-free)`, etc.
+- Auth: `Authorization: Bearer` + `User-Agent: pr-reviewer/1.0` (+ `x-opencode-session` no Go).
+
+### 9.2 `anthropic-messages` — POST `{base}/messages`
+- Headers: `x-api-key`, `anthropic-version: 2023-06-01`, `content-type: application/json` (+ `User-Agent`, + `x-opencode-session` no Go).
+- Request: `{model, max_tokens (OBRIGATÓRIO, de llm_max_tokens), system, messages: [{role:"user",content}]}`. NUNCA `temperature`/`top_p`/`n`/`response_format` por default (regras validateSampling existentes: Claude 4.7+ rejeita).
+- Response: concatena `content[]` com `type:"text"` → parse manual + validador. `stop_reason`: `end_turn`=ok, `max_tokens`=degradar, `refusal` → pular (campo sempre vazio na camada compat — usa nativo aqui, checar de verdade).
+- Modelos: Claude (Opus/Sonnet/Haiku/Fable) + Qwen-Plus/Flash + MiniMax no Go via `.../messages`.
+
+### 9.3 `google-models` — POST `{base}/v1beta/models/<id>:generateContent`
+- Para Zen (`.../zen/v1/models/<id>`): segue o path do catálogo com a mesma semântica (adapter detecta `/models/` no endpoint e usa corpo Google).
+- Request: `{contents: [{role:"user",parts:[{text}]}], systemInstruction: {parts:[{text}]}, generationConfig: {responseMimeType:"application/json", responseSchema:<schema>, maxOutputTokens}}`. Sem `responseSchema` se 400 → retry sem + parse.
+- Response: `candidates[0].content.parts[]` text → parse. `finishReason`: `STOP`=ok, `MAX_TOKENS`=degradar, `SAFETY`/outros=pular sem retry.
+- Auth: `key` via query `?key=` OU header `x-goog-api-key` (preferir header; nunca logar).
+
+### 9.4 Regras transversais (valem para os 3 adapters)
+- `temperature`/`top_p` NUNCA por default; `validateSampling` estendido com `apiStyle` (já existe o parâmetro).
+- `max_tokens` mapping: reasoning OpenAI → `max_completion_tokens` (chat) / `max_output_tokens` (responses); Anthropic → `max_tokens` (obrigatório); Google → `maxOutputTokens`.
+- Timeout 90s (AbortController cobrindo body), retry 1x só 5xx/429 com backoff + Retry-After; `llm_api_key` nunca em logs (redact/scrub existentes).
+- `auto`: consulta o mapa versionado `(provider,model)`; pares non-chat agora RESOLVEM para seu adapter em vez de fail-fast. `GET {base}/models` continua validando só existência.
+- `llm_path` custom continua path-only experimental (sem adapter inferido).
+- Testes: matriz por adapter (request shape exato + response parse + refusal/finish de cada protocolo + 400-fallback), sem chamadas reais (fetch mockado).
