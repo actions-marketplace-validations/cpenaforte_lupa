@@ -14,7 +14,7 @@ inputs:
     required: false
     default: ""
   llm_api_style:
-    description: "API style: auto, openai, or anthropic"
+    description: "API style: auto, openai-chat, openai-responses, anthropic-messages, google-models, or custom-path"
     required: false
     default: "auto"
   llm_path:

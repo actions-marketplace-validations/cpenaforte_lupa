@@ -1,6 +1,13 @@
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import * as core from "@actions/core";
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+// Wrap core.info in a spy (ESM namespaces cannot be spied on directly); behavior is unchanged.
+vi.mock("@actions/core", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@actions/core")>();
+  return { ...actual, info: vi.fn(actual.info) };
+});
 import { cleanEnvForExec, run, sanitizeFinding, unquoteGitPath, type Deps, type Gateway, type PrInfo, type RunEnv } from "../src/main.js";
 import type { ActionInputs } from "../src/inputs.js";
 import { ReadonlyTokenError } from "../src/github.js";
@@ -349,6 +356,18 @@ describe("run() orchestration", () => {
     const n = await runWithMocks({ prNumber: null });
     expect(n.posted).toBe(false);
     expect(n.exitCode).toBe(0);
+  });
+
+  it("dry-run logs the event and finding counts it would have posted", async () => {
+    const info = vi.mocked(core.info);
+    info.mockClear();
+    const r = await runWithMocks({ postComment: false });
+    expect(r.posted).toBe(false);
+    const lines = info.mock.calls.map((c) => String(c[0]));
+    const dry = lines.find((l) => l.includes("dry-run, nothing posted"));
+    expect(dry).toBeDefined();
+    expect(dry).toMatch(/would post event=(COMMENT|REQUEST_CHANGES), inline=\d+, general=\d+, high=\d+\)/);
+    expect(dry).not.toContain("## ");
   });
 
   it("validateModelExists rejection skips the slow path with a warning but still posts fast-path", async () => {

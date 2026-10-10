@@ -26183,7 +26183,8 @@ async function publishReview(a) {
     a.out.summaryWritten = true;
   }
   if (!a.env.inputs.postComment) {
-    info("post_comment is false: dry-run, nothing posted");
+    const high = findings.filter((f) => f.severity === "high").length;
+    info(`post_comment is false: dry-run, nothing posted (would post event=${payload.event}, inline=${inline.length}, general=${general.length}, high=${high})`);
     return;
   }
   const canWrite = !a.isFork || a.env.tokenIsApp;

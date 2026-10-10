@@ -23,8 +23,10 @@ The diff is treated as untrusted data. The LLM has no tools and its output is va
    | Name | Kind | Purpose |
    |---|---|---|
    | `LLM_API_KEY` | secret | Key for the LLM provider. Omit it to run fast-path only. |
-   | `PR_REVIEWER_MODEL` | variable | Model name, for example `deepseek-v4-flash` on `opencode-go`. |
+   | `PR_REVIEWER_MODEL` | variable | Model name. Must belong to the provider set in the template's `llm_provider`. |
    | `PR_REVIEWER_APP_ID` / `PR_REVIEWER_APP_KEY` | variable / secret | Only for fork PRs with the privileged template (see below). |
+
+   The template defaults to `llm_provider: openai`, so provider and model must match. To use OpenCode Go, set `llm_provider: opencode-go` in the template **and** set `PR_REVIEWER_MODEL` to a Go model such as `deepseek-v4-flash`. If you keep `openai`, use an OpenAI model.
 
 3. Open a pull request. The review is posted for `opened`, `synchronize`, `reopened` and `ready_for_review`. You can also comment `/review` on a PR (trusted author associations only) or run `workflow_dispatch` with `pr_number`.
 
@@ -51,7 +53,7 @@ Output: `exit-code` (`0` pass, `2` warning findings, `1` high-severity findings)
 
 ## Providers
 
-v1 supports the `openai-chat` API style only: `POST {base_url}/chat/completions` with the JSON-schema `response_format` where the provider accepts it. Anthropic-compatible presets omit `response_format`, `temperature`, `top_p` and `n`, and the output is parsed manually.
+v1 supports the `openai-chat` API style only: `POST {base_url}/chat/completions` with the JSON-schema `response_format` where the provider accepts it. Anthropic-compatible presets omit `response_format` and parse the output manually. Sampling on Anthropic-compatible endpoints is restricted: `temperature`, `top_p` and `n` are sent only when you set them explicitly, and they are validated per model family (for example, `n` must be 1, and `temperature` and `top_p` cannot be set together). Invalid combinations fail before the request is sent.
 
 | `llm_provider` | Base URL (preset) | v1 status |
 |---|---|---|
@@ -68,7 +70,7 @@ v1 supports the `openai-chat` API style only: `POST {base_url}/chat/completions`
 
 ### opencode-zen and opencode-go
 
-- **Key:** `Bearer` with your OpenCode API key (`OPENCODE_API_KEY` in your own tooling, `LLM_API_KEY` in this action).
+- **Key:** `Bearer` with your OpenCode API key , passed as the `llm_api_key` input (the `LLM_API_KEY` secret in the template).
 - **Headers:** the action sends `User-Agent: pr-reviewer/1.0`. `opencode-go` also sends `x-opencode-session: pr-<number>`, stable per PR, so the provider can group the calls.
 - **Model check:** the action calls `GET {base}/models` to confirm the model id exists. It checks the id only and never changes the endpoint.
 - **Routing table:** the action keeps a versioned map of `(provider, model) → API style` in code. Some models are not served by chat completions. Examples: `claude-*`, `minimax-m3`, `minimax-m2.7`, `qwen3.8-max` and `qwen3.7-*` on Go use `anthropic-messages`; `grok-*`, `gpt-6*` and `gpt-5.6-luna` use `openai-responses`; `gemini-*` use `google-models`. The same model can differ by provider: `qwen3.8-max` is chat-capable on Zen but `anthropic-messages` on Go. For non-chat pairs the action fails fast with a clear message instead of sending an incompatible request. Non-chat styles are v2.
@@ -85,7 +87,7 @@ v1 supports the `openai-chat` API style only: `POST {base_url}/chat/completions`
 Budget figures are estimates. Prices change: check your provider's price page, and compare **Zen vs direto** (calling the model provider directly with its own key). Zen is pay-per-use through OpenCode, and its prices can differ from the direct provider prices.
 
 - **Cost of a typical PR:** about 3k input tokens plus 600 output tokens.
-- **Ceiling:** `max_diff_chars` 60000 is about 15k input tokens plus prompt overhead. At frontier-model prices that is roughly $0.15 to $0.30 per PR at the ceiling, not $0.001. Lower `max_diff_chars` to cap spend. Files larger than the per-file cap (8000 characters) are truncated, and files over the total ceiling are skipped with a note.
+- **Ceiling:** `max_diff_chars` 60000 is about 15k input tokens plus prompt overhead. At frontier-model prices a PR at the ceiling costs roughly $0.15 to $0.30, far more than the cost of a typical PR. Lower `max_diff_chars` to cap spend. Files larger than the per-file cap (8000 characters) are truncated, and files over the total ceiling are skipped with a note.
 - **peak/off-peak pricing:** some models price by time of day. For example, `deepseek-v4.1-flash` has different peak and off-peak prices. Check the current rates before choosing a model for high-volume repositories.
 - **Retries:** one retry with exponential backoff, only on 5xx and 429 (honouring `Retry-After`). Timeouts and output truncation (`finish_reason: length`) are not retried with a smaller diff, because truncating the input does not fix truncated output.
 
@@ -97,16 +99,16 @@ The findings and the gate are separate. The review event and the exit code follo
 |---|---|---|
 | `none` | always `COMMENT` | `0` always (log only) |
 | `warning` | `COMMENT` | `2` if any finding is `warning` or `high`; `0` for info-only |
-| `high` | `REQUEST_CHANGES` only when a `high` finding has evidence; otherwise `COMMENT` | `1` if any `high` finding; `0` otherwise |
+| `high` | `REQUEST_CHANGES` when a high-severity finding exists; otherwise `COMMENT` | `1` if any `high` finding; `0` otherwise |
 
 - The action never approves automatically in v1.
 - A `REQUEST_CHANGES` review always has a body.
 - The action step exits non-zero for `1` and `2`, so the template runs it with `continue-on-error: true` and reads `steps.review.outputs.exit-code` in a separate gate step.
-- The template's gate passes on `0` and `2` and fails on `1`. With `fail_level: warning` nothing blocks the merge, because high findings still produce exit `2`. Set `fail_level: high` to block on high-severity findings.
+- The template's gate passes on `0` and `2` and fails on `1`. Warning findings never block a merge. A failed run (for example an action error, where no exit code is produced) still fails the gate. To block on high-severity findings, set `fail_level: high`.
 
 ## Dry-run: `post_comment: false`
 
-With `post_comment: false` the action runs the whole pipeline, writes the summary and the artifact, and logs the review it would have posted. Nothing is posted to the PR. Use it to tune the prompt, the model, or `max_diff_chars` before you enable posting.
+With `post_comment: false` the action runs the whole pipeline, writes the summary and the artifact, and logs the event and the finding counts it would have posted (event, inline, general and high). The review body is not logged. Nothing is posted to the PR. Use it to tune the prompt, the model, or `max_diff_chars` before you enable posting.
 
 ## Forks and the two-workflow setup
 
@@ -119,7 +121,7 @@ To post reviews on fork PRs, use the two-workflow pattern with an App token:
 
 The segregation matters: the privileged job reads only the artifact, so PR code never runs with the App key.
 
-**Fork L2 skip:** on fork PRs with secrets in scope (any trigger other than `pull_request`, a writable App token, or an `llm_api_key`), the action does not run L2 native toolchains, because they execute repository-defined tooling. Semgrep, gitleaks and trivy still run. A warning is logged.
+**Fork L2 skip:** on fork PRs with secrets in scope (any trigger other than `pull_request`, an App token, or an `llm_api_key`), the action does not run L2 native toolchains, because they execute repository-defined tooling. Semgrep, gitleaks and trivy still run. A warning is logged.
 
 **Known limitation:** every scanner and L2 process gets a scrubbed environment (no `*TOKEN*`, `*KEY*`, `*SECRET*`, `*PASSWORD*`, `*AUTH*`, `GITHUB_TOKEN` or `ACTIONS_*` variables). This is not a sandbox. A residual `/proc` vector remains: a process can read its parent's environment and memory maps. For high-threat repositories, move the review of untrusted code into a workflow with no secrets and no base-repository context, and post results only through the privileged template.
 

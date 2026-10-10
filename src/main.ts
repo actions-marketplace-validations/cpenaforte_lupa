@@ -508,7 +508,11 @@ async function publishReview(a: PublishArgs): Promise<void> {
     a.out.summaryWritten = true;
   }
   if (!a.env.inputs.postComment) {
-    core.info("post_comment is false: dry-run, nothing posted");
+    const high = findings.filter((f) => f.severity === "high").length;
+    core.info(
+      `post_comment is false: dry-run, nothing posted (would post event=${payload.event}, ` +
+        `inline=${inline.length}, general=${general.length}, high=${high})`,
+    );
     return;
   }
   const canWrite = !a.isFork || a.env.tokenIsApp;
