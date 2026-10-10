@@ -109,15 +109,18 @@ describe("callGoogle", () => {
     });
   });
 
-  it("uses the endpoint path as-is (Zen /models/<id> catalog path keeps Google body semantics)", async () => {
+  // Spec §9.3: /models/<id>:generateContent is the real Google-protocol call —
+  // the Zen/Go catalog /models/<id> entry is the AI SDK package descriptor,
+  // not an inference endpoint. The adapter posts to whatever path resolveEndpoint supplies.
+  it("uses the endpoint path as-is on a Zen base (spec §9.3: :generateContent is the real call)", async () => {
     const zenEp: ResolvedEndpoint = {
       baseUrl: "https://opencode.ai/zen/v1",
-      path: "/models/gemini-2.5-flash",
+      path: "/models/gemini-2.5-flash:generateContent",
       headers: { Authorization: "Bearer k", "User-Agent": "pr-reviewer/1.0" },
       apiStyle: "google-models",
     };
     expect(await callGoogle(zenEp, MODEL, msgs(), opts())).toEqual({ ok: true, findings: [] });
-    expect(calls.at(-1)!.url).toBe("https://opencode.ai/zen/v1/models/gemini-2.5-flash");
+    expect(calls.at(-1)!.url).toBe("https://opencode.ai/zen/v1/models/gemini-2.5-flash:generateContent");
     expect(lastBody().contents).toEqual([{ role: "user", parts: [{ text: '{"findings":[]}' }] }]);
   });
 

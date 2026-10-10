@@ -139,6 +139,39 @@ describe("callResponses", () => {
     });
   });
 
+  it("retries once on 429/5xx and degrades on timeout without retry", async () => {
+    // 429 → one retry (Retry-After: 0 keeps the backoff instant).
+    stubFetch((_c, n) =>
+      n === 1 ? json(429, { error: "rate limited" }, { "retry-after": "0" }) : json(200, okResponses('{"findings":[]}')),
+    );
+    expect(await callResponses(fakeResponsesEp(), msgs(), opts())).toEqual({ ok: true, findings: [] });
+    expect(calls.length).toBe(2);
+
+    // Persistent 5xx → exactly one retry (two calls, never three).
+    stubFetch(() => json(503, { error: "unavailable" }, { "retry-after": "0" }));
+    expect(await callResponses(fakeResponsesEp(), msgs(), opts())).toMatchObject({
+      ok: false,
+      reason: "http-error",
+    });
+    expect(calls.length).toBe(2);
+
+    // Timeout → degrade without any retry.
+    const timeoutFetch = vi.fn(
+      (url: string | URL, init: RequestInit) =>
+        new Promise<Response>((_res, rej) => {
+          calls.push({ url: String(url), init });
+          init.signal?.addEventListener("abort", () => rej(new Error("aborted")));
+        }),
+    );
+    vi.stubGlobal("fetch", timeoutFetch);
+    calls = [];
+    expect(
+      await callResponses(fakeResponsesEp(), msgs(), { ...opts(), timeoutSeconds: 0.05 }),
+    ).toMatchObject({ ok: false, reason: "timeout" });
+    expect(timeoutFetch).toHaveBeenCalledTimes(1);
+    expect(calls.length).toBe(1);
+  });
+
   it("reasoning model maps max_completion_tokens→max_output_tokens", async () => {
     await callResponses(fakeResponsesEp(), msgs(), { ...opts(), model: "gpt-6-luna" });
     const body = lastBody();

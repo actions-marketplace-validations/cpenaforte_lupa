@@ -84,6 +84,8 @@ export const NON_CHAT: ReadonlyMap<string, NonChatStyle> = new Map<string, NonCh
   ["opencode-zen:gpt-6-astra", "openai-responses"],
   ["opencode-zen:grok-4.7", "openai-responses"],
   ["opencode-zen:grok-4.6", "openai-responses"],
+  // Spec §9.1: Muse-Spark ships a free variant on Zen; it is a responses model too.
+  ["opencode-zen:muse-spark-1.3-contributor-free", "openai-responses"],
   ["opencode-zen:claude-haiku-5-5", "anthropic-messages"],
   ["opencode-zen:claude-sonnet-5-5", "anthropic-messages"],
   ["opencode-zen:claude-opus-5-5", "anthropic-messages"],
@@ -92,6 +94,27 @@ export const NON_CHAT: ReadonlyMap<string, NonChatStyle> = new Map<string, NonCh
   ["opencode-zen:gemini-3.8-flash", "google-models"],
   ["opencode-zen:gemini-3.5-flash-lite", "google-models"],
 ]);
+
+/**
+ * Claude Fable family on Zen/Go (spec §9.2 names Fable alongside Opus/Sonnet/
+ * Haiku): resolved by id prefix because the exact versioned ids are not
+ * enumerated in NON_CHAT.
+ */
+const CLAUDE_FABLE_PREFIX = /^claude-fable-/;
+
+/**
+ * Single non-chat lookup used by both `auto` and the explicit `openai-chat`
+ * fail-fast: the exact (provider, model) map first, then the Fable family rule
+ * for Zen/Go only (a `claude-fable-*` id on any other provider stays chat).
+ */
+function nonChatFor(provider: string, model: string): NonChatStyle | undefined {
+  const exact = NON_CHAT.get(`${provider}:${model}`);
+  if (exact !== undefined) return exact;
+  if ((provider === "opencode-zen" || provider === "opencode-go") && CLAUDE_FABLE_PREFIX.test(model)) {
+    return "anthropic-messages";
+  }
+  return undefined;
+}
 
 /** Last path segments that identify a non-chat endpoint (path-only misuse). */
 const NON_CHAT_PATH_SEGMENTS: ReadonlySet<string> = new Set(["messages", "responses", "models"]);
@@ -152,11 +175,11 @@ export function resolveEndpoint(o: ResolveEndpointOptions): ResolvedEndpoint {
   if (o.llmApiStyle === "openai-responses" || o.llmApiStyle === "anthropic-messages" || o.llmApiStyle === "google-models") {
     apiStyle = o.llmApiStyle;
   } else if (o.llmApiStyle === "auto") {
-    apiStyle = NON_CHAT.get(`${o.llmProvider}:${o.llmModel}`) ?? "openai-chat";
+    apiStyle = nonChatFor(o.llmProvider, o.llmModel) ?? "openai-chat";
   } else {
     apiStyle = "openai-chat";
     if (o.llmApiStyle === "openai-chat") {
-      const nonChat = NON_CHAT.get(`${o.llmProvider}:${o.llmModel}`);
+      const nonChat = nonChatFor(o.llmProvider, o.llmModel);
       if (nonChat !== undefined) {
         throw new UnsupportedModelError(
           `Model "${o.llmModel}" on "${o.llmProvider}" is served by "${nonChat}", which openai-chat cannot reach. ` +

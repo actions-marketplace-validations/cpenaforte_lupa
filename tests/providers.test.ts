@@ -13,7 +13,7 @@ vi.mock("@actions/core", () => ({ warning: vi.fn() }));
 const base = { llmBaseUrl: "", llmApiStyle: "auto", llmPath: "", llmApiKey: "k", prNumber: 1 } as const;
 
 const ZEN_CHAT = ["deepseek-v4.1-flash", "deepseek-v4-pro", "deepseek-v4-flash", "glm-5.3-flash", "glm-5.3", "glm-5.2", "kimi-k3", "kimi-k2.7-code", "kimi-k2.6", "minimax-m3", "minimax-m2.7", "mistral-large-4", "qwen3.8-max", "big-pickle", "space-bunny-free", "mimo-v2.6-flash-free"];
-const ZEN_NON_CHAT = ["gpt-6-luna", "gpt-6.1-sol", "gpt-6-astra", "grok-4.7", "grok-4.6", "claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5-5", "qwen3.7-max", "qwen3.7-plus", "gemini-3.8-flash", "gemini-3.5-flash-lite"];
+const ZEN_NON_CHAT = ["gpt-6-luna", "gpt-6.1-sol", "gpt-6-astra", "grok-4.7", "grok-4.6", "claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5-5", "qwen3.7-max", "qwen3.7-plus", "gemini-3.8-flash", "gemini-3.5-flash-lite", "muse-spark-1.3-contributor-free"];
 const GO_CHAT = ["glm-5.3-flash", "glm-5.3", "glm-5.2", "kimi-k3", "kimi-k2.7-code", "kimi-k2.6", "deepseek-v4-flash", "deepseek-v4-pro", "deepseek-v4.1-flash", "deepseek-v4-flash-vision-exp", "mimo-v2.6-flash", "mimo-v2.5", "mimo-v2.6-pro", "hy4-preview", "hy3", "longcat-2.0", "space-bunny"];
 const GO_NON_CHAT = ["grok-4.7", "grok-4.6", "gpt-6-luna", "gpt-5.6-luna", "gpt-6.1-sol", "gpt-6-astra", "muse-spark-1.3-contributor", "claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5-5", "minimax-m3", "minimax-m2.7", "qwen3.8-max", "qwen3.8-flash", "qwen3.7-max", "qwen3.7-plus", "gemini-3.8-flash", "gemini-3.5-flash-lite"];
 
@@ -116,7 +116,22 @@ describe("resolveEndpoint", () => {
     expect(NON_CHAT.get("opencode-go:qwen3.8-max")).toBe("anthropic-messages");
     expect(NON_CHAT.get("opencode-zen:gpt-6-luna")).toBe("openai-responses");
     expect(NON_CHAT.get("opencode-zen:gemini-3.8-flash")).toBe("google-models");
+    // Spec ids: Zen Muse-Spark free variant (§9.1).
+    expect(NON_CHAT.get("opencode-zen:muse-spark-1.3-contributor-free")).toBe("openai-responses");
     expect(NON_CHAT.has("opencode-zen:qwen3.8-max")).toBe(false);
+  });
+
+  // Spec §9.2: the Claude Fable family is anthropic-messages on Zen/Go (prefix rule, not an exact id).
+  it("claude-fable-* resolves anthropic-messages on zen and go, chat elsewhere", () => {
+    for (const provider of ["opencode-zen", "opencode-go"] as const) {
+      const r = resolveEndpoint({ ...base, llmProvider: provider, llmModel: "claude-fable-5-5" });
+      expect(r.apiStyle).toBe("anthropic-messages");
+      expect(r.path).toBe("/messages");
+      expect(() =>
+        resolveEndpoint({ ...base, llmProvider: provider, llmModel: "claude-fable-5-5", llmApiStyle: "openai-chat" }),
+      ).toThrow(UnsupportedModelError);
+    }
+    expect(resolveEndpoint({ ...base, llmProvider: "openai", llmModel: "claude-fable-5-5" }).apiStyle).toBe("openai-chat");
   });
 
   // F10: no chat-capable pair may be in NON_CHAT.

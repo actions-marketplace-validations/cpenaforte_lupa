@@ -25858,6 +25858,8 @@ var NON_CHAT = /* @__PURE__ */ new Map([
   ["opencode-zen:gpt-6-astra", "openai-responses"],
   ["opencode-zen:grok-4.7", "openai-responses"],
   ["opencode-zen:grok-4.6", "openai-responses"],
+  // Spec §9.1: Muse-Spark ships a free variant on Zen; it is a responses model too.
+  ["opencode-zen:muse-spark-1.3-contributor-free", "openai-responses"],
   ["opencode-zen:claude-haiku-5-5", "anthropic-messages"],
   ["opencode-zen:claude-sonnet-5-5", "anthropic-messages"],
   ["opencode-zen:claude-opus-5-5", "anthropic-messages"],
@@ -25866,6 +25868,16 @@ var NON_CHAT = /* @__PURE__ */ new Map([
   ["opencode-zen:gemini-3.8-flash", "google-models"],
   ["opencode-zen:gemini-3.5-flash-lite", "google-models"]
 ]);
+var CLAUDE_FABLE_PREFIX = /^claude-fable-/;
+function nonChatFor(provider, model) {
+  const exact = NON_CHAT.get(`${provider}:${model}`);
+  if (exact !== void 0)
+    return exact;
+  if ((provider === "opencode-zen" || provider === "opencode-go") && CLAUDE_FABLE_PREFIX.test(model)) {
+    return "anthropic-messages";
+  }
+  return void 0;
+}
 var NON_CHAT_PATH_SEGMENTS = /* @__PURE__ */ new Set(["messages", "responses", "models"]);
 function isPathOnlyNonChat(path) {
   const pathname = path.replace(/\/+$/, "");
@@ -25897,11 +25909,11 @@ function resolveEndpoint(o) {
   if (o.llmApiStyle === "openai-responses" || o.llmApiStyle === "anthropic-messages" || o.llmApiStyle === "google-models") {
     apiStyle = o.llmApiStyle;
   } else if (o.llmApiStyle === "auto") {
-    apiStyle = NON_CHAT.get(`${o.llmProvider}:${o.llmModel}`) ?? "openai-chat";
+    apiStyle = nonChatFor(o.llmProvider, o.llmModel) ?? "openai-chat";
   } else {
     apiStyle = "openai-chat";
     if (o.llmApiStyle === "openai-chat") {
-      const nonChat = NON_CHAT.get(`${o.llmProvider}:${o.llmModel}`);
+      const nonChat = nonChatFor(o.llmProvider, o.llmModel);
       if (nonChat !== void 0) {
         throw new UnsupportedModelError(`Model "${o.llmModel}" on "${o.llmProvider}" is served by "${nonChat}", which openai-chat cannot reach. Set llm_api_style to auto (resolves it automatically) or "${nonChat}". Supported API styles: auto, openai-chat, openai-responses, anthropic-messages, google-models, custom-path.`);
       }

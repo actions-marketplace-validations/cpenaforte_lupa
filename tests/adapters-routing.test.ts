@@ -55,6 +55,10 @@ describe("resolveEndpoint: auto routes non-chat pairs to their adapter", () => {
     ["opencode-zen", "gemini-3.8-flash", "google-models", "/models/gemini-3.8-flash:generateContent"],
     ["opencode-go", "qwen3.8-max", "anthropic-messages", "/messages"],
     ["opencode-go", "gpt-6-luna", "openai-responses", "/responses"],
+    // Spec ids: Zen Muse-Spark free variant (§9.1) and the Claude Fable family (§9.2).
+    ["opencode-zen", "muse-spark-1.3-contributor-free", "openai-responses", "/responses"],
+    ["opencode-zen", "claude-fable-5-5", "anthropic-messages", "/messages"],
+    ["opencode-go", "claude-fable-5-5", "anthropic-messages", "/messages"],
   ] as const)("auto %s:%s → %s at %s", (provider, model, apiStyle, path) => {
     const r = resolveEndpoint({ ...base, llmProvider: provider, llmModel: model });
     expect(r.apiStyle).toBe(apiStyle);
@@ -67,6 +71,9 @@ describe("resolveEndpoint: auto routes non-chat pairs to their adapter", () => {
       ["opencode-zen", "deepseek-v4.1-flash"],
       ["opencode-go", "glm-5.3"],
       ["openai", "gpt-test"],
+      // Claude ids outside the map and the Fable family stay chat.
+      ["opencode-zen", "claude-3-5-haiku"],
+      ["openai", "claude-fable-x"],
     ] as const) {
       const r = resolveEndpoint({ ...base, llmProvider: provider, llmModel: model });
       expect(r.apiStyle).toBe("openai-chat");
@@ -150,6 +157,10 @@ describe("resolveEndpoint: fail-fast cases that stay", () => {
     expect(msg).toContain("Supported API styles");
     expect(() =>
       resolveEndpoint({ ...base, llmProvider: "opencode-go", llmModel: "qwen3.8-max", llmApiStyle: "openai-chat" }),
+    ).toThrow(UnsupportedModelError);
+    // The Fable family is non-chat on Zen/Go, so explicit chat fails there too.
+    expect(() =>
+      resolveEndpoint({ ...base, llmProvider: "opencode-zen", llmModel: "claude-fable-5-5", llmApiStyle: "openai-chat" }),
     ).toThrow(UnsupportedModelError);
   });
 
