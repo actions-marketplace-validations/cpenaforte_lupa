@@ -121,7 +121,7 @@ jobs:
           llm_api_key: ${{ secrets.LLM_API_KEY }}
           fail_level: warning
 
-      # This step runs on every event. Its guard checks only that the event has a same-repository
+      # This step is evaluated on every event. Its guard checks only that the event has a same-repository
       # PR head. Without security-events: write (commented out above), the upload fails and
       # continue-on-error absorbs it, so the job still passes. The guard is false on
       # issue_comment and workflow_dispatch (no PR head context), where the step is skipped.

@@ -122,7 +122,7 @@ describe("workflow templates", () => {
   it("SARIF comments state the no-op condition and the skipped events", () => {
     const t = fs.readFileSync("docs/workflow-template.yml", "utf8");
     expect(t).toContain("issue_comment and workflow_dispatch");
-    expect(t).toMatch(/This step runs on every event/);
+    expect(t).toMatch(/This step is evaluated on every event/);
     expect(t).toContain("issue_comment and workflow_dispatch");
     expect(t).toContain("continue-on-error absorbs it");
   });

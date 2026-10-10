@@ -668,7 +668,7 @@ async function runFlowA(env: RunEnv, deps: Deps, out: Outcome): Promise<void> {
  */
 async function runFlowB(env: RunEnv, deps: Deps, out: Outcome): Promise<void> {
   out.slowPathSkipped = true;
-  // Sanitizing pass for the privileged flow (Flow A sanitizes in runFlowA; publish never does).
+  // Sanitizing pass for the privileged flow (Flow A sanitizes in runFlowA; publishReview does not sanitize).
   const meta = readPrMeta(env.artifactDir);
   if (meta === undefined) {
     throw new Error(
