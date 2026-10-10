@@ -1,0 +1,243 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  ReadonlyTokenError,
+  postIssueFallback,
+  postReview,
+  resolvePrNumber,
+  shouldTrigger,
+  type Octokit,
+} from "../src/github.js";
+import type { ReviewPayload } from "../src/review.js";
+
+const payload: ReviewPayload = {
+  commit_id: "sha-old",
+  body: "summary",
+  event: "COMMENT",
+  comments: [{ path: "a.ts", line: 4, side: "RIGHT", body: "**high** [r] m" }],
+};
+
+function httpError(status: number, message: string, errors?: unknown[]): Error {
+  return Object.assign(new Error(message), { status, response: { data: { message, errors } } });
+}
+
+/** Fake octokit: createReview runs the scripted outcomes in order; pulls.get returns headSha. */
+function fakeOctokit(outcomes: Array<"ok" | Error>, headSha = "sha-new") {
+  const calls: string[] = [];
+  const reviewArgs: Array<Record<string, unknown>> = [];
+  const createReview = vi.fn(async (args: Record<string, unknown>) => {
+    reviewArgs.push(args);
+    calls.push("post");
+    const next = outcomes.shift();
+    if (next === undefined || next === "ok") return { data: {} };
+    throw next;
+  });
+  const get = vi.fn(async () => {
+    calls.push("get");
+    return { data: { head: { sha: headSha } } };
+  });
+  const createComment = vi.fn(async () => {
+    calls.push("comment");
+    return { data: {} };
+  });
+  const octokit = { rest: { pulls: { createReview, get }, issues: { createComment } } } as unknown as Octokit;
+  return { octokit, calls, reviewArgs, createReview, createComment };
+}
+
+/** First POST rejects 422 line-off-diff, second succeeds. */
+async function postReviewWithMock(calls: string[]) {
+  const f = fakeOctokit([
+    httpError(422, "Unprocessable Entity", [{ message: "Line could not be resolved" }]),
+    "ok",
+  ]);
+  const r = await postReview(f.octokit, 1, payload);
+  calls.push(...f.calls);
+  return r;
+}
+
+/** First POST rejects 422 stale commit_id; head_sha is re-resolved and the retry succeeds. */
+async function postReviewStaleMock() {
+  const f = fakeOctokit([httpError(422, "Unprocessable Entity: commit_id is not the head commit"), "ok"]);
+  const r = await postReview(f.octokit, 1, payload);
+  expect(f.calls).toEqual(["post", "get", "post"]);
+  expect(f.reviewArgs[1].commit_id).toBe("sha-new");
+  return r;
+}
+
+/** A 500 that carries the key in its message; postReview must not leak it. */
+async function postReviewFailing(key: string) {
+  const f = fakeOctokit([httpError(500, `server exploded with ${key}`)]);
+  return postReview(f.octokit, 1, payload).catch((e: unknown) => ({ error: String(e) }));
+}
+
+/** Network throw carrying the key. */
+async function postReviewThrowing(key: string) {
+  const f = fakeOctokit([new Error(`socket hang up ${key}`)]);
+  return postReview(f.octokit, 1, payload);
+}
+
+describe("resolvePrNumber", () => {
+  it("issue without pull_request resolves null; review uses top-level pull_request; dispatch via inputs", () => {
+    expect(resolvePrNumber("pull_request", { pull_request: { number: 7 } })).toBe(7);
+    expect(resolvePrNumber("issue_comment", { issue: { number: 5 } })).toBeNull();
+    expect(resolvePrNumber("issue_comment", { issue: { number: 5, pull_request: {} } })).toBe(5);
+    expect(resolvePrNumber("pull_request_review", { pull_request: { number: 9 }, inputs: {} })).toBe(9);
+    expect(resolvePrNumber("workflow_dispatch", { inputs: { pr_number: 11 } })).toBe(11);
+    expect(resolvePrNumber("workflow_dispatch", { inputs: {} })).toBeNull();
+  });
+});
+
+describe("shouldTrigger", () => {
+  it("gates actions and events", () => {
+    expect(shouldTrigger("pull_request", { action: "opened" })).toBe(true);
+    expect(shouldTrigger("pull_request", { action: "synchronize" })).toBe(true);
+    expect(shouldTrigger("pull_request", { action: "reopened" })).toBe(true);
+    expect(shouldTrigger("pull_request", { action: "ready_for_review" })).toBe(true);
+    expect(shouldTrigger("pull_request", { action: "labeled" })).toBe(false);
+    expect(
+      shouldTrigger("issue_comment", { commentBody: "LGTM", authorAssociation: "MEMBER", issueHasPR: true }),
+    ).toBe(false);
+    expect(
+      shouldTrigger("issue_comment", {
+        commentBody: "/review please",
+        authorAssociation: "CONTRIBUTOR",
+        issueHasPR: true,
+      }),
+    ).toBe(false);
+    expect(
+      shouldTrigger("issue_comment", { commentBody: "/review", authorAssociation: "OWNER", issueHasPR: false }),
+    ).toBe(false);
+    expect(
+      shouldTrigger("issue_comment", {
+        action: "created",
+        commentBody: "/review",
+        authorAssociation: "OWNER",
+        issueHasPR: true,
+      }),
+    ).toBe(true);
+    expect(
+      shouldTrigger("issue_comment", {
+        action: "edited",
+        commentBody: "/review",
+        authorAssociation: "OWNER",
+        issueHasPR: true,
+      }),
+    ).toBe(false);
+    expect(shouldTrigger("workflow_dispatch", { prNumber: null })).toBe(false);
+    expect(shouldTrigger("workflow_dispatch", { prNumber: 3 })).toBe(true);
+    expect(shouldTrigger("workflow_run", {})).toBe(false);
+  });
+
+  it("covers review association too", () => {
+    expect(
+      shouldTrigger("pull_request_review", { action: "submitted", reviewBody: "LGTM", authorAssociation: "MEMBER" }),
+    ).toBe(true);
+    expect(
+      shouldTrigger("pull_request_review", { action: "edited", reviewBody: "LGTM", authorAssociation: "MEMBER" }),
+    ).toBe(false);
+    expect(
+      shouldTrigger("pull_request_review", {
+        action: "submitted",
+        reviewBody: "LGTM",
+        authorAssociation: "CONTRIBUTOR",
+      }),
+    ).toBe(false);
+    expect(
+      shouldTrigger("pull_request_review", { action: "submitted", reviewBody: "", authorAssociation: "MEMBER" }),
+    ).toBe(false);
+  });
+});
+
+beforeEach(() => {
+  process.env.GITHUB_REPOSITORY = "owner/repo";
+});
+afterEach(() => {
+  delete process.env.GITHUB_REPOSITORY;
+});
+
+describe("postReview", () => {
+
+  it("422 off-diff degrades to general and retries once; stale sha re-resolves", async () => {
+    const calls: string[] = [];
+    const r = await postReviewWithMock(calls);
+    expect(calls.filter((c) => c === "post").length).toBe(2);
+    expect(r.degraded).toBe(true);
+    const s = await postReviewStaleMock();
+    expect(s.retriedWithNewSha).toBe(true);
+  });
+
+  it("off-diff retry posts with no inline comments and the comments folded into the body", async () => {
+    const f = fakeOctokit([httpError(422, "Unprocessable Entity", [{ message: "Line could not be resolved" }]), "ok"]);
+    await postReview(f.octokit, 7, payload);
+    const retry = f.reviewArgs[1];
+    expect(retry.comments).toEqual([]);
+    expect(String(retry.body)).toContain("a.ts:4");
+    expect(String(retry.body)).toContain("**high** [r] m");
+    expect(retry.pull_number).toBe(7);
+    expect(retry.owner).toBe("owner");
+    expect(retry.repo).toBe("repo");
+  });
+
+  it("degrades at most once: a second off-diff 422 throws", async () => {
+    const f = fakeOctokit([
+      httpError(422, "Unprocessable Entity", [{ message: "Line could not be resolved" }]),
+      httpError(422, "Unprocessable Entity", [{ message: "Line could not be resolved" }]),
+    ]);
+    await expect(postReview(f.octokit, 1, payload)).rejects.toThrow();
+    expect(f.createReview).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not degrade when there are no inline comments", async () => {
+    const f = fakeOctokit([httpError(422, "Unprocessable Entity", [{ message: "Line could not be resolved" }])]);
+    await expect(postReview(f.octokit, 1, { ...payload, comments: [] })).rejects.toThrow();
+    expect(f.createReview).toHaveBeenCalledTimes(1);
+  });
+
+  it("plain success reports no degradation and no re-resolve", async () => {
+    const f = fakeOctokit(["ok"]);
+    const r = await postReview(f.octokit, 1, payload);
+    expect(r).toEqual({ degraded: false, retriedWithNewSha: false });
+    expect(f.calls).toEqual(["post"]);
+  });
+
+  it("stale sha retries once only", async () => {
+    const f = fakeOctokit([
+      httpError(422, "Unprocessable Entity: commit_id is not the head commit"),
+      httpError(422, "Unprocessable Entity: commit_id is not the head commit"),
+    ]);
+    await expect(postReview(f.octokit, 1, payload)).rejects.toThrow();
+    expect(f.createReview).toHaveBeenCalledTimes(2);
+    expect(f.calls).toEqual(["post", "get", "post"]);
+  });
+
+  it("fork read-only token (403) throws ReadonlyTokenError", async () => {
+    const f = fakeOctokit([httpError(403, "Resource not accessible by integration")]);
+    await expect(postReview(f.octokit, 1, payload)).rejects.toBeInstanceOf(ReadonlyTokenError);
+  });
+
+  it("never logs api key in result or throw", async () => {
+    const r = await postReviewFailing("sk-secret-abc");
+    expect(JSON.stringify(r)).not.toContain("sk-secret-abc");
+    const err = await postReviewThrowing("sk-secret-abc").catch((e) => String(e));
+    expect(err).not.toContain("sk-secret-abc");
+  });
+});
+
+describe("postIssueFallback", () => {
+  it("posts a comment when enabled and issues:write", async () => {
+    const f = fakeOctokit([]);
+    await postIssueFallback(f.octokit, { enabled: true, issuesWrite: true, pr: 4, body: "hi" });
+    expect(f.createComment).toHaveBeenCalledTimes(1);
+  });
+
+  it("throws when disabled", async () => {
+    const f = fakeOctokit([]);
+    await expect(postIssueFallback(f.octokit, { enabled: false, issuesWrite: true, pr: 4, body: "hi" })).rejects.toThrow();
+    expect(f.createComment).not.toHaveBeenCalled();
+  });
+
+  it("throws without issues:write", async () => {
+    const f = fakeOctokit([]);
+    await expect(postIssueFallback(f.octokit, { enabled: true, issuesWrite: false, pr: 4, body: "hi" })).rejects.toThrow();
+    expect(f.createComment).not.toHaveBeenCalled();
+  });
+});
