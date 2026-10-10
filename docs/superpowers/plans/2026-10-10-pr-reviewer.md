@@ -1108,3 +1108,36 @@ Steps 1-5 mirror Task 15 (commit `feat: google-models adapter`).
 - [ ] **Step 3: Implement** (providers auto-map update + llm.ts dispatcher + README section + template comment)
 - [ ] **Step 4: Run → PASS** (full `npx vitest run` + `npm run build` + `node --check dist/index.js`)
 - [ ] **Step 5: Commit** (`git add` the touched files; `feat: adapter routing, matrix and docs`)
+
+---
+
+### Task 19: Error-driven routing — remove NON_CHAT (substitui o mapa por probe; spec §9.5)
+
+**Files:**
+- Modify: `src/providers.ts` (remove `NON_CHAT`/`nonChatFor`/prefix rules + fail-fast; keep catalog-sha helper/authHeaderFor; `auto` resolves base+path per style only), `src/llm.ts` (probe driver replacing the map lookup), `docs/workflow-template.yml` + `README.md` (docs: probe behavior, remove map language)
+- Delete: `tests/providers.test.ts` NON_CHAT/matrix blocks + `tests/adapters-routing.test.ts` map assertions (replace with probe tests)
+- Test: `tests/probe-routing.test.ts`
+
+**Interfaces:**
+- Consumes: adapters (Tasks 15-17), `resolveEndpoint` base/path builders per style, `validateModelExists`
+- Produces: `export const PROBE_ORDER = ["openai-chat","openai-responses","anthropic-messages","google-models"] as const`; `callByStyle` (kept, explicit style honored) + NEW `callWithProbe(provider, model, baseUrl, key, messages, o, explicitStyle?)`: explicit → single call; auto → sequential probe; probe ONLY on 400/404 of the HTTP call OR `invalid-json` from wrong-shape parse? NO — only 400/404 decide probe (per spec §9.5); 429/5xx use adapter retry and do NOT advance the probe; success → return LlmResult + `via` style (for logging/tests); all failed → `http-error` with last redacted detail + `console.warn`-style core.warning listing attempted styles; in-process memo `Map<provider:model,style>` (session determinism).
+
+- [ ] **Step 1: Write failing tests**
+
+```ts
+it("auto probes chat→responses and succeeds on second style", ...); // fetch mock: 404 then 200 responses body
+it("auto walks all four styles and fails with http-error + warning", ...);
+it("explicit style never probes (single fetch even on 404)", ...);
+it("429/5xx does not advance the probe (adapter retry only)", ...);
+it("memo fixes style for subsequent calls in-process", ...);
+it("redaction holds across every probe attempt", ...);
+```
+
+- [ ] **Step 2: Run → FAIL** (`npx vitest run tests/probe-routing.test.ts`)
+- [ ] **Step 3: Implement**
+  - providers: remove map exports; add `buildEndpointForStyle(provider, model, baseUrl, style)` returning `{baseUrl,path,headers}` (chat: existing preset; responses: `/responses`; messages: `/messages`; google: `/models/<id>:generateContent`).
+  - llm/main: `callWithProbe` driver; wire `main.ts` slow path to it; keep explicit `llm_api_style` honored.
+  - docs: README probe paragraph (no map language); template comment updated; spec §9.5 already written.
+  - Update `tests/providers.test.ts` + `tests/adapters-routing.test.ts` removing map tests; keep chat/explicit-style tests.
+- [ ] **Step 4: Run → PASS** (full `npx vitest run` + `npm run build` + `node --check dist/index.js` + `GITHUB_EVENT_NAME=push node dist/index.js` exit 0)
+- [ ] **Step 5: Commit** (`refactor: error-driven style routing (probe) replaces NON_CHAT map`)

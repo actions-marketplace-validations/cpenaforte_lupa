@@ -111,6 +111,18 @@ Objetivo: `llm_api_style` explícito e `auto` passam a suportar todos os endpoin
 - `temperature`/`top_p` NUNCA por default; `validateSampling` estendido com `apiStyle` (já existe o parâmetro).
 - `max_tokens` mapping: reasoning OpenAI → `max_completion_tokens` (chat) / `max_output_tokens` (responses); Anthropic → `max_tokens` (obrigatório); Google → `maxOutputTokens`.
 - Timeout 90s (AbortController cobrindo body), retry 1x só 5xx/429 com backoff + Retry-After; `llm_api_key` nunca em logs (redact/scrub existentes).
-- `auto`: consulta o mapa versionado `(provider,model)`; pares non-chat agora RESOLVEM para seu adapter em vez de fail-fast. `GET {base}/models` continua validando só existência.
-- `llm_path` custom continua path-only experimental (sem adapter inferido).
+- `llm_path` custom continua path-only experimental.
 - Testes: matriz por adapter (request shape exato + response parse + refusal/finish de cada protocolo + 400-fallback), sem chamadas reais (fetch mockado).
+
+### 9.5 Roteamento error-driven (revisão 2026-10-10b — substitui o mapa NON_CHAT)
+Decisão: NÃO manter mapa hardcoded `(provider,model)->api_style` — envelhece. O catálogo `GET {base}/models` devolve só `{id,object,created,owned_by}` (sem metadado de endpoint), então o roteamento é por erro:
+- `auto` (default): tenta em ordem `openai-chat` → `openai-responses` → `anthropic-messages` → `google-models`. Cada tentativa usa o request shape do adapter; probe só em `400` ou `404` (erro de rota/contrato); `429`/`5xx` usam o retry normal do adapter (não conta como probe de estilo); sucesso memoiza o estilo na sessão (memo em processo; runner é efêmero, então o valor real é determinismo + testes).
+- Máximo de 4 tentativas; esgotadas, retorna `http-error` com o detalhe da ÚLTIMA falha (redigido) + warning nomeando o modelo e os estilos tentados.
+- `llm_api_style` explícito: honrado como está, SEM probe (usuário decidiu).
+- `llm_api_key` sem chave: permanece `no-key` sem fetch.
+- `validateModelExists` continua validando existência no catálogo antes do probe (fail-fast para typo de modelo, mensagem clara).
+- Google probe constrói path `POST {base}/models/<id>:generateContent` (spec §9.3); `authHeaderFor` por estilo (x-goog-api-key só no google-native; Bearer no resto).
+- Segurança: probing é seguro por construção — adapters só GERAM texto (read-only, idempotente), nunca escrevem.
+- Testes: sequência 404→sucesso por estilo (4 combinações), todas falham → http-error+warning, explicit style sem probe, 429 não dispara probe, redaction em todas as tentativas.
+
+Literais removidos com o mapa: `NON_CHAT`, prefixo `claude-fable-*`, entradas `muse-spark-*`, e o fail-fast "explicit openai-chat on non-chat pair" (agora honrado). Fontes de verdade restantes: catálogo `GET /models` (existência) + probe (estilo).
