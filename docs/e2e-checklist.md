@@ -1,7 +1,7 @@
 # End-to-end checklist
 
-Manual checks against a disposable consumer repository, run on the **canary** (the immutable
-`v0.1.0` SHA) before the marketplace listing goes live. Each case lists the PR to create and the
+Manual checks against a disposable consumer repository, run on the **canary**: the immutable
+`v0.1.0` tag, before the marketplace listing goes live. Each case lists the PR to create and the
 assertions to verify. The unit tests cover the mapping logic (`eventFor`, `exitFor`, `buildBody`);
 these cases cover the wiring in a real GitHub run, including live Ollama, which CI does not run.
 
@@ -75,7 +75,7 @@ Release order (strict; `v1` moves exactly once, as the last tag move):
    git push origin v0.1.0
    ```
 
-3. **Canary on the tag.** In the consumer test repository, pin the workflow to
+3. **Canary on the immutable `v0.1.0` tag.** In the consumer test repository, pin the workflow to
    `OWNER/pr-reviewer@v0.1.0` and run every case above, including live Ollama. All must pass. Do not
    touch `v0.1.0`. If a case fails, fix on `main`, cut a new tag (`v0.1.1`), and restart from step 2.
    `v1` has not moved yet, so nothing consumes the failed release.
