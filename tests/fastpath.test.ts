@@ -84,6 +84,17 @@ describe("runL0", () => {
     expect(clean.some((x) => x.rule === "sensitive-path")).toBe(false);
   });
 
+  it("env templates (.env.example, .env.sample, .env.template) are not sensitive; .env.local still is", () => {
+    const templates = runL0([
+      { file: "config/.env.example", hunks: "", truncated: false },
+      { file: ".env.sample", hunks: "", truncated: false },
+      { file: "deploy/.env.template", hunks: "", truncated: false },
+    ]);
+    expect(templates.some((x) => x.rule === "sensitive-path")).toBe(false);
+    const local = runL0([{ file: "config/.env.local", hunks: "", truncated: false }]);
+    expect(local.some((x) => x.rule === "sensitive-path" && x.severity === "high")).toBe(true);
+  });
+
   it("todo-marker reports the line number of the marker (headerless input counts from 1)", () => {
     const f = runL0([{ file: "a.ts", hunks: "const a = 1;\n// FIXME later\n", truncated: false }]);
     const t = f.find((x) => x.rule === "todo-marker");

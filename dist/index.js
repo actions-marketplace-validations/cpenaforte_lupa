@@ -24631,8 +24631,11 @@ function readPrMeta(dir) {
 import { basename as basename2 } from "node:path";
 var LARGE_FILE_BYTES = 500 * 1024;
 var TODO_RE = /\b(TODO|FIXME|XXX)\b/;
+var ENV_TEMPLATES = /* @__PURE__ */ new Set([".env.example", ".env.sample", ".env.template"]);
 function isSensitivePath(file) {
   const name = basename2(file);
+  if (ENV_TEMPLATES.has(name))
+    return false;
   if (name === "id_rsa")
     return true;
   if (name.endsWith(".pem"))
@@ -25579,8 +25582,8 @@ function hasSuggestion(f) {
 }
 function fenceFor(suggestion) {
   let longest = 0;
-  for (const run3 of suggestion.matchAll(/`+/g))
-    longest = Math.max(longest, run3[0].length);
+  for (const run2 of suggestion.matchAll(/`+/g))
+    longest = Math.max(longest, run2[0].length);
   return "`".repeat(Math.max(3, longest + 1));
 }
 function formatBody(f, side) {
@@ -25751,10 +25754,10 @@ function parseSarif(text) {
   if (!isObj(log) || !Array.isArray(log.runs))
     return void 0;
   const out = [];
-  for (const run3 of log.runs) {
-    if (!isObj(run3) || !Array.isArray(run3.results))
+  for (const run2 of log.runs) {
+    if (!isObj(run2) || !Array.isArray(run2.results))
       continue;
-    for (const res of run3.results) {
+    for (const res of run2.results) {
       if (!isObj(res))
         continue;
       const { file, line } = firstPhysicalLocation(res.locations);
@@ -25770,16 +25773,18 @@ function parseSarif(text) {
   }
   return out;
 }
-function run(file, args, cwd, env) {
+var TOOL_TIMEOUT_MS = 6e5;
+function runExec(file, args, cwd, env, timeoutMs = TOOL_TIMEOUT_MS) {
   return new Promise((resolve) => {
-    execFile2(file, args, { cwd, env: { ...process.env, ...env }, maxBuffer: MAX_BUFFER2 }, (err, stdout) => {
+    execFile2(file, args, { cwd, env: { ...process.env, ...env }, maxBuffer: MAX_BUFFER2, timeout: timeoutMs }, (err, stdout) => {
       if (!err)
-        return resolve({ missing: false, code: 0, stdout: String(stdout) });
+        return resolve({ missing: false, code: 0, stdout: String(stdout), timedOut: false });
       const e = err;
       if (e.code === "ENOENT")
-        return resolve({ missing: true, code: null, stdout: "" });
+        return resolve({ missing: true, code: null, stdout: "", timedOut: false });
+      const timedOut = e.killed === true;
       const code = typeof e.code === "number" ? e.code : null;
-      resolve({ missing: false, code, stdout: stdout ? String(stdout) : "" });
+      resolve({ missing: false, code, stdout: stdout ? String(stdout) : "", timedOut });
     });
   });
 }
@@ -25789,6 +25794,8 @@ function warning2(rule, message) {
 function fromStdout(tool, label, r) {
   if (r.missing)
     return [warning2("scanner-missing", `${label} unavailable: ${tool} not found`)];
+  if (r.timedOut)
+    return [warning2("scanner-failed", `${label} timed out after ${TOOL_TIMEOUT_MS / 1e3}s`)];
   const parsed = r.stdout.trim() ? parseSarif(r.stdout) : void 0;
   if (!parsed) {
     return [warning2("scanner-failed", `${label} exited ${r.code ?? "abnormally"} without parseable SARIF`)];
@@ -25804,17 +25811,17 @@ async function runScanners(o) {
   const jobs = o.jobs ?? resolveJobs();
   const dir = resolvePath(o.dir);
   const sg = semgrepArgv({ baselineSha: o.baselineSha, jobs, hasToken: !!o.hasSemgrepToken });
-  findings.push(...fromStdout("semgrep", "semgrep", await run("semgrep", sg.argv, dir, sg.env)));
-  const tv = await run("docker", dockerArgs(dir, TRIVY_IMAGE, TRIVY_DIGEST, trivyArgv(".")), dir);
+  findings.push(...fromStdout("semgrep", "semgrep", await runExec("semgrep", sg.argv, dir, sg.env)));
+  const tv = await runExec("docker", dockerArgs(dir, TRIVY_IMAGE, TRIVY_DIGEST, trivyArgv(".")), dir);
   findings.push(...fromStdout("docker", "trivy", tv));
   findings.push(...await runGitleaks(dir));
   for (const lock of o.lockfiles ?? []) {
-    const osv = await run("docker", dockerArgs(dir, OSV_IMAGE, OSV_DIGEST, osvArgv(lock)), dir);
+    const osv = await runExec("docker", dockerArgs(dir, OSV_IMAGE, OSV_DIGEST, osvArgv(lock)), dir);
     findings.push(...fromStdout("docker", `osv-scanner (${lock})`, osv));
   }
   let sbomPath;
   if (o.sbom) {
-    const sb = await run("docker", dockerArgs(dir, TRIVY_IMAGE, TRIVY_DIGEST, sbomArgv(".")), dir);
+    const sb = await runExec("docker", dockerArgs(dir, TRIVY_IMAGE, TRIVY_DIGEST, sbomArgv(".")), dir);
     if (sb.missing) {
       findings.push(warning2("scanner-missing", "sbom unavailable: docker not found"));
     } else if (!isCycloneDx(sb.stdout)) {
@@ -25852,11 +25859,13 @@ async function runGitleaks(dir) {
   }
   const hostReport = join3(reportDir, "report.sarif");
   try {
-    const gl = await run("docker", dockerArgs(dir, GITLEAKS_IMAGE, GITLEAKS_DIGEST, gitleaksArgv("/src", "/out/report.sarif"), [
+    const gl = await runExec("docker", dockerArgs(dir, GITLEAKS_IMAGE, GITLEAKS_DIGEST, gitleaksArgv("/src", "/out/report.sarif"), [
       `${reportDir}:/out`
     ]), dir);
     if (gl.missing)
       return [warning2("scanner-missing", "gitleaks unavailable: docker not found")];
+    if (gl.timedOut)
+      return [warning2("scanner-failed", `gitleaks timed out after ${TOOL_TIMEOUT_MS / 1e3}s`)];
     let text;
     try {
       text = await readFile(hostReport, "utf8");
@@ -26365,7 +26374,7 @@ async function runFlowB(env, deps, out) {
   await publishReview({ env, deps, out, pr, isFork: live.isFork, findings, hunks, headSha });
   out.exitCode = exitFor(env.inputs.failLevel, findings);
 }
-async function run2(env, deps) {
+async function run(env, deps) {
   const out = newOutcome();
   if (env.eventName === "workflow_run")
     await runFlowB(env, deps, out);
@@ -26438,7 +26447,7 @@ function readRunEnv() {
 }
 async function main() {
   const env = readRunEnv();
-  const out = await run2(env, { gh: realGateway(env.inputs.githubToken), analysis: realAnalysis() });
+  const out = await run(env, { gh: realGateway(env.inputs.githubToken), analysis: realAnalysis() });
   setOutput("exit-code", String(out.exitCode));
   process.exitCode = out.exitCode;
 }
@@ -26452,7 +26461,7 @@ export {
   cleanEnvForExec,
   main,
   readRunEnv,
-  run2 as run,
+  run,
   sanitizeFinding,
   toSarif,
   unquoteGitPath

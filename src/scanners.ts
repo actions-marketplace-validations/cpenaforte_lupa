@@ -167,22 +167,40 @@ export function parseSarif(text: string): Finding[] | undefined {
 
 // ---- execution -----------------------------------------------------------
 
+/** Per-tool wall-clock budget. A tool that exceeds it is killed and reported as a warning. */
+export const TOOL_TIMEOUT_MS = 600_000;
+
 interface Exec {
   missing: boolean; // ENOENT: binary not on PATH
   code: number | null; // 0 on success; numeric exit code otherwise (null if killed by signal)
   stdout: string;
+  timedOut: boolean; // killed by the timeout
 }
 
-function run(file: string, args: string[], cwd: string, env?: NodeJS.ProcessEnv): Promise<Exec> {
+/** Runs one tool. Exported for tests (the timeout parameter is the seam). */
+export function runExec(
+  file: string,
+  args: string[],
+  cwd: string,
+  env?: NodeJS.ProcessEnv,
+  timeoutMs: number = TOOL_TIMEOUT_MS,
+): Promise<Exec> {
   return new Promise((resolve) => {
-    execFile(file, args, { cwd, env: { ...process.env, ...env }, maxBuffer: MAX_BUFFER }, (err, stdout) => {
-      if (!err) return resolve({ missing: false, code: 0, stdout: String(stdout) });
-      const e = err as NodeJS.ErrnoException;
-      if (e.code === "ENOENT") return resolve({ missing: true, code: null, stdout: "" });
-      // Non-zero exit (scanners exit 1 when findings exist): keep stdout, which may hold SARIF.
-      const code = typeof e.code === "number" ? e.code : null;
-      resolve({ missing: false, code, stdout: stdout ? String(stdout) : "" });
-    });
+    execFile(
+      file,
+      args,
+      { cwd, env: { ...process.env, ...env }, maxBuffer: MAX_BUFFER, timeout: timeoutMs },
+      (err, stdout) => {
+        if (!err) return resolve({ missing: false, code: 0, stdout: String(stdout), timedOut: false });
+        const e = err as NodeJS.ErrnoException & { killed?: boolean };
+        if (e.code === "ENOENT") return resolve({ missing: true, code: null, stdout: "", timedOut: false });
+        // execFile sets `killed` when its timeout fires.
+        const timedOut = e.killed === true;
+        // Non-zero exit (scanners exit 1 when findings exist): keep stdout, which may hold SARIF.
+        const code = typeof e.code === "number" ? e.code : null;
+        resolve({ missing: false, code, stdout: stdout ? String(stdout) : "", timedOut });
+      },
+    );
   });
 }
 
@@ -194,8 +212,9 @@ function warning(rule: string, message: string): Finding {
  * Interpret a scanner whose SARIF arrives on stdout. Fail-open: a non-zero exit (or
  * any exit) with empty/unparseable stdout is a `scanner-failed` warning, never a clean pass.
  */
-function fromStdout(tool: string, label: string, r: Exec): Finding[] {
+export function fromStdout(tool: string, label: string, r: Exec): Finding[] {
   if (r.missing) return [warning("scanner-missing", `${label} unavailable: ${tool} not found`)];
+  if (r.timedOut) return [warning("scanner-failed", `${label} timed out after ${TOOL_TIMEOUT_MS / 1000}s`)];
   const parsed = r.stdout.trim() ? parseSarif(r.stdout) : undefined;
   if (!parsed) {
     return [warning("scanner-failed", `${label} exited ${r.code ?? "abnormally"} without parseable SARIF`)];
@@ -249,10 +268,10 @@ export async function runScanners(o: {
 
   // semgrep (binary, not docker)
   const sg = semgrepArgv({ baselineSha: o.baselineSha, jobs, hasToken: !!o.hasSemgrepToken });
-  findings.push(...fromStdout("semgrep", "semgrep", await run("semgrep", sg.argv, dir, sg.env)));
+  findings.push(...fromStdout("semgrep", "semgrep", await runExec("semgrep", sg.argv, dir, sg.env)));
 
   // trivy (docker image pinned by digest)
-  const tv = await run("docker", dockerArgs(dir, TRIVY_IMAGE, TRIVY_DIGEST, trivyArgv(".")), dir);
+  const tv = await runExec("docker", dockerArgs(dir, TRIVY_IMAGE, TRIVY_DIGEST, trivyArgv(".")), dir);
   findings.push(...fromStdout("docker", "trivy", tv));
 
   // gitleaks (docker image pinned by digest; SARIF goes to a report file in a temp dir)
@@ -260,14 +279,14 @@ export async function runScanners(o: {
 
   // osv-scanner (docker image pinned by digest), one run per lockfile
   for (const lock of o.lockfiles ?? []) {
-    const osv = await run("docker", dockerArgs(dir, OSV_IMAGE, OSV_DIGEST, osvArgv(lock)), dir);
+    const osv = await runExec("docker", dockerArgs(dir, OSV_IMAGE, OSV_DIGEST, osvArgv(lock)), dir);
     findings.push(...fromStdout("docker", `osv-scanner (${lock})`, osv));
   }
 
   // SBOM (trivy fs --format cyclonedx). Written under a unique mkdtemp dir inside outDir.
   let sbomPath: string | undefined;
   if (o.sbom) {
-    const sb = await run("docker", dockerArgs(dir, TRIVY_IMAGE, TRIVY_DIGEST, sbomArgv(".")), dir);
+    const sb = await runExec("docker", dockerArgs(dir, TRIVY_IMAGE, TRIVY_DIGEST, sbomArgv(".")), dir);
     if (sb.missing) {
       findings.push(warning("scanner-missing", "sbom unavailable: docker not found"));
     } else if (!isCycloneDx(sb.stdout)) {
@@ -317,7 +336,7 @@ async function runGitleaks(dir: string): Promise<Finding[]> {
   }
   const hostReport = join(reportDir, "report.sarif");
   try {
-    const gl = await run(
+    const gl = await runExec(
       "docker",
       dockerArgs(dir, GITLEAKS_IMAGE, GITLEAKS_DIGEST, gitleaksArgv("/src", "/out/report.sarif"), [
         `${reportDir}:/out`,
@@ -325,6 +344,7 @@ async function runGitleaks(dir: string): Promise<Finding[]> {
       dir,
     );
     if (gl.missing) return [warning("scanner-missing", "gitleaks unavailable: docker not found")];
+    if (gl.timedOut) return [warning("scanner-failed", `gitleaks timed out after ${TOOL_TIMEOUT_MS / 1000}s`)];
     let text: string | undefined;
     try {
       text = await readFile(hostReport, "utf8");

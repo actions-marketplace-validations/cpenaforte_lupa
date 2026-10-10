@@ -14,8 +14,12 @@ const LARGE_FILE_BYTES = 500 * 1024;
 const TODO_RE = /\b(TODO|FIXME|XXX)\b/;
 
 /** Filename-level sensitive-path rules (basename match). */
+/** Committed templates of env files. They hold placeholders, not secrets, so they are not flagged. */
+const ENV_TEMPLATES: ReadonlySet<string> = new Set([".env.example", ".env.sample", ".env.template"]);
+
 function isSensitivePath(file: string): boolean {
   const name = basename(file);
+  if (ENV_TEMPLATES.has(name)) return false;
   if (name === "id_rsa") return true;
   if (name.endsWith(".pem")) return true;
   if (name === ".env" || name.startsWith(".env.")) return true;

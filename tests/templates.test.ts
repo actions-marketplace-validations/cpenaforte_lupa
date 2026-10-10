@@ -78,6 +78,14 @@ describe("workflow templates", () => {
     expect(t).toContain('contains(fromJSON(\'["OWNER","MEMBER","COLLABORATOR"]\'), github.event.review.author_association)');
   });
 
+  it("privileged template has NO SARIF upload (fork tokens lack security-events: write); comment says so", () => {
+    const p = fs.readFileSync("docs/workflow-template-privileged.yml", "utf8");
+    expect(p).not.toContain("upload-sarif");
+    expect(p).not.toContain("codeql-action");
+    expect(p).toContain("SARIF: this privileged flow never uploads SARIF");
+    expect(p).toContain("Code-scanning uploads happen only in the same-repo");
+  });
+
   it("semgrep is installed from PyPI at the pinned version (no docker)", () => {
     const t = fs.readFileSync("docs/workflow-template.yml", "utf8");
     expect(t).toContain("semgrep==1.180.0");

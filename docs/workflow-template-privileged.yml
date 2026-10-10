@@ -17,6 +17,10 @@ concurrency:
   group: pr-reviewer-priv-${{ github.event.workflow_run.head_repository.full_name }}-${{ github.event.workflow_run.head_branch }}
   cancel-in-progress: true
 
+# SARIF: this privileged flow never uploads SARIF. Code-scanning uploads happen only in the same-repo
+# unprivileged flow (docs/workflow-template.yml). Fork runs carry no security-events: write, so an
+# upload from here would be refused.
+#
 # Why the guards look like this:
 # - Fork only (head_repository != this repository): same-repo PRs are reviewed and posted by the
 #   unprivileged template. Running here too would post the same review twice.

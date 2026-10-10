@@ -21,6 +21,9 @@ import {
   GITLEAKS_IMAGE,
   GITLEAKS_DIGEST,
   SEMGREP_VERSION,
+  runExec,
+  fromStdout,
+  TOOL_TIMEOUT_MS,
 } from "../src/scanners.js";
 
 // Only writeFile is wrapped; everything else passes through. Tests opt into failures.
@@ -433,5 +436,41 @@ describe("runScanners", () => {
     const r = await runScanners({ dir: tmp, baselineSha: "abc", sbom: true, outDir: tmp });
     const gl = r.findings.find((f) => f.message.startsWith("gitleaks temp dir unavailable"));
     expect(gl).toMatchObject({ severity: "warning", rule: "scanner-failed" });
+  });
+});
+
+describe("per-tool timeout (M8)", () => {
+  it("default budget is 10 minutes per tool invocation", () => {
+    expect(TOOL_TIMEOUT_MS).toBe(600_000);
+  });
+
+  it("a tool that outlives its timeout is killed and flagged timedOut", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "timeout-"));
+    try {
+      const r = await runExec(process.execPath, ["-e", "setTimeout(() => {}, 20000)"], dir, undefined, 300);
+      expect(r.timedOut).toBe(true);
+      expect(r.missing).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 15_000);
+
+  it("a tool that finishes in time is not flagged", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "timeout-"));
+    try {
+      const r = await runExec(process.execPath, ["-e", "process.exit(0)"], dir, undefined, 10_000);
+      expect(r.timedOut).toBe(false);
+      expect(r.code).toBe(0);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("a timeout becomes a scanner-failed warning, never a clean pass", () => {
+    const f = fromStdout("semgrep", "semgrep", { missing: false, code: null, stdout: "", timedOut: true });
+    expect(f).toHaveLength(1);
+    expect(f[0].severity).toBe("warning");
+    expect(f[0].rule).toBe("scanner-failed");
+    expect(f[0].message).toContain("timed out after 600s");
   });
 });
