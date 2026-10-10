@@ -33,8 +33,8 @@ const okResponses = (text: string, extra: Record<string, unknown> = {}) => ({
   ...extra,
 });
 
-function lastBody(): any {
-  return JSON.parse(String(calls.at(-1)!.init.body));
+function lastBody(): Record<string, unknown> {
+  return JSON.parse(String(calls.at(-1)!.init.body)) as Record<string, unknown>;
 }
 
 /** Endpoint mirroring resolveEndpoint for the responses path. */

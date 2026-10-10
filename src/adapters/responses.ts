@@ -64,6 +64,8 @@ export async function callResponses(
   if (key === "") return { ok: false, reason: "no-key", detail: "no API key configured" };
 
   try {
+    // Hardcoded "openai": the callResponses signature carries no provider (per brief), and the
+    // Responses wire format is provider-neutral here — sampling rules only need the OpenAI family.
     validateSampling({ model: o.model, temperature: o.temperature, topP: o.topP, provider: "openai" });
   } catch (e) {
     return { ok: false, reason: "unsupported", detail: redact(errMessage(e), key) };
