@@ -1,5 +1,5 @@
 {
-  "name": "pr-reviewer",
+  "name": "lupa",
   "version": "0.1.0",
   "description": "Reusable GitHub Action that reviews pull requests with an LLM",
   "private": true,

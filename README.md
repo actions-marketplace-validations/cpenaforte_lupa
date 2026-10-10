@@ -1,4 +1,4 @@
-# PR Reviewer
+# Lupa
 
 A reusable GitHub Action (TypeScript, Node 24) that reviews pull requests in two layers and posts the result as one review:
 
@@ -13,10 +13,10 @@ The diff is treated as untrusted data. The LLM has no tools and its output is va
 
    ```bash
    mkdir -p .github/workflows
-   cp docs/workflow-template.yml .github/workflows/pr-reviewer.yml
+   cp docs/workflow-template.yml .github/workflows/lupa.yml
    ```
 
-   Replace `OWNER` and the all-zero SHA in the template with a released `pr-reviewer` commit.
+   Replace `OWNER` and the all-zero SHA in the template with a released `lupa` commit.
 
 2. Add secrets and variables to the repository:
 
@@ -122,7 +122,7 @@ A fork PR gets a read-only `GITHUB_TOKEN`, so the review cannot be posted from t
 To post reviews on fork PRs, use the two-workflow pattern with an App token:
 
 1. **Unprivileged** (`docs/workflow-template.yml`, trigger `pull_request`): checks out the PR head with `persist-credentials: false`, writes the diff against the fetched base SHA, runs the review and uploads the artifact. It holds no App key.
-2. **Privileged** (`docs/workflow-template-privileged.yml`, trigger `workflow_run` on `PR Reviewer` with `types: [completed]`, guarded to fork `pull_request` runs that were not cancelled): runs in the base repository context. It only downloads the artifact by `run-id`, verifies the files, and posts the review, using a GitHub App token created with `actions/create-github-app-token` when `PR_REVIEWER_APP_ID` is set. It never checks out PR code, never runs scanners or L2, and never calls the LLM.
+2. **Privileged** (`docs/workflow-template-privileged.yml`, trigger `workflow_run` on `Lupa` with `types: [completed]`, guarded to fork `pull_request` runs that were not cancelled): runs in the base repository context. It only downloads the artifact by `run-id`, verifies the files, and posts the review, using a GitHub App token created with `actions/create-github-app-token` when `PR_REVIEWER_APP_ID` is set. It never checks out PR code, never runs scanners or L2, and never calls the LLM.
 
 The segregation matters: the privileged job reads only the artifact, so PR code never runs with the App key.
 
@@ -139,3 +139,7 @@ The segregation matters: the privileged job reads only the artifact, so PR code 
 - Never interpolate PR titles or bodies into `run:` steps. `pull_request_target` is not used.
 - `llm_api_key` is never written to logs. Prompt-injection defences are structural (delimited diff, no tools for the model, output validation, an auditable log of each call). They are not a guarantee.
 - The model can be wrong. Treat findings as suggestions and keep human review for security-critical changes.
+
+## Why the technical identifiers still say pr-reviewer
+
+Lupa is the product's display name, but `pr-reviewer` remains the stable technical namespace: `PR_REVIEWER_*` variables and inputs, `pr-reviewer/1.0` user-agent, `pr-reviewer-*` concurrency groups, `pr-reviewer-out` artifacts, `pr-reviewer:` log prefixes and the SARIF driver name are all kept so existing workflows, gates and tooling keep working without migration.

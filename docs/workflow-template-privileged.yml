@@ -1,11 +1,11 @@
-# PR Reviewer: Fluxo B (privileged). Posts the review produced by the PR run.
+# Lupa: Fluxo B (privileged). Posts the review produced by the PR run.
 # Runs in the base repository context. It only downloads the artifact and posts it:
 # no checkout, no scanners, no LLM. Replace OWNER and the action SHA below.
-name: PR Reviewer (post)
+name: Lupa (post)
 
 on:
   workflow_run:
-    workflows: ["PR Reviewer"]
+    workflows: ["Lupa"]
     types: [completed]
 
 permissions:
@@ -64,7 +64,7 @@ jobs:
       - name: Post review
         # Reporting only: it does not gate merges (the PR run's gate does).
         continue-on-error: true
-        uses: OWNER/pr-reviewer@0000000000000000000000000000000000000000 # replace with a released SHA
+        uses: OWNER/lupa@0000000000000000000000000000000000000000 # replace with a released SHA
         env:
           PR_REVIEWER_ARTIFACT_DIR: ${{ runner.temp }}/pr-reviewer-priv-out
           PR_REVIEWER_TOKEN_TYPE: ${{ steps.app.outcome == 'success' && 'app' || 'github-token' }}

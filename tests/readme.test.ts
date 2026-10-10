@@ -21,6 +21,7 @@ describe("README", () => {
       "artifact",
       "dry-run",
       "REQUEST_CHANGES",
+      "lupa",
     ]) {
       expect(r).toContain(s);
     }

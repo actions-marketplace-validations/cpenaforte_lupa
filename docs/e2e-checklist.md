@@ -54,7 +54,7 @@ git diff --exit-code -- dist/index.js
 ## Release procedure
 
 Consumers copy the templates from `main` **after** the release. Never copy them from the v0.1.0 tag:
-that tag's templates still carry the `OWNER/pr-reviewer@0000…` placeholder by design.
+that tag's templates still carry the `OWNER/lupa@0000…` placeholder by design.
 
 Before starting, verify that the scanner digests are real (the scoped test in `tests/ci.test.ts`
 checks `src/`, `.github/workflows/ci.yml` and `action.yml` for placeholders):
@@ -71,12 +71,12 @@ Release order (strict; `v1` moves exactly once, as the last tag move):
 2. **Immutable tag.** Create an annotated tag on the release commit and push it. The tag is never moved:
 
    ```bash
-   git tag -a v0.1.0 -m "pr-reviewer v0.1.0"
+   git tag -a v0.1.0 -m "lupa v0.1.0"
    git push origin v0.1.0
    ```
 
 3. **Canary on the immutable `v0.1.0` tag.** In the consumer test repository, pin the workflow to
-   `OWNER/pr-reviewer@v0.1.0` and run every case above, including live Ollama. All must pass. Do not
+   `OWNER/lupa@v0.1.0` and run every case above, including live Ollama. All must pass. Do not
    touch `v0.1.0`. If a case fails, fix on `main`, cut a new tag (`v0.1.1`), and restart from step 2.
    `v1` has not moved yet, so nothing consumes the failed release.
 4. **Substitute the tag's commit SHA into BOTH templates**, then commit on `main` (follow-up commit C).
@@ -88,7 +88,7 @@ Release order (strict; `v1` moves exactly once, as the last tag move):
    SHA=$(git rev-parse "v0.1.0^{commit}")
    echo "$SHA"   # 40 hex
    OWNER=your-login
-   sed -i "s#OWNER/pr-reviewer@0000000000000000000000000000000000000000#$OWNER/pr-reviewer@$SHA#" docs/workflow-template.yml docs/workflow-template-privileged.yml
+   sed -i "s#OWNER/lupa@0000000000000000000000000000000000000000#$OWNER/lupa@$SHA#" docs/workflow-template.yml docs/workflow-template-privileged.yml
    sed -i 's/ # replace with a released SHA$//' docs/workflow-template.yml docs/workflow-template-privileged.yml
    grep -n "$SHA" docs/workflow-template.yml docs/workflow-template-privileged.yml   # both files, no placeholder left
    npx vitest run tests/templates.test.ts tests/ci.test.ts
@@ -107,5 +107,5 @@ Release order (strict; `v1` moves exactly once, as the last tag move):
    ```
 
 6. **Marketplace.** On the GitHub release for `v0.1.0`, tick "Publish this Action to the GitHub
-   Marketplace". Check the listing copy against `action.yml` (`name: "PR Reviewer"`, the `description`
+   Marketplace". Check the listing copy against `action.yml` (`name: "Lupa"`, the `description`
    field, the inputs and outputs, and the `branding:` block from step 1).

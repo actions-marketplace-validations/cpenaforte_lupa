@@ -218,7 +218,7 @@ describe("ci workflow", () => {
     expect(d).toContain("git tag -a v0.1.0");
     expect(d).toContain("v1");
     expect(d).toMatch(/canary/i);
-    expect(d).toContain("OWNER/pr-reviewer@0000000000000000000000000000000000000000");
+    expect(d).toContain("OWNER/lupa@0000000000000000000000000000000000000000");
     expect(d).toMatch(/marketplace/i);
     expect(d).toContain("docs/workflow-template.yml docs/workflow-template-privileged.yml");
     expect(d).toMatch(/never copy them from the v0\.1\.0 tag/i);

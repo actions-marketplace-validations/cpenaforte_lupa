@@ -1,5 +1,5 @@
-# PR Reviewer: Fluxo A (unprivileged). Copy into .github/workflows/ of the consuming repository.
-# Replace OWNER and the action SHA below with a released commit of pr-reviewer.
+# Lupa: Fluxo A (unprivileged). Copy into .github/workflows/ of the consuming repository.
+# Replace OWNER and the action SHA below with a released commit of lupa.
 #
 # Trust model (read before enabling):
 # - issue_comment and pull_request_review run in the BASE repository context WITH secrets. Those
@@ -15,7 +15,7 @@
 #   Known limitation. For high-threat repositories, separate the review of untrusted code into a
 #   workflow with no secrets and no base-repository context, and post results through the
 #   privileged workflow (docs/workflow-template-privileged.yml) only.
-name: PR Reviewer
+name: Lupa
 
 on:
   pull_request:
@@ -117,7 +117,7 @@ jobs:
         id: review
         # Exit 2 (warning) must never block the merge; the gate step below decides.
         continue-on-error: true
-        uses: OWNER/pr-reviewer@0000000000000000000000000000000000000000 # replace with a released SHA
+        uses: OWNER/lupa@0000000000000000000000000000000000000000 # replace with a released SHA
         env:
           PR_REVIEWER_BASE_SHA: ${{ steps.shas.outputs.base_sha }}
           PR_REVIEWER_HEAD_SHA: ${{ steps.shas.outputs.head_sha }}
