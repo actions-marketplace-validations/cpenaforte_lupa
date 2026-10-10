@@ -80,7 +80,7 @@ export async function callMessages(
   for (const k of Object.keys(headers)) {
     if (/^authorization$/i.test(k)) delete headers[k];
   }
-  const authEp: ResolvedEndpoint = { baseUrl: ep.baseUrl, path: ep.path, headers };
+  const authEp: ResolvedEndpoint = { baseUrl: ep.baseUrl, path: ep.path, headers, apiStyle: ep.apiStyle };
 
   let a = await attempt(authEp, payload, o);
   if (a.kind === "fail") return a.result;

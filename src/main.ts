@@ -19,7 +19,7 @@ import { runL0, type Finding } from "./fastpath.js";
 import { runL2 } from "./l2.js";
 import { postIssueFallback, postReview, ReadonlyTokenError, resolvePrNumber, shouldTrigger } from "./github.js";
 import { getInputs, type ActionInputs } from "./inputs.js";
-import { callLlm, ensureOllama, type LlmResult } from "./llm.js";
+import { callByStyle, callLlm, ensureOllama, type LlmResult } from "./llm.js";
 import { buildMessages, linkedIssueNumber } from "./prompt.js";
 import { resolveEndpoint, validateModelExists, type ResolvedEndpoint } from "./providers.js";
 import { buildBody, eventFor, exitFor, mapToComments, type ReviewPayload } from "./review.js";
@@ -800,7 +800,10 @@ function realAnalysis(): Analysis {
     runL2: (dir) => runL2(dir),
     ensureOllama,
     validateModelExists,
-    callLlm,
+    // The slow path invokes this seam; it dispatches by the endpoint's resolved
+    // API style (openai-chat keeps callLlm; v2 styles use their adapter), so
+    // every provider/model pair works end-to-end.
+    callLlm: callByStyle,
   };
 }
 

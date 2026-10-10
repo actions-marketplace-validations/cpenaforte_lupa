@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { callGoogle } from "../src/adapters/google.js";
+import { callGoogle, googleSchema } from "../src/adapters/google.js";
 import { PR_REVIEW_SCHEMA } from "../src/prompt.js";
 import type { ResolvedEndpoint } from "../src/providers.js";
 
@@ -35,12 +35,36 @@ function lastBody(): Record<string, unknown> {
   return JSON.parse(String(calls.at(-1)!.init.body)) as Record<string, unknown>;
 }
 
+/** PR_REVIEW_SCHEMA.schema as Google's OpenAPI subset expects it (no additionalProperties, nullable flags). */
+const EXPECTED_GOOGLE_SCHEMA = {
+  type: "object",
+  required: ["findings"],
+  properties: {
+    findings: {
+      type: "array",
+      items: {
+        type: "object",
+        required: ["severity", "file", "line", "rule", "message", "suggestion"],
+        properties: {
+          severity: { type: "string", enum: ["info", "warning", "high"] },
+          file: { type: "string" },
+          line: { type: "integer", nullable: true },
+          rule: { type: "string" },
+          message: { type: "string" },
+          suggestion: { type: "string", nullable: true },
+        },
+      },
+    },
+  },
+};
+
 /** Endpoint mirroring resolveEndpoint for the native Google path. */
 function fakeGoogleEp(key = "k"): ResolvedEndpoint {
   return {
     baseUrl: "https://generativelanguage.googleapis.com/v1beta",
     path: "/models/gemini-2.5-flash:generateContent",
     headers: { "User-Agent": "pr-reviewer/1.0", "x-opencode-session": "pr-123" },
+    apiStyle: "google-models",
   };
 }
 
@@ -79,7 +103,7 @@ describe("callGoogle", () => {
       systemInstruction: { parts: [{ text: "s" }] },
       generationConfig: {
         responseMimeType: "application/json",
-        responseSchema: PR_REVIEW_SCHEMA.schema,
+        responseSchema: EXPECTED_GOOGLE_SCHEMA,
         maxOutputTokens: 50,
       },
     });
@@ -90,6 +114,7 @@ describe("callGoogle", () => {
       baseUrl: "https://opencode.ai/zen/v1",
       path: "/models/gemini-2.5-flash",
       headers: { Authorization: "Bearer k", "User-Agent": "pr-reviewer/1.0" },
+      apiStyle: "google-models",
     };
     expect(await callGoogle(zenEp, MODEL, msgs(), opts())).toEqual({ ok: true, findings: [] });
     expect(calls.at(-1)!.url).toBe("https://opencode.ai/zen/v1/models/gemini-2.5-flash");
@@ -241,5 +266,38 @@ describe("callGoogle", () => {
     expect((r as { detail: string }).detail).not.toContain(key);
     // 5xx → exactly one retry, then the plain http-error path (no schema fallback for 5xx).
     expect(calls.length).toBe(2);
+  });
+});
+
+// ---------- googleSchema ----------
+
+describe("googleSchema", () => {
+  it("converts type arrays to a single type plus nullable", () => {
+    expect(googleSchema({ type: ["integer", "null"] })).toEqual({ type: "integer", nullable: true });
+    expect(googleSchema({ type: ["string", "null"] })).toEqual({ type: "string", nullable: true });
+  });
+
+  it("drops additionalProperties at every level of PR_REVIEW_SCHEMA", () => {
+    const out = googleSchema(PR_REVIEW_SCHEMA.schema);
+    expect(JSON.stringify(out)).not.toContain("additionalProperties");
+  });
+
+  it("preserves nested items, arrays and required arrays", () => {
+    const out = googleSchema(PR_REVIEW_SCHEMA.schema) as typeof EXPECTED_GOOGLE_SCHEMA;
+    const items = out.properties.findings.items;
+    expect(out.properties.findings.type).toBe("array");
+    expect(out.required).toEqual(["findings"]);
+    expect(items.required).toEqual(["severity", "file", "line", "rule", "message", "suggestion"]);
+    expect(items.properties.line).toEqual({ type: "integer", nullable: true });
+    expect(items.properties.severity).toEqual({ type: "string", enum: ["info", "warning", "high"] });
+  });
+
+  it("keeps a required array valid when it names a property the schema does not define", () => {
+    const out = googleSchema({
+      type: "object",
+      required: ["a", "ghost"],
+      properties: { a: { type: "string" } },
+    });
+    expect(out.required).toEqual(["a"]);
   });
 });

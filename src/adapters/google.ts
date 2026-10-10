@@ -46,6 +46,52 @@ function joinCandidateText(json: unknown): string | undefined {
 }
 
 /**
+ * Converts the strict OpenAI-style schema subset used by PR_REVIEW_SCHEMA to
+ * Google's OpenAPI-subset for `responseSchema`:
+ * - `type: ["integer", "null"]` becomes `type: "integer", nullable: true`;
+ * - `additionalProperties` is dropped (unsupported there), at every level;
+ * - `required` is filtered to the properties the schema actually defines, so
+ *   it stays valid;
+ * - `properties` and `items` are converted recursively; everything else is
+ *   copied as is. The caller keeps the retry-without-schema fallback as safety.
+ */
+export function googleSchema(schema: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(schema)) {
+    if (k === "additionalProperties") continue;
+    if (k === "type" && Array.isArray(v)) {
+      const types = v.filter((t): t is string => typeof t === "string" && t !== "null");
+      if (v.includes("null")) out.nullable = true;
+      if (types.length > 0) out.type = types[0];
+      continue;
+    }
+    if (k === "properties" && typeof v === "object" && v !== null && !Array.isArray(v)) {
+      const props: Record<string, unknown> = {};
+      for (const [name, sub] of Object.entries(v as Record<string, unknown>)) {
+        props[name] =
+          typeof sub === "object" && sub !== null && !Array.isArray(sub)
+            ? googleSchema(sub as Record<string, unknown>)
+            : sub;
+      }
+      out.properties = props;
+      continue;
+    }
+    if (k === "items" && typeof v === "object" && v !== null && !Array.isArray(v)) {
+      out.items = googleSchema(v as Record<string, unknown>);
+      continue;
+    }
+    out[k] = v;
+  }
+  if (Array.isArray(out.required) && typeof out.properties === "object" && out.properties !== null) {
+    const props = out.properties as Record<string, unknown>;
+    const required = (out.required as unknown[]).filter((n) => typeof n === "string" && n in props);
+    if (required.length > 0) out.required = required;
+    else delete out.required;
+  }
+  return out;
+}
+
+/**
  * Google generateContent (`POST {base}/models/<id>:generateContent`): the body is
  * `{contents, systemInstruction, generationConfig}` with `maxOutputTokens` for the
  * token budget. Structured output rides as `responseMimeType`+`responseSchema`; a 400
@@ -82,7 +128,7 @@ export async function callGoogle(
     const generationConfig: Record<string, unknown> = { maxOutputTokens: o.maxTokens };
     if (withSchema) {
       generationConfig.responseMimeType = "application/json";
-      generationConfig.responseSchema = PR_REVIEW_SCHEMA.schema;
+      generationConfig.responseSchema = googleSchema(PR_REVIEW_SCHEMA.schema);
     }
     if (o.temperature !== undefined) generationConfig.temperature = o.temperature;
     if (o.topP !== undefined) generationConfig.topP = o.topP;
@@ -106,7 +152,7 @@ export async function callGoogle(
   for (const k of Object.keys(headers)) {
     if (/^authorization$/i.test(k)) delete headers[k];
   }
-  const authEp: ResolvedEndpoint = { baseUrl: ep.baseUrl, path: ep.path, headers };
+  const authEp: ResolvedEndpoint = { baseUrl: ep.baseUrl, path: ep.path, headers, apiStyle: ep.apiStyle };
 
   let a = await attempt(authEp, payload, o);
   if (a.kind === "fail") return a.result;

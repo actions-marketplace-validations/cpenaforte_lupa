@@ -49,6 +49,7 @@ function fakeMessagesEp(key = "k"): ResolvedEndpoint {
       "User-Agent": "pr-reviewer/1.0",
       "x-opencode-session": "pr-123",
     },
+    apiStyle: "anthropic-messages",
   };
 }
 

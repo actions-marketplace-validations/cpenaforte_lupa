@@ -1,6 +1,9 @@
 import type { Finding } from "./fastpath.js";
 import { PR_REVIEW_SCHEMA } from "./prompt.js";
-import type { ResolvedEndpoint } from "./providers.js";
+import type { ResolvedEndpoint, ResolvedApiStyle } from "./providers.js";
+import { callGoogle } from "./adapters/google.js";
+import { callMessages } from "./adapters/messages.js";
+import { callResponses } from "./adapters/responses.js";
 
 export class InvalidJsonError extends Error {}
 export class OllamaMissingError extends Error {}
@@ -290,6 +293,39 @@ export async function callLlm(
 
 /** Default client timeout for the Ollama pull (pulls can be slow). */
 const PULL_TIMEOUT_DEFAULT_S = 300;
+
+/**
+ * Dispatches to the adapter of the endpoint's resolved API style: openai-chat
+ * keeps callLlm; the v2 styles route to their native-protocol adapters. Same
+ * messages/options shape and the same LlmResult union for every style, so
+ * callers handle the result identically.
+ */
+export async function callByStyle(
+  ep: ResolvedEndpoint,
+  messages: { system: string; user: string },
+  o: {
+    model: string;
+    apiKey: string;
+    temperature?: number;
+    topP?: number;
+    maxTokens: number;
+    timeoutSeconds: number;
+    provider: string;
+  },
+): Promise<LlmResult> {
+  const style: ResolvedApiStyle = ep.apiStyle ?? "openai-chat";
+  switch (style) {
+    case "openai-responses":
+      return callResponses(ep, messages, o);
+    case "anthropic-messages":
+      return callMessages(ep, messages, o);
+    case "google-models":
+      // Google posts to {base}/models/<id>:generateContent: the model id rides the path.
+      return callGoogle(ep, o.model, messages, o);
+    case "openai-chat":
+      return callLlm(ep, messages, o);
+  }
+}
 
 /**
  * Healthchecks the Ollama server at the root (baseUrl minus trailing /v1),

@@ -43,6 +43,7 @@ function fakeResponsesEp(key = "k"): ResolvedEndpoint {
     baseUrl: "https://opencode.ai/zen/v1",
     path: "/responses",
     headers: { Authorization: `Bearer ${key}`, "User-Agent": "pr-reviewer/1.0" },
+    apiStyle: "openai-responses",
   };
 }
 

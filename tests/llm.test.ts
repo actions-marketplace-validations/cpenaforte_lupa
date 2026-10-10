@@ -51,6 +51,7 @@ function fakeEp(p: string, key = "k"): ResolvedEndpoint {
     baseUrl: `https://${p}.test/v1`,
     path: "/chat/completions",
     headers: { Authorization: `Bearer ${key}`, "User-Agent": "pr-reviewer/1.0" },
+    apiStyle: "openai-chat",
   };
 }
 const fakeOpenAiEp = () => fakeEp("openai");

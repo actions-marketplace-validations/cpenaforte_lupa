@@ -9,12 +9,20 @@ export type ApiStyle = LlmApiStyle;
 /** API styles that need a non-chat body adapter (v2 only). */
 export type NonChatStyle = Exclude<ApiStyle, "auto" | "openai-chat" | "custom-path">;
 
+/**
+ * What a resolved endpoint actually speaks: "auto" is resolved away, and
+ * "custom-path" (path-only override) resolves to the openai-chat body.
+ */
+export type ResolvedApiStyle = "openai-chat" | NonChatStyle;
+
 export interface ResolvedEndpoint {
   /** Base URL only; never includes the request path. */
   baseUrl: string;
   /** Request path appended to baseUrl, e.g. "/chat/completions". */
   path: string;
   headers: Record<string, string>;
+  /** Resolved API style: the dispatcher in llm.ts picks the adapter by this. */
+  apiStyle: ResolvedApiStyle;
 }
 
 /**
@@ -39,12 +47,11 @@ const VALIDATE_TIMEOUT_MS = 15_000;
 
 /**
  * Provider:model pairs that are NOT served by the OpenAI chat-completions
- * endpoint. `auto` fails fast for these in v1, and so does an explicit
- * `openai-chat` (both throw UnsupportedModelError). Chat-supported pairs
- * (e.g. opencode-zen:qwen3.8-max) must NOT appear here.
- *
- * Non-chat styles listed here are v2-only: explicitly selecting them in v1
- * throws UnsupportedModelError.
+ * endpoint. `auto` resolves these pairs to their adapter (v2: no more
+ * fail-fast), and so does an explicit v2 `llm_api_style`. Explicit
+ * `openai-chat` on one of these pairs still throws UnsupportedModelError
+ * (chat cannot serve them). Chat-supported pairs (e.g. opencode-zen:qwen3.8-max)
+ * must NOT appear here.
  *
  * Go per-model limits (documented for operators, enforced by the provider):
  * 5h window 20%, weekly 50%, monthly 100%, per-model caps $15–60.
@@ -86,12 +93,6 @@ export const NON_CHAT: ReadonlyMap<string, NonChatStyle> = new Map<string, NonCh
   ["opencode-zen:gemini-3.5-flash-lite", "google-models"],
 ]);
 
-const V2_STYLES: ReadonlySet<string> = new Set<NonChatStyle>([
-  "openai-responses",
-  "anthropic-messages",
-  "google-models",
-]);
-
 /** Last path segments that identify a non-chat endpoint (path-only misuse). */
 const NON_CHAT_PATH_SEGMENTS: ReadonlySet<string> = new Set(["messages", "responses", "models"]);
 
@@ -118,6 +119,20 @@ export interface ResolveEndpointOptions {
   prNumber: number | null;
 }
 
+/** Default request path for each resolved API style; llm_path overrides it. */
+function defaultPathFor(apiStyle: ResolvedApiStyle, model: string): string {
+  switch (apiStyle) {
+    case "openai-responses":
+      return "/responses";
+    case "anthropic-messages":
+      return "/messages";
+    case "google-models":
+      return `/models/${model}:generateContent`;
+    case "openai-chat":
+      return CHAT_PATH;
+  }
+}
+
 export function resolveEndpoint(o: ResolveEndpointOptions): ResolvedEndpoint {
   const rawBase = o.llmBaseUrl || PRESET_BASE_URLS[o.llmProvider] || "";
   if (rawBase === "") {
@@ -125,28 +140,39 @@ export function resolveEndpoint(o: ResolveEndpointOptions): ResolvedEndpoint {
   }
   const baseUrl = rawBase.replace(/\/+$/, "");
 
-  if (V2_STYLES.has(o.llmApiStyle)) {
-    throw new UnsupportedModelError(
-      `llm_api_style "${o.llmApiStyle}" is not supported in v1; only openai-chat is available`,
-    );
-  }
-
-  if (o.llmApiStyle === "auto" || o.llmApiStyle === "openai-chat") {
-    const nonChat = NON_CHAT.get(`${o.llmProvider}:${o.llmModel}`);
-    if (nonChat !== undefined) {
-      throw new UnsupportedModelError(
-        `Model "${o.llmModel}" on "${o.llmProvider}" requires "${nonChat}", which is not supported in v1. ` +
-          `Supported API styles: openai-chat (chat-capable models only).`,
-      );
-    }
-  }
-
-  // custom-path requires an explicit llm_path; other styles default to chat.
+  // custom-path requires an explicit llm_path; other styles default to their own path.
   if (o.llmApiStyle === "custom-path" && o.llmPath === "") {
     throw new Error(`llm_api_style "custom-path" requires llm_path`);
   }
 
-  const rawPath = o.llmPath !== "" ? o.llmPath : CHAT_PATH;
+  // Resolve the API style. `auto` consults the versioned (provider, model) map
+  // and now RESOLVES non-chat pairs to their adapter; explicit v2 styles are
+  // honored as-is (functional); openai-chat and custom-path use the chat body.
+  let apiStyle: ResolvedApiStyle;
+  if (o.llmApiStyle === "openai-responses" || o.llmApiStyle === "anthropic-messages" || o.llmApiStyle === "google-models") {
+    apiStyle = o.llmApiStyle;
+  } else if (o.llmApiStyle === "auto") {
+    apiStyle = NON_CHAT.get(`${o.llmProvider}:${o.llmModel}`) ?? "openai-chat";
+  } else {
+    apiStyle = "openai-chat";
+    if (o.llmApiStyle === "openai-chat") {
+      const nonChat = NON_CHAT.get(`${o.llmProvider}:${o.llmModel}`);
+      if (nonChat !== undefined) {
+        throw new UnsupportedModelError(
+          `Model "${o.llmModel}" on "${o.llmProvider}" is served by "${nonChat}", which openai-chat cannot reach. ` +
+            `Set llm_api_style to auto (resolves it automatically) or "${nonChat}". ` +
+            `Supported API styles: auto, openai-chat, openai-responses, anthropic-messages, google-models, custom-path.`,
+        );
+      }
+    }
+  }
+
+  // The google preset base ends in the OpenAI-compat segment (/openai); the
+  // native generateContent path hangs off the API root, so drop that segment.
+  const effectiveBase =
+    apiStyle === "google-models" && baseUrl.endsWith("/openai") ? baseUrl.slice(0, -"/openai".length) : baseUrl;
+
+  const rawPath = o.llmPath !== "" ? o.llmPath : defaultPathFor(apiStyle, o.llmModel);
   // Normalize (leading slash), then strip query and fragment from the returned
   // path; the path-only guard runs on that same returned path.
   const normalized = rawPath.startsWith("/") ? rawPath : `/${rawPath}`;
@@ -158,11 +184,14 @@ export function resolveEndpoint(o: ResolveEndpointOptions): ResolvedEndpoint {
   if (strippedParts.length > 0) {
     core.warning(`llm_path ${strippedParts.join(" and ")} ignored; only the path is used`);
   }
-  if (isPathOnlyNonChat(path)) {
+  // Path-only guard: a non-chat path needs a body adapter, which only a v2
+  // style provides — with a v2 style active the adapter exists, so it is skipped.
+  if (apiStyle === "openai-chat" && isPathOnlyNonChat(path)) {
     const rawClean = rawPath.split(/[?#]/)[0];
     throw new UnsupportedModelError(
       `llm_path "${rawClean}" normalizes to "${path}", which is path-only: it names a non-chat endpoint. ` +
-        `llm_path only overrides the path; a non-chat body adapter requires a v2 llm_api_style, which is not supported in v1.`,
+        `llm_path only overrides the path; a non-chat body adapter requires a v2 llm_api_style ` +
+        `(openai-responses, anthropic-messages or google-models).`,
     );
   }
 
@@ -174,7 +203,7 @@ export function resolveEndpoint(o: ResolveEndpointOptions): ResolvedEndpoint {
     headers["x-opencode-session"] = `pr-${o.prNumber}`;
   }
 
-  return { baseUrl, path, headers };
+  return { baseUrl: effectiveBase, path, headers, apiStyle };
 }
 
 /**

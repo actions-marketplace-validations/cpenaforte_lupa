@@ -33,9 +33,11 @@ describe("resolveEndpoint", () => {
     expect(r.path).toBe("/chat/completions");
   });
 
-  it("zen qwen3.8-max resolves chat, go qwen3.8-max throws", () => {
+  it("zen qwen3.8-max resolves chat, go qwen3.8-max resolves anthropic-messages", () => {
     expect(resolveEndpoint({ ...base, llmProvider: "opencode-zen", llmModel: "qwen3.8-max" }).path).toBe("/chat/completions");
-    expect(() => resolveEndpoint({ ...base, llmProvider: "opencode-go", llmModel: "qwen3.8-max" })).toThrow(UnsupportedModelError);
+    const go = resolveEndpoint({ ...base, llmProvider: "opencode-go", llmModel: "qwen3.8-max" });
+    expect(go.apiStyle).toBe("anthropic-messages");
+    expect(go.path).toBe("/messages");
   });
 
   it("zen sends no session header, go does", () => {
@@ -46,26 +48,30 @@ describe("resolveEndpoint", () => {
     expect(g.headers["x-opencode-session"]).toBe("pr-1");
   });
 
-  it("matrix: documented chat models resolve, non-chat fail-fast", () => {
+  it("matrix: documented chat models resolve chat, non-chat models resolve their adapter", () => {
     for (const m of ZEN_CHAT) {
       expect(resolveEndpoint({ ...base, llmProvider: "opencode-zen", llmModel: m }).path).toBe("/chat/completions");
     }
-    expect(() => resolveEndpoint({ ...base, llmProvider: "opencode-zen", llmModel: "gpt-6-luna" })).toThrow(UnsupportedModelError);
-    expect(() => resolveEndpoint({ ...base, llmProvider: "opencode-zen", llmModel: "claude-sonnet-5-5" })).toThrow(UnsupportedModelError);
+    expect(resolveEndpoint({ ...base, llmProvider: "opencode-zen", llmModel: "gpt-6-luna" }).apiStyle).toBe("openai-responses");
+    expect(resolveEndpoint({ ...base, llmProvider: "opencode-zen", llmModel: "claude-sonnet-5-5" }).apiStyle).toBe("anthropic-messages");
   });
 
-  it("zen non-chat fail-fast covers v2 list", () => {
+  it("zen non-chat models resolve to their v2 adapter (no fail-fast)", () => {
     for (const m of ZEN_NON_CHAT) {
-      expect(() => resolveEndpoint({ ...base, llmProvider: "opencode-zen", llmModel: m })).toThrow(UnsupportedModelError);
+      const r = resolveEndpoint({ ...base, llmProvider: "opencode-zen", llmModel: m });
+      expect(r.apiStyle).toBe(NON_CHAT.get(`opencode-zen:${m}`));
+      expect(r.path).not.toBe("/chat/completions");
     }
   });
 
-  it("go chat models resolve, go non-chat fail-fast", () => {
+  it("go chat models resolve chat, go non-chat models resolve their adapter", () => {
     for (const m of GO_CHAT) {
       expect(resolveEndpoint({ ...base, llmProvider: "opencode-go", llmModel: m }).path).toBe("/chat/completions");
     }
     for (const m of GO_NON_CHAT) {
-      expect(() => resolveEndpoint({ ...base, llmProvider: "opencode-go", llmModel: m })).toThrow(UnsupportedModelError);
+      const r = resolveEndpoint({ ...base, llmProvider: "opencode-go", llmModel: m });
+      expect(r.apiStyle).toBe(NON_CHAT.get(`opencode-go:${m}`));
+      expect(r.path).not.toBe("/chat/completions");
     }
   });
 
@@ -73,8 +79,8 @@ describe("resolveEndpoint", () => {
     expect(() => resolveEndpoint({ ...base, llmProvider: "custom", llmBaseUrl: "https://x", llmModel: "m", llmPath: "/messages" })).toThrow(/path-only/);
   });
 
-  it("explicit v2 api_style throws in v1", () => {
-    expect(() => resolveEndpoint({ ...base, llmProvider: "openai", llmModel: "m", llmApiStyle: "anthropic-messages" })).toThrow(UnsupportedModelError);
+  it("explicit v2 api_style is functional and picks the adapter path", () => {
+    expect(resolveEndpoint({ ...base, llmProvider: "openai", llmModel: "m", llmApiStyle: "anthropic-messages" }).path).toBe("/messages");
   });
 
   it("prNumber null ok, go without number omits session header", () => {
@@ -129,9 +135,12 @@ describe("resolveEndpoint", () => {
     expect(resolveEndpoint({ ...base, llmProvider: "opencode-zen", llmModel: "qwen3.8-max", llmApiStyle: "openai-chat" }).path).toBe("/chat/completions");
   });
 
-  // F12: explicit v2 styles throw in v1.
-  it.each(["openai-responses", "google-models"] as const)("explicit %s throws UnsupportedModelError in v1", (style) => {
-    expect(() => resolveEndpoint({ ...base, llmProvider: "openai", llmModel: "m", llmApiStyle: style })).toThrow(UnsupportedModelError);
+  // F12 (v2): explicit v2 styles resolve to their adapter path.
+  it.each([
+    ["openai-responses", "/responses"],
+    ["google-models", "/models/m:generateContent"],
+  ] as const)("explicit %s resolves with path %s", (style, path) => {
+    expect(resolveEndpoint({ ...base, llmProvider: "openai", llmModel: "m", llmApiStyle: style }).path).toBe(path);
   });
 
   // F12: custom-path needs llm_path; plain Error (R2).

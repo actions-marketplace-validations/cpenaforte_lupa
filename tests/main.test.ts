@@ -10,7 +10,8 @@ vi.mock("@actions/core", async (importOriginal) => {
 });
 import { cleanEnvForExec, main, run, sanitizeFinding, unquoteGitPath, type Deps, type Gateway, type PrInfo, type RunEnv } from "../src/main.js";
 import { readPrMeta } from "../src/diff.js";
-import type { ActionInputs } from "../src/inputs.js";
+import type { ActionInputs, LlmApiStyle, LlmProvider } from "../src/inputs.js";
+import { callByStyle } from "../src/llm.js";
 import { ReadonlyTokenError } from "../src/github.js";
 import type { ReviewPayload } from "../src/review.js";
 import type { Finding } from "../src/fastpath.js";
@@ -55,6 +56,7 @@ const created: string[] = [];
 
 afterEach(() => {
   for (const d of created.splice(0)) rmSync(d, { recursive: true, force: true });
+  vi.unstubAllGlobals();
 });
 
 function scratch(): string {
@@ -127,11 +129,11 @@ function gatewayFor(rec: Rec, o: GwOpts): Gateway {
 function inputsFor(o: MockOpts): ActionInputs {
   return {
     githubToken: "t",
-    llmProvider: "openai",
-    llmBaseUrl: "https://llm.example/v1",
-    llmApiStyle: "auto",
+    llmProvider: o.llmProvider ?? "openai",
+    llmBaseUrl: o.llmBaseUrl ?? "https://llm.example/v1",
+    llmApiStyle: o.llmApiStyle ?? "auto",
     llmPath: "",
-    llmModel: "gpt-test",
+    llmModel: o.llmModel ?? "gpt-test",
     llmApiKey: o.llmApiKey ?? "k",
     llmMaxTokens: 2000,
     failLevel: o.failLevel ?? "warning",
@@ -164,6 +166,13 @@ interface MockOpts {
   /** Files created under the work dir (real on-disk sizes for L0's large-file rule). */
   workFiles?: Record<string, number>;
   tokenIsApp?: boolean;
+  llmProvider?: LlmProvider;
+  llmModel?: string;
+  llmApiStyle?: LlmApiStyle;
+  /** Empty string falls back to the provider preset base URL. */
+  llmBaseUrl?: string;
+  /** Use the real callByStyle dispatcher for analysis.callLlm (fetch is stubbed by the test). */
+  realLlm?: boolean;
 }
 
 async function runWithMocks(o: MockOpts = {}) {
@@ -224,10 +233,12 @@ async function runWithMocks(o: MockOpts = {}) {
         if (o.validateModel === "reject") throw new Error("GET /models failed with HTTP 500");
         return o.validateModel !== false;
       },
-      callLlm: async () => {
-        rec.llmCalled += 1;
-        return { ok: true, findings: o.llm ?? [LLM_FINDING] };
-      },
+      callLlm: o.realLlm === true
+        ? callByStyle
+        : async () => {
+            rec.llmCalled += 1;
+            return { ok: true, findings: o.llm ?? [LLM_FINDING] };
+          },
     },
   };
 
@@ -516,6 +527,45 @@ describe("run() orchestration", () => {
   it("the LLM slow path keeps its key (not scrubbed; it is intended API use)", async () => {
     const r = await runWithMocks({ llmApiKey: "sk-live" });
     expect(r.llmCalled).toBe(1);
+  });
+
+  // Task 12 wiring: the slow path resolves the adapter (auto → responses for zen gpt-6-luna)
+  // and dispatches through callByStyle, so a non-chat pair works end-to-end.
+  it("slow path dispatches a non-chat pair through the responses adapter and posts its findings", async () => {
+    const fetchMock = vi.fn(async (_url: string | URL, _init?: RequestInit) =>
+      new Response(
+        JSON.stringify({
+          status: "completed",
+          output: [
+            {
+              type: "message",
+              content: [
+                {
+                  type: "output_text",
+                  text: JSON.stringify({ findings: [{ ...LLM_FINDING, suggestion: "sug" }] }),
+                },
+              ],
+            },
+          ],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const r = await runWithMocks({ realLlm: true, llmProvider: "opencode-zen", llmModel: "gpt-6-luna", llmBaseUrl: "" });
+    expect(r.posted).toBe(true);
+    expect(r.findingsFrom).toBe("llm");
+    expect(JSON.stringify(r.reviews[0])).toContain("llm message");
+    const call = fetchMock.mock.calls.find((c) => String(c[0]).endsWith("/responses"));
+    expect(call).toBeDefined();
+    expect(String(call![0])).toBe("https://opencode.ai/zen/v1/responses");
+    const body = JSON.parse(String((call![1] as RequestInit).body)) as Record<string, any>;
+    expect(body.model).toBe("gpt-6-luna");
+    expect(body.max_output_tokens).toBe(2000);
+    expect(body.input).toEqual([
+      { role: "system", content: expect.any(String) },
+      { role: "user", content: expect.any(String) },
+    ]);
   });
 
   it("a failed sbom copy is a warning and the run continues", async () => {
