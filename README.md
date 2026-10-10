@@ -64,8 +64,8 @@ The default wire format is `openai-chat`: `POST {base_url}/chat/completions` wit
 | `mistral` | `https://api.mistral.ai/v1` | `openai-chat`. |
 | `openrouter` | `https://openrouter.ai/api/v1` | `openai-chat`. Model slugs look like `author/model`. |
 | `ollama` | `http://localhost:11434/v1` | `openai-chat`. Needs a daemon in the job (`services:` or a setup step), a healthcheck, `ollama pull <model>` before the run, `llm_api_key: dummy`, and no strict schema. |
-| `opencode-zen` | `https://opencode.ai/zen/v1` | `auto` resolves each model through the enumerated id map in `src/providers.ts`: chat-capable ids use `openai-chat`; the rest route to `anthropic-messages`, `openai-responses` or `google-models`. |
-| `opencode-go` | `https://opencode.ai/zen/go/v1` | Same mechanism, its own enumerated list in `src/providers.ts` — some ids are chat on Zen but adapters on Go (e.g. `qwen3.8-max`). |
+| `opencode-zen` | `https://opencode.ai/zen/v1` | With `auto`, the probe tries `openai-chat` first and falls through to `anthropic-messages`, `openai-responses` or `google-models` on a 400/404 (see API styles below). Nothing is hardcoded per model. |
+| `opencode-go` | `https://opencode.ai/zen/go/v1` | Same probe; some ids are chat-capable on Zen but served by an adapter on Go (e.g. `qwen3.8-max`), which error-driven routing discovers at call time. |
 | `custom` | (you set `llm_base_url`) | `openai-chat`, or a v2 style with the matching path; `custom-path` for a path-only override. |
 
 ### opencode-zen and opencode-go
@@ -73,23 +73,23 @@ The default wire format is `openai-chat`: `POST {base_url}/chat/completions` wit
 - **Key:** `Bearer` with your OpenCode API key, passed as the `llm_api_key` input (the `LLM_API_KEY` secret in the template).
 - **Headers:** the action sends `User-Agent: pr-reviewer/1.0`. `opencode-go` also sends `x-opencode-session: pr-<number>`, stable per PR, so the provider can group the calls.
 - **Model check:** the action calls `GET {base}/models` to confirm the model id exists. It checks the id only and never changes the endpoint.
-- **Routing table:** the action keeps a versioned map of `(provider, model) → API style` in code. Some models are not served by chat completions. Examples: `claude-*`, `minimax-m3`, `minimax-m2.7`, `qwen3.8-max` and `qwen3.7-*` on Go use `anthropic-messages`; `grok-*`, `gpt-6*` and `gpt-5.6-luna` use `openai-responses`; `gemini-*` use `google-models`. The same model can differ by provider: `qwen3.8-max` is chat-capable on Zen but `anthropic-messages` on Go. `auto` routes those pairs to the matching adapter instead of sending an incompatible chat body.
+- **Routing:** with the default `auto` style, the action discovers the wire format at call time (error-driven routing): it sends the `openai-chat` request first and, on an HTTP 400 or 404 (wrong route or body contract), moves on to `openai-responses`, `anthropic-messages` and `google-models`. The style that works is remembered for the rest of the run. The same model can need different styles on different providers; nothing is hardcoded per model id. Set `llm_api_style` explicitly to skip the probe.
 - **Go limits (operator reference):** a 5-hour window of 20%, a weekly limit of 50%, a monthly limit of 100%, and per-model caps of $15 to $60. When a Go subscription limit is hit, the provider falls back to the Zen balance. The action does not switch providers itself.
 
 ### API styles
 
 | `llm_api_style` | Wire format | Used by |
 |---|---|---|
-| `auto` (default) | Resolved per `(provider, model)` from the versioned map, then chat or the adapter below. | Everything, automatically. |
+| `auto` (default) | Error-driven probe: chat first, then the adapters below in order, learning the style from HTTP 400/404; the working style is remembered for the run. | Everything, automatically. |
 | `openai-chat` | `POST {base}/chat/completions` | `openai`, `groq`, `mistral`, `openrouter`, `ollama`, `custom`; `anthropic` and `google` through their OpenAI-compatible layers; chat-capable Zen/Go models. |
-| `openai-responses` | `POST {base}/responses` | Zen and Go: `gpt-6-luna`, `gpt-6.1-sol`, `gpt-6-astra`, `grok-4.6/4.7`; Zen free tier: `muse-spark-1.3-contributor-free`; Go-only: `gpt-5.6-luna`, `muse-spark-1.3-contributor`. Also native on the `openai` preset. |
-| `anthropic-messages` | `POST {base}/messages` | Zen/Go `claude-*`; Go `qwen3.8-*`, `qwen3.7-*`, `minimax-m3`, `minimax-m2.7`; Zen `qwen3.7-*`. Also native on the `anthropic` preset. |
-| `google-models` | `POST {base}/models/<id>:generateContent` | Zen/Go `gemini-*`. Also native on the `google` preset. |
+| `openai-responses` | `POST {base}/responses` | Zen and Go: `gpt-*`, `grok-*` and `muse-spark-*` models. Also native on the `openai` preset. |
+| `anthropic-messages` | `POST {base}/messages` | Zen/Go `claude-*`, `qwen*` and `minimax*` models. Also native on the `anthropic` preset. |
+| `google-models` | `POST {base}/models/<id>:generateContent` | Zen/Go `gemini-*` models. Also native on the `google` preset. |
 | `custom-path` | Path-only override via `llm_path` (experimental). | Custom OpenAI-compatible endpoints. |
 
-- Explicit `llm_api_style` values are functional: selecting `openai-responses`, `anthropic-messages` or `google-models` sends that protocol's body to `{base_url}` plus the style's default path (`llm_path` still overrides the path).
-- `auto` resolves non-chat pairs to their adapter; a pair that does not appear in the map uses `openai-chat`.
-- Explicit `openai-chat` on a pair that the map says is not chat-served fails fast, with a message naming the style the pair needs.
+- Explicit `llm_api_style` values are functional: selecting `openai-responses`, `anthropic-messages` or `google-models` sends that protocol's body to `{base_url}` plus the style's default path (`llm_path` still overrides the path). An explicit style is honored as-is: exactly one request, no probing.
+- `auto` is error-driven, with no model map: each attempt uses the style's full request shape, and only a 400 or 404 advances to the next style. Rate limits (429) and server errors (5xx) use the normal single retry and never advance the probe; a refusal, content filter or unparseable response is returned as-is. If every style is rejected, the slow path is skipped with a warning naming the model and the styles tried, plus the last HTTP error.
+- The `GET {base}/models` check still runs before the probe and only confirms that the model id exists; probing never changes that check.
 - A path-only `llm_path` that names a non-chat endpoint (`/messages`, `/responses`, `/models`) is still rejected without a v2 style, because the path alone cannot select a body adapter.
 - All styles share one outcome contract: the same findings schema, the same failure reasons, a 90 s timeout, one retry on 5xx/429, and `temperature`/`top_p` only when set explicitly.
 

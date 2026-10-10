@@ -11,7 +11,7 @@ vi.mock("@actions/core", async (importOriginal) => {
 import { cleanEnvForExec, main, run, sanitizeFinding, unquoteGitPath, type Deps, type Gateway, type PrInfo, type RunEnv } from "../src/main.js";
 import { readPrMeta } from "../src/diff.js";
 import type { ActionInputs, LlmApiStyle, LlmProvider } from "../src/inputs.js";
-import { callByStyle } from "../src/llm.js";
+import { callWithProbe } from "../src/llm.js";
 import { ReadonlyTokenError } from "../src/github.js";
 import type { ReviewPayload } from "../src/review.js";
 import type { Finding } from "../src/fastpath.js";
@@ -172,7 +172,7 @@ interface MockOpts {
   llmApiStyle?: LlmApiStyle;
   /** Empty string falls back to the provider preset base URL. */
   llmBaseUrl?: string;
-  /** Use the real callByStyle dispatcher for analysis.callLlm (fetch is stubbed by the test). */
+  /** Use the real callWithProbe driver for analysis.callWithProbe (fetch is stubbed by the test). */
   realLlm?: boolean;
 }
 
@@ -235,12 +235,18 @@ async function runWithMocks(o: MockOpts = {}) {
         if (o.validateModel === "reject") throw new Error("GET /models failed with HTTP 500");
         return o.validateModel !== false;
       },
-      callLlm: o.realLlm === true
-        ? callByStyle
-        : async () => {
-            rec.llmCalled += 1;
-            return { ok: true, findings: o.llm ?? [LLM_FINDING] };
-          },
+      callByStyle: async () => {
+        rec.llmCalled += 1;
+        return { ok: true, findings: o.llm ?? [LLM_FINDING] };
+      },
+      callWithProbe:
+        o.realLlm === true
+          ? async (provider, model, baseUrl, apiKey, messages, opts) =>
+              (await callWithProbe(provider, model, baseUrl, apiKey, messages, opts)).result
+          : async () => {
+              rec.llmCalled += 1;
+              return { ok: true, findings: o.llm ?? [LLM_FINDING] };
+            },
     },
   };
 
@@ -328,7 +334,8 @@ async function runPrivileged(o: PrivOpts = {}) {
       runL2: spyFail("l2"),
       ensureOllama: spyFail("ollama"),
       validateModelExists: spyFail("models"),
-      callLlm: spyFail("llm"),
+      callByStyle: spyFail("llm"),
+      callWithProbe: spyFail("llm"),
     },
   };
   const out = await run(env, deps);
@@ -442,7 +449,10 @@ describe("run() orchestration", () => {
         validateModelExists: () => {
           throw new Error("models must not run");
         },
-        callLlm: () => {
+        callByStyle: () => {
+          throw new Error("llm must not run");
+        },
+        callWithProbe: () => {
           throw new Error("llm must not run");
         },
       },
@@ -532,27 +542,30 @@ describe("run() orchestration", () => {
     expect(r.llmCalled).toBe(1);
   });
 
-  // Task 12 wiring: the slow path resolves the adapter (auto → responses for zen gpt-6-luna)
-  // and dispatches through callByStyle, so a non-chat pair works end-to-end.
-  it("slow path dispatches a non-chat pair through the responses adapter and posts its findings", async () => {
-    const fetchMock = vi.fn(async (_url: string | URL, _init?: RequestInit) =>
-      new Response(
-        JSON.stringify({
-          status: "completed",
-          output: [
-            {
-              type: "message",
-              content: [
+  // Task 19 wiring: with plain `auto` the slow path probes (error-driven, spec §9.5) —
+  // chat 404s for zen gpt-6-luna, the probe advances and the responses adapter
+  // answers, so a non-chat pair works end-to-end without any map.
+  it("slow path probes a non-chat pair through the responses adapter and posts its findings", async () => {
+    const fetchMock = vi.fn(async (url: string | URL, _init?: RequestInit) =>
+      String(url).endsWith("/chat/completions")
+        ? new Response("not found", { status: 404 })
+        : new Response(
+            JSON.stringify({
+              status: "completed",
+              output: [
                 {
-                  type: "output_text",
-                  text: JSON.stringify({ findings: [{ ...LLM_FINDING, suggestion: "sug" }] }),
+                  type: "message",
+                  content: [
+                    {
+                      type: "output_text",
+                      text: JSON.stringify({ findings: [{ ...LLM_FINDING, suggestion: "sug" }] }),
+                    },
+                  ],
                 },
               ],
-            },
-          ],
-        }),
-        { status: 200, headers: { "content-type": "application/json" } },
-      ),
+            }),
+            { status: 200, headers: { "content-type": "application/json" } },
+          ),
     );
     vi.stubGlobal("fetch", fetchMock);
     const r = await runWithMocks({ realLlm: true, llmProvider: "opencode-zen", llmModel: "gpt-6-luna", llmBaseUrl: "" });
@@ -804,7 +817,8 @@ describe("findings from binaries, renames and skip paths", () => {
         runL2: fail("l2"),
         ensureOllama: fail("ollama"),
         validateModelExists: fail("models"),
-        callLlm: fail("llm"),
+        callByStyle: fail("llm"),
+        callWithProbe: fail("llm"),
       },
     };
     const out = await run(env, deps);

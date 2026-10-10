@@ -5,17 +5,11 @@ import {
   UnsupportedModelError,
   validateModelExists,
   authHeaderFor,
-  NON_CHAT,
 } from "../src/providers.js";
 
 vi.mock("@actions/core", () => ({ warning: vi.fn() }));
 
 const base = { llmBaseUrl: "", llmApiStyle: "auto", llmPath: "", llmApiKey: "k", prNumber: 1 } as const;
-
-const ZEN_CHAT = ["deepseek-v4.1-flash", "deepseek-v4-pro", "deepseek-v4-flash", "glm-5.3-flash", "glm-5.3", "glm-5.2", "kimi-k3", "kimi-k2.7-code", "kimi-k2.6", "minimax-m3", "minimax-m2.7", "mistral-large-4", "qwen3.8-max", "big-pickle", "space-bunny-free", "mimo-v2.6-flash-free"];
-const ZEN_NON_CHAT = ["gpt-6-luna", "gpt-6.1-sol", "gpt-6-astra", "grok-4.7", "grok-4.6", "claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5-5", "qwen3.7-max", "qwen3.7-plus", "gemini-3.8-flash", "gemini-3.5-flash-lite", "muse-spark-1.3-contributor-free"];
-const GO_CHAT = ["glm-5.3-flash", "glm-5.3", "glm-5.2", "kimi-k3", "kimi-k2.7-code", "kimi-k2.6", "deepseek-v4-flash", "deepseek-v4-pro", "deepseek-v4.1-flash", "deepseek-v4-flash-vision-exp", "mimo-v2.6-flash", "mimo-v2.5", "mimo-v2.6-pro", "hy4-preview", "hy3", "longcat-2.0", "space-bunny"];
-const GO_NON_CHAT = ["grok-4.7", "grok-4.6", "gpt-6-luna", "gpt-5.6-luna", "gpt-6.1-sol", "gpt-6-astra", "muse-spark-1.3-contributor", "claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5-5", "minimax-m3", "minimax-m2.7", "qwen3.8-max", "qwen3.8-flash", "qwen3.7-max", "qwen3.7-plus", "gemini-3.8-flash", "gemini-3.5-flash-lite"];
 
 beforeEach(() => {
   vi.mocked(core.warning).mockClear();
@@ -34,11 +28,20 @@ describe("resolveEndpoint", () => {
     expect(r.path).toBe("/chat/completions");
   });
 
-  it("zen qwen3.8-max resolves chat, go qwen3.8-max resolves anthropic-messages", () => {
-    expect(resolveEndpoint({ ...base, llmProvider: "opencode-zen", llmModel: "qwen3.8-max" }).path).toBe("/chat/completions");
-    const go = resolveEndpoint({ ...base, llmProvider: "opencode-go", llmModel: "qwen3.8-max" });
-    expect(go.apiStyle).toBe("anthropic-messages");
-    expect(go.path).toBe("/messages");
+  // Spec §9.5: auto consults no map — it resolves the chat default, and the
+  // probe (callWithProbe) discovers the working style from 400/404 errors.
+  it("auto resolves openai-chat for every provider (the probe decides the style)", () => {
+    for (const [provider, model] of [
+      ["opencode-zen", "qwen3.8-max"],
+      ["opencode-go", "qwen3.8-max"],
+      ["opencode-zen", "gpt-6-luna"],
+      ["opencode-zen", "claude-sonnet-5-5"],
+      ["opencode-zen", "gemini-3.8-flash"],
+    ] as const) {
+      const r = resolveEndpoint({ ...base, llmProvider: provider, llmModel: model });
+      expect(r.apiStyle).toBe("openai-chat");
+      expect(r.path).toBe("/chat/completions");
+    }
   });
 
   it("zen sends no session header, go does", () => {
@@ -47,33 +50,6 @@ describe("resolveEndpoint", () => {
     expect(z.headers["x-opencode-session"]).toBeUndefined();
     const g = resolveEndpoint({ ...base, llmProvider: "opencode-go", llmModel: "glm-5.3-flash" });
     expect(g.headers["x-opencode-session"]).toBe("pr-1");
-  });
-
-  it("matrix: documented chat models resolve chat, non-chat models resolve their adapter", () => {
-    for (const m of ZEN_CHAT) {
-      expect(resolveEndpoint({ ...base, llmProvider: "opencode-zen", llmModel: m }).path).toBe("/chat/completions");
-    }
-    expect(resolveEndpoint({ ...base, llmProvider: "opencode-zen", llmModel: "gpt-6-luna" }).apiStyle).toBe("openai-responses");
-    expect(resolveEndpoint({ ...base, llmProvider: "opencode-zen", llmModel: "claude-sonnet-5-5" }).apiStyle).toBe("anthropic-messages");
-  });
-
-  it("zen non-chat models resolve to their v2 adapter (no fail-fast)", () => {
-    for (const m of ZEN_NON_CHAT) {
-      const r = resolveEndpoint({ ...base, llmProvider: "opencode-zen", llmModel: m });
-      expect(r.apiStyle).toBe(NON_CHAT.get(`opencode-zen:${m}`));
-      expect(r.path).not.toBe("/chat/completions");
-    }
-  });
-
-  it("go chat models resolve chat, go non-chat models resolve their adapter", () => {
-    for (const m of GO_CHAT) {
-      expect(resolveEndpoint({ ...base, llmProvider: "opencode-go", llmModel: m }).path).toBe("/chat/completions");
-    }
-    for (const m of GO_NON_CHAT) {
-      const r = resolveEndpoint({ ...base, llmProvider: "opencode-go", llmModel: m });
-      expect(r.apiStyle).toBe(NON_CHAT.get(`opencode-go:${m}`));
-      expect(r.path).not.toBe("/chat/completions");
-    }
   });
 
   it("llm_path to non-chat without v2 style throws path-only error", () => {
@@ -112,34 +88,6 @@ describe("resolveEndpoint", () => {
     expect(g.headers["x-opencode-session"]).toBe("pr-1");
   });
 
-  it("NON_CHAT contains only non-chat pairs", () => {
-    expect(NON_CHAT.get("opencode-go:qwen3.8-max")).toBe("anthropic-messages");
-    expect(NON_CHAT.get("opencode-zen:gpt-6-luna")).toBe("openai-responses");
-    expect(NON_CHAT.get("opencode-zen:gemini-3.8-flash")).toBe("google-models");
-    // Spec ids: Zen Muse-Spark free variant (§9.1).
-    expect(NON_CHAT.get("opencode-zen:muse-spark-1.3-contributor-free")).toBe("openai-responses");
-    expect(NON_CHAT.has("opencode-zen:qwen3.8-max")).toBe(false);
-  });
-
-  // Spec §9.2: the Claude Fable family is anthropic-messages on Zen/Go (prefix rule, not an exact id).
-  it("claude-fable-* resolves anthropic-messages on zen and go, chat elsewhere", () => {
-    for (const provider of ["opencode-zen", "opencode-go"] as const) {
-      const r = resolveEndpoint({ ...base, llmProvider: provider, llmModel: "claude-fable-5-5" });
-      expect(r.apiStyle).toBe("anthropic-messages");
-      expect(r.path).toBe("/messages");
-      expect(() =>
-        resolveEndpoint({ ...base, llmProvider: provider, llmModel: "claude-fable-5-5", llmApiStyle: "openai-chat" }),
-      ).toThrow(UnsupportedModelError);
-    }
-    expect(resolveEndpoint({ ...base, llmProvider: "openai", llmModel: "claude-fable-5-5" }).apiStyle).toBe("openai-chat");
-  });
-
-  // F10: no chat-capable pair may be in NON_CHAT.
-  it("NON_CHAT has no key for any chat-supported zen or go model", () => {
-    for (const m of ZEN_CHAT) expect(NON_CHAT.has(`opencode-zen:${m}`)).toBe(false);
-    for (const m of GO_CHAT) expect(NON_CHAT.has(`opencode-go:${m}`)).toBe(false);
-  });
-
   // F9: preset table, all nine presets.
   it.each([
     ["openai", "https://api.openai.com/v1"],
@@ -162,10 +110,15 @@ describe("resolveEndpoint", () => {
     expect(resolveEndpoint({ ...base, llmProvider: "custom", llmBaseUrl: "https://c.example/v1/", llmModel: "m" }).baseUrl).toBe("https://c.example/v1");
   });
 
-  // F1 / F12: explicit openai-chat on a non-chat pair fails fast.
-  it("explicit openai-chat on a NON_CHAT pair throws UnsupportedModelError", () => {
-    expect(() => resolveEndpoint({ ...base, llmProvider: "opencode-zen", llmModel: "gpt-6-luna", llmApiStyle: "openai-chat" })).toThrow(UnsupportedModelError);
-    expect(() => resolveEndpoint({ ...base, llmProvider: "opencode-go", llmModel: "qwen3.8-max", llmApiStyle: "openai-chat" })).toThrow(UnsupportedModelError);
+  // Spec §9.5: the "explicit openai-chat on a non-chat pair" fail-fast is gone —
+  // an explicit openai-chat is honored on every pair, chat body sent as-is.
+  it("explicit openai-chat is honored on every pair (no map, no fail-fast)", () => {
+    expect(
+      resolveEndpoint({ ...base, llmProvider: "opencode-zen", llmModel: "gpt-6-luna", llmApiStyle: "openai-chat" }).path,
+    ).toBe("/chat/completions");
+    expect(
+      resolveEndpoint({ ...base, llmProvider: "opencode-go", llmModel: "qwen3.8-max", llmApiStyle: "openai-chat" }).path,
+    ).toBe("/chat/completions");
   });
 
   it("explicit openai-chat on a chat pair resolves", () => {

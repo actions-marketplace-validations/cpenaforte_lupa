@@ -25172,6 +25172,138 @@ function linkedIssueNumber(prBody) {
   return m ? Number(m[1]) : null;
 }
 
+// lib/src/providers.js
+var UnsupportedModelError = class extends Error {
+};
+var PRESET_BASE_URLS = {
+  openai: "https://api.openai.com/v1",
+  anthropic: "https://api.anthropic.com/v1",
+  google: "https://generativelanguage.googleapis.com/v1beta/openai",
+  groq: "https://api.groq.com/openai/v1",
+  mistral: "https://api.mistral.ai/v1",
+  openrouter: "https://openrouter.ai/api/v1",
+  ollama: "http://localhost:11434/v1",
+  "opencode-zen": "https://opencode.ai/zen/v1",
+  "opencode-go": "https://opencode.ai/zen/go/v1"
+};
+var CHAT_PATH = "/chat/completions";
+var USER_AGENT = "pr-reviewer/1.0";
+var VALIDATE_TIMEOUT_MS = 15e3;
+var PATH_ONLY_SEGMENTS = /* @__PURE__ */ new Set(["messages", "responses", "models"]);
+function isPathOnlyNonChat(path) {
+  const pathname = path.replace(/\/+$/, "");
+  const last = pathname.slice(pathname.lastIndexOf("/") + 1);
+  return PATH_ONLY_SEGMENTS.has(last);
+}
+function defaultPathFor(apiStyle, model) {
+  switch (apiStyle) {
+    case "openai-responses":
+      return "/responses";
+    case "anthropic-messages":
+      return "/messages";
+    case "google-models":
+      return `/models/${model}:generateContent`;
+    case "openai-chat":
+      return CHAT_PATH;
+  }
+}
+function resolveEndpoint(o) {
+  const rawBase = o.llmBaseUrl || PRESET_BASE_URLS[o.llmProvider] || "";
+  if (rawBase === "") {
+    throw new Error(`llm_provider "${o.llmProvider}" requires llm_base_url`);
+  }
+  const baseUrl2 = rawBase.replace(/\/+$/, "");
+  if (o.llmApiStyle === "custom-path" && o.llmPath === "") {
+    throw new Error(`llm_api_style "custom-path" requires llm_path`);
+  }
+  let apiStyle;
+  if (o.llmApiStyle === "openai-responses" || o.llmApiStyle === "anthropic-messages" || o.llmApiStyle === "google-models") {
+    apiStyle = o.llmApiStyle;
+  } else {
+    apiStyle = "openai-chat";
+  }
+  const effectiveBase = apiStyle === "google-models" && baseUrl2.endsWith("/openai") ? baseUrl2.slice(0, -"/openai".length) : baseUrl2;
+  if (effectiveBase !== baseUrl2 && o.llmBaseUrl !== "") {
+    warning(`llm_base_url "${baseUrl2}" rewritten to "${effectiveBase}": google-models needs the API root, not the OpenAI-compat "/openai" suffix`);
+  }
+  const rawPath = o.llmPath !== "" ? o.llmPath : defaultPathFor(apiStyle, o.llmModel);
+  const normalized = rawPath.startsWith("/") ? rawPath : `/${rawPath}`;
+  const path = normalized.split(/[?#]/)[0];
+  const strippedParts = [];
+  if (normalized.includes("?"))
+    strippedParts.push("query string");
+  if (normalized.includes("#"))
+    strippedParts.push("fragment");
+  if (strippedParts.length > 0) {
+    warning(`llm_path ${strippedParts.join(" and ")} ignored; only the path is used`);
+  }
+  if (apiStyle === "openai-chat" && isPathOnlyNonChat(path)) {
+    const rawClean = rawPath.split(/[?#]/)[0];
+    throw new UnsupportedModelError(`llm_path "${rawClean}" normalizes to "${path}", which is path-only: it names a non-chat endpoint. llm_path only overrides the path; a non-chat body adapter requires a v2 llm_api_style (openai-responses, anthropic-messages or google-models).`);
+  }
+  const headers = {
+    Authorization: `Bearer ${o.llmApiKey}`,
+    "User-Agent": USER_AGENT
+  };
+  if (o.llmProvider === "opencode-go" && o.prNumber !== null) {
+    headers["x-opencode-session"] = `pr-${o.prNumber}`;
+  }
+  return { baseUrl: effectiveBase, path, headers, apiStyle };
+}
+function buildEndpointForStyle(provider, model, baseUrl2, apiKey, style, prNumber = null) {
+  return resolveEndpoint({
+    llmProvider: provider,
+    llmBaseUrl: baseUrl2,
+    llmApiStyle: style,
+    llmPath: "",
+    llmModel: model,
+    llmApiKey: apiKey,
+    prNumber
+  });
+}
+function authHeaderFor(provider, apiStyle) {
+  const googleNative = apiStyle === "google-models" && (provider === "google" || provider === "custom");
+  return { header: googleNative ? "x-goog-api-key" : "Authorization" };
+}
+async function validateModelExists(baseUrl2, model, apiKey, auth2 = {}) {
+  const url = `${baseUrl2.replace(/\/+$/, "")}/models`;
+  const headers = { "User-Agent": USER_AGENT };
+  if (auth2.header === "x-goog-api-key") {
+    headers["x-goog-api-key"] = apiKey;
+  } else {
+    headers.Authorization = `Bearer ${apiKey}`;
+  }
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), VALIDATE_TIMEOUT_MS);
+  try {
+    const res = await fetch(url, {
+      headers,
+      signal: controller.signal
+    });
+    if (res.status === 404) {
+      await res.body?.cancel().catch(() => void 0);
+      return false;
+    }
+    if (!res.ok) {
+      await res.body?.cancel().catch(() => void 0);
+      throw new Error(`GET ${url} failed with HTTP ${res.status}`);
+    }
+    let body;
+    try {
+      body = await res.json();
+    } catch {
+      throw new Error(`GET ${url} returned invalid JSON`);
+    }
+    const data = body?.data;
+    if (!Array.isArray(data)) {
+      throw new Error(`GET ${url} returned no "data" array`);
+    }
+    return data.some((m) => m?.id === model);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 // lib/src/adapters/google.js
 function firstCandidate(json) {
   const candidates = json?.candidates;
@@ -25763,6 +25895,54 @@ async function callByStyle(ep, messages, o) {
       throw new Error("unsupported apiStyle: " + String(ep.apiStyle));
   }
 }
+var PROBE_ORDER = ["openai-chat", "openai-responses", "anthropic-messages", "google-models"];
+var PROBE_MEMO = /* @__PURE__ */ new Map();
+function isProbeTrigger(result) {
+  return result.ok === false && result.reason === "http-error" && /^HTTP (400|404)(?!\d)/.test(result.detail);
+}
+async function callWithProbe(provider, model, baseUrl2, key, messages, o, explicitStyle) {
+  if (key === "") {
+    return { result: { ok: false, reason: "no-key", detail: "no API key configured" } };
+  }
+  const callOpts = {
+    model,
+    apiKey: key,
+    temperature: o.temperature,
+    topP: o.topP,
+    maxTokens: o.maxTokens,
+    timeoutSeconds: o.timeoutSeconds,
+    provider
+  };
+  const run2 = async (style) => {
+    const ep = buildEndpointForStyle(provider, model, baseUrl2, key, style, o.prNumber ?? null);
+    return { result: await callByStyle(ep, messages, callOpts), via: style };
+  };
+  if (explicitStyle !== void 0 && explicitStyle !== "auto") {
+    return run2(explicitStyle);
+  }
+  const memoKey = `${provider}:${model}`;
+  const memoized = PROBE_MEMO.get(memoKey);
+  const order = memoized !== void 0 ? [memoized] : PROBE_ORDER;
+  const attempted = [];
+  let last;
+  for (const style of order) {
+    attempted.push(style);
+    const out = await run2(style);
+    if (out.result.ok) {
+      PROBE_MEMO.set(memoKey, style);
+      return out;
+    }
+    last = out.result;
+    if (!isProbeTrigger(last))
+      return out;
+  }
+  warning(`model "${model}": no API style accepted the request; tried ${attempted.join(" \u2192 ")}. Set llm_api_style explicitly to skip the probe.`);
+  const detail = last !== void 0 && !last.ok ? last.detail : "no API style accepted the request";
+  return {
+    result: { ok: false, reason: "http-error", detail: redact(detail, key) },
+    via: attempted.at(-1)
+  };
+}
 async function ensureOllama(baseUrl2, model, o = {}) {
   const key = o.apiKey ?? "";
   const timeoutSeconds = o.timeoutSeconds ?? PULL_TIMEOUT_DEFAULT_S;
@@ -25812,181 +25992,6 @@ async function ensureOllama(baseUrl2, model, o = {}) {
   }
   if (body?.error) {
     throw new Error(scrub(`ollama pull "${model}" failed: ${String(body.error)}`));
-  }
-}
-
-// lib/src/providers.js
-var UnsupportedModelError = class extends Error {
-};
-var PRESET_BASE_URLS = {
-  openai: "https://api.openai.com/v1",
-  anthropic: "https://api.anthropic.com/v1",
-  google: "https://generativelanguage.googleapis.com/v1beta/openai",
-  groq: "https://api.groq.com/openai/v1",
-  mistral: "https://api.mistral.ai/v1",
-  openrouter: "https://openrouter.ai/api/v1",
-  ollama: "http://localhost:11434/v1",
-  "opencode-zen": "https://opencode.ai/zen/v1",
-  "opencode-go": "https://opencode.ai/zen/go/v1"
-};
-var CHAT_PATH = "/chat/completions";
-var USER_AGENT = "pr-reviewer/1.0";
-var VALIDATE_TIMEOUT_MS = 15e3;
-var NON_CHAT = /* @__PURE__ */ new Map([
-  // opencode-go
-  ["opencode-go:qwen3.8-max", "anthropic-messages"],
-  ["opencode-go:qwen3.8-flash", "anthropic-messages"],
-  ["opencode-go:qwen3.7-max", "anthropic-messages"],
-  ["opencode-go:qwen3.7-plus", "anthropic-messages"],
-  ["opencode-go:minimax-m3", "anthropic-messages"],
-  ["opencode-go:minimax-m2.7", "anthropic-messages"],
-  ["opencode-go:claude-haiku-5-5", "anthropic-messages"],
-  ["opencode-go:claude-sonnet-5-5", "anthropic-messages"],
-  ["opencode-go:claude-opus-5-5", "anthropic-messages"],
-  ["opencode-go:grok-4.7", "openai-responses"],
-  ["opencode-go:grok-4.6", "openai-responses"],
-  ["opencode-go:gpt-6-luna", "openai-responses"],
-  ["opencode-go:gpt-5.6-luna", "openai-responses"],
-  ["opencode-go:gpt-6.1-sol", "openai-responses"],
-  ["opencode-go:gpt-6-astra", "openai-responses"],
-  ["opencode-go:muse-spark-1.3-contributor", "openai-responses"],
-  ["opencode-go:gemini-3.8-flash", "google-models"],
-  ["opencode-go:gemini-3.5-flash-lite", "google-models"],
-  // opencode-zen
-  ["opencode-zen:gpt-6-luna", "openai-responses"],
-  ["opencode-zen:gpt-6.1-sol", "openai-responses"],
-  ["opencode-zen:gpt-6-astra", "openai-responses"],
-  ["opencode-zen:grok-4.7", "openai-responses"],
-  ["opencode-zen:grok-4.6", "openai-responses"],
-  // Spec §9.1: Muse-Spark ships a free variant on Zen; it is a responses model too.
-  ["opencode-zen:muse-spark-1.3-contributor-free", "openai-responses"],
-  ["opencode-zen:claude-haiku-5-5", "anthropic-messages"],
-  ["opencode-zen:claude-sonnet-5-5", "anthropic-messages"],
-  ["opencode-zen:claude-opus-5-5", "anthropic-messages"],
-  ["opencode-zen:qwen3.7-max", "anthropic-messages"],
-  ["opencode-zen:qwen3.7-plus", "anthropic-messages"],
-  ["opencode-zen:gemini-3.8-flash", "google-models"],
-  ["opencode-zen:gemini-3.5-flash-lite", "google-models"]
-]);
-var CLAUDE_FABLE_PREFIX = /^claude-fable-/;
-function nonChatFor(provider, model) {
-  const exact = NON_CHAT.get(`${provider}:${model}`);
-  if (exact !== void 0)
-    return exact;
-  if ((provider === "opencode-zen" || provider === "opencode-go") && CLAUDE_FABLE_PREFIX.test(model)) {
-    return "anthropic-messages";
-  }
-  return void 0;
-}
-var NON_CHAT_PATH_SEGMENTS = /* @__PURE__ */ new Set(["messages", "responses", "models"]);
-function isPathOnlyNonChat(path) {
-  const pathname = path.replace(/\/+$/, "");
-  const last = pathname.slice(pathname.lastIndexOf("/") + 1);
-  return NON_CHAT_PATH_SEGMENTS.has(last);
-}
-function defaultPathFor(apiStyle, model) {
-  switch (apiStyle) {
-    case "openai-responses":
-      return "/responses";
-    case "anthropic-messages":
-      return "/messages";
-    case "google-models":
-      return `/models/${model}:generateContent`;
-    case "openai-chat":
-      return CHAT_PATH;
-  }
-}
-function resolveEndpoint(o) {
-  const rawBase = o.llmBaseUrl || PRESET_BASE_URLS[o.llmProvider] || "";
-  if (rawBase === "") {
-    throw new Error(`llm_provider "${o.llmProvider}" requires llm_base_url`);
-  }
-  const baseUrl2 = rawBase.replace(/\/+$/, "");
-  if (o.llmApiStyle === "custom-path" && o.llmPath === "") {
-    throw new Error(`llm_api_style "custom-path" requires llm_path`);
-  }
-  let apiStyle;
-  if (o.llmApiStyle === "openai-responses" || o.llmApiStyle === "anthropic-messages" || o.llmApiStyle === "google-models") {
-    apiStyle = o.llmApiStyle;
-  } else if (o.llmApiStyle === "auto") {
-    apiStyle = nonChatFor(o.llmProvider, o.llmModel) ?? "openai-chat";
-  } else {
-    apiStyle = "openai-chat";
-    if (o.llmApiStyle === "openai-chat") {
-      const nonChat = nonChatFor(o.llmProvider, o.llmModel);
-      if (nonChat !== void 0) {
-        throw new UnsupportedModelError(`Model "${o.llmModel}" on "${o.llmProvider}" is served by "${nonChat}", which openai-chat cannot reach. Set llm_api_style to auto (resolves it automatically) or "${nonChat}". Supported API styles: auto, openai-chat, openai-responses, anthropic-messages, google-models, custom-path.`);
-      }
-    }
-  }
-  const effectiveBase = apiStyle === "google-models" && baseUrl2.endsWith("/openai") ? baseUrl2.slice(0, -"/openai".length) : baseUrl2;
-  if (effectiveBase !== baseUrl2 && o.llmBaseUrl !== "") {
-    warning(`llm_base_url "${baseUrl2}" rewritten to "${effectiveBase}": google-models needs the API root, not the OpenAI-compat "/openai" suffix`);
-  }
-  const rawPath = o.llmPath !== "" ? o.llmPath : defaultPathFor(apiStyle, o.llmModel);
-  const normalized = rawPath.startsWith("/") ? rawPath : `/${rawPath}`;
-  const path = normalized.split(/[?#]/)[0];
-  const strippedParts = [];
-  if (normalized.includes("?"))
-    strippedParts.push("query string");
-  if (normalized.includes("#"))
-    strippedParts.push("fragment");
-  if (strippedParts.length > 0) {
-    warning(`llm_path ${strippedParts.join(" and ")} ignored; only the path is used`);
-  }
-  if (apiStyle === "openai-chat" && isPathOnlyNonChat(path)) {
-    const rawClean = rawPath.split(/[?#]/)[0];
-    throw new UnsupportedModelError(`llm_path "${rawClean}" normalizes to "${path}", which is path-only: it names a non-chat endpoint. llm_path only overrides the path; a non-chat body adapter requires a v2 llm_api_style (openai-responses, anthropic-messages or google-models).`);
-  }
-  const headers = {
-    Authorization: `Bearer ${o.llmApiKey}`,
-    "User-Agent": USER_AGENT
-  };
-  if (o.llmProvider === "opencode-go" && o.prNumber !== null) {
-    headers["x-opencode-session"] = `pr-${o.prNumber}`;
-  }
-  return { baseUrl: effectiveBase, path, headers, apiStyle };
-}
-function authHeaderFor(provider, apiStyle) {
-  const googleNative = apiStyle === "google-models" && (provider === "google" || provider === "custom");
-  return { header: googleNative ? "x-goog-api-key" : "Authorization" };
-}
-async function validateModelExists(baseUrl2, model, apiKey, auth2 = {}) {
-  const url = `${baseUrl2.replace(/\/+$/, "")}/models`;
-  const headers = { "User-Agent": USER_AGENT };
-  if (auth2.header === "x-goog-api-key") {
-    headers["x-goog-api-key"] = apiKey;
-  } else {
-    headers.Authorization = `Bearer ${apiKey}`;
-  }
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), VALIDATE_TIMEOUT_MS);
-  try {
-    const res = await fetch(url, {
-      headers,
-      signal: controller.signal
-    });
-    if (res.status === 404) {
-      await res.body?.cancel().catch(() => void 0);
-      return false;
-    }
-    if (!res.ok) {
-      await res.body?.cancel().catch(() => void 0);
-      throw new Error(`GET ${url} failed with HTTP ${res.status}`);
-    }
-    let body;
-    try {
-      body = await res.json();
-    } catch {
-      throw new Error(`GET ${url} returned invalid JSON`);
-    }
-    const data = body?.data;
-    if (!Array.isArray(data)) {
-      throw new Error(`GET ${url} returned no "data" array`);
-    }
-    return data.some((m) => m?.id === model);
-  } finally {
-    clearTimeout(timer);
   }
 }
 
@@ -26596,15 +26601,17 @@ async function slowPath(env, deps, pr, fast, promptText, issueBody, skipped) {
     return void 0;
   }
   const messages = buildMessages(fast, promptText, issueBody, skipped);
-  const res = await deps.analysis.callLlm(ep, messages, {
+  const llmOpts = {
     model: i.llmModel,
     apiKey: i.llmApiKey,
     temperature: i.llmTemperature,
     topP: i.llmTopP,
     maxTokens: i.llmMaxTokens,
     timeoutSeconds: i.timeoutSeconds,
-    provider: i.llmProvider
-  });
+    provider: i.llmProvider,
+    prNumber: pr
+  };
+  const res = i.llmApiStyle === "auto" && i.llmPath === "" ? await deps.analysis.callWithProbe(i.llmProvider, i.llmModel, ep.baseUrl, i.llmApiKey, messages, llmOpts) : await deps.analysis.callByStyle(ep, messages, llmOpts);
   if (!res.ok) {
     warning(`slow path failed (${res.reason}): ${res.detail}`);
     return void 0;
@@ -26850,10 +26857,16 @@ function realAnalysis() {
     runL2: (dir) => runL2(dir),
     ensureOllama,
     validateModelExists,
-    // The slow path invokes this seam; it dispatches by the endpoint's resolved
-    // API style (openai-chat keeps callLlm; v2 styles use their adapter), so
-    // every provider/model pair works end-to-end.
-    callLlm: callByStyle
+    // Explicit styles (and llm_path overrides) dispatch straight to the resolved
+    // endpoint's adapter; plain `auto` goes through the error-driven probe
+    // (spec §9.5), which logs the style that won.
+    callByStyle,
+    callWithProbe: async (provider, model, baseUrl2, apiKey, messages, o) => {
+      const { result, via } = await callWithProbe(provider, model, baseUrl2, apiKey, messages, o);
+      if (via !== void 0)
+        info(`llm api style: ${via}`);
+      return result;
+    }
   };
 }
 function readRunEnv() {

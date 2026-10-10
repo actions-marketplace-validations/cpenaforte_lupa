@@ -1,0 +1,173 @@
+import { describe, it, expect, vi, afterEach } from "vitest";
+import * as core from "@actions/core";
+import { callWithProbe, PROBE_ORDER } from "../src/llm.js";
+
+vi.mock("@actions/core", () => ({ warning: vi.fn(), info: vi.fn() }));
+
+// ---------- helpers ----------
+
+const FINDING = { severity: "warning", file: "src/a.ts", line: 2, rule: "logic", message: "m", suggestion: "sug" };
+const FINDINGS_JSON = JSON.stringify({ findings: [FINDING] });
+
+/** One protocol-shaped success envelope per style, all carrying the same findings JSON. */
+const CHAT_OK = { choices: [{ finish_reason: "stop", message: { content: FINDINGS_JSON } }] };
+const RESPONSES_OK = {
+  status: "completed",
+  output: [{ type: "message", content: [{ type: "output_text", text: FINDINGS_JSON }] }],
+};
+const MESSAGES_OK = { stop_reason: "end_turn", content: [{ type: "text", text: FINDINGS_JSON }] };
+const GOOGLE_OK = { candidates: [{ content: { parts: [{ text: FINDINGS_JSON }] }, finishReason: "STOP" }] };
+
+const msgs = { system: "s", user: "u" };
+const o = { maxTokens: 50, timeoutSeconds: 5 };
+const ZEN = "https://opencode.ai/zen/v1";
+
+/** URL-aware fetch stub: `misses` leading 404s, then `okBody` with 200. */
+function stubProbe(misses: number, okBody: unknown): void {
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async () => {
+      const n = vi.mocked(fetch).mock.calls.length;
+      return n <= misses
+        ? new Response(JSON.stringify({ error: { message: "not found" } }), { status: 404 })
+        : new Response(JSON.stringify(okBody), { status: 200 });
+    }),
+  );
+}
+
+function urls(): string[] {
+  return vi.mocked(fetch).mock.calls.map((c) => String(c[0]));
+}
+
+function warnings(): string[] {
+  return vi.mocked(core.warning).mock.calls.map((c) => String(c[0]));
+}
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+  vi.restoreAllMocks();
+});
+
+// ---------- spec §9.5: error-driven routing ----------
+
+describe("callWithProbe: auto discovers the style from 400/404 errors", () => {
+  it("auto probes chat→responses and succeeds on second style", async () => {
+    stubProbe(1, RESPONSES_OK);
+    const r = await callWithProbe("opencode-zen", "alpha-model", ZEN, "k", msgs, o);
+    expect(r.result).toEqual({ ok: true, findings: [FINDING] });
+    expect(r.via).toBe("openai-responses");
+    expect(urls()).toEqual([`${ZEN}/chat/completions`, `${ZEN}/responses`]);
+  });
+
+  // Spec §9.5 test list: 404→success sequence for every winning style.
+  it.each([
+    ["openai-chat", 0, "/chat/completions", CHAT_OK],
+    ["openai-responses", 1, "/responses", RESPONSES_OK],
+    ["anthropic-messages", 2, "/messages", MESSAGES_OK],
+    ["google-models", 3, ":generateContent", GOOGLE_OK],
+  ] as const)("auto walks %i style miss(es) and succeeds on %s", async (style, misses, pathSuffix, okBody) => {
+    stubProbe(misses, okBody);
+    const model = `probe-${style}`;
+    const r = await callWithProbe("opencode-zen", model, ZEN, "k", msgs, o);
+    expect(r.result).toEqual({ ok: true, findings: [FINDING] });
+    expect(r.via).toBe(style);
+    const called = urls();
+    expect(called).toHaveLength(misses + 1);
+    expect(called.at(-1)).toContain(pathSuffix);
+  });
+
+  it("auto walks all four styles and fails with http-error + warning", async () => {
+    stubProbe(4, {});
+    const r = await callWithProbe("opencode-zen", "epsilon-model", ZEN, "k", msgs, o);
+    expect(r.result.ok).toBe(false);
+    expect(r.result.ok === false && r.result.reason).toBe("http-error");
+    expect(r.result.ok === false && r.result.detail).toContain("HTTP 404");
+    expect(vi.mocked(fetch)).toHaveBeenCalledTimes(PROBE_ORDER.length);
+    expect(warnings()).toHaveLength(1);
+    const w = warnings()[0];
+    expect(w).toContain("epsilon-model");
+    for (const s of PROBE_ORDER) expect(w).toContain(s);
+  });
+
+  it("a non-400/404 failure stops the probe at the first style", async () => {
+    // A refusal is not a style signal: no probe advance, no probe warning.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response(JSON.stringify({ choices: [{ finish_reason: "stop", message: { content: "", refusal: "no" } }] }), { status: 200 })),
+    );
+    const r = await callWithProbe("opencode-zen", "zeta-refusal", ZEN, "k", msgs, o);
+    expect(r.result).toEqual({ ok: false, reason: "content-filter", detail: "model refused the request" });
+    expect(r.via).toBe("openai-chat");
+    expect(vi.mocked(fetch)).toHaveBeenCalledTimes(1);
+    expect(warnings()).toHaveLength(0);
+  });
+
+  it("429/5xx does not advance the probe (adapter retry only)", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response("rate limited", { status: 429, headers: { "retry-after": "0" } })),
+    );
+    const r = await callWithProbe("opencode-zen", "eta-model", ZEN, "k", msgs, o);
+    expect(r.result.ok).toBe(false);
+    expect(r.result.ok === false && r.result.detail).toContain("HTTP 429");
+    expect(r.via).toBe("openai-chat");
+    // One adapter retry on the SAME style: two fetches, both to chat.
+    expect(vi.mocked(fetch)).toHaveBeenCalledTimes(2);
+    for (const u of urls()) expect(u).toBe(`${ZEN}/chat/completions`);
+    expect(warnings()).toHaveLength(0);
+  });
+
+  it("memo fixes style for subsequent calls in-process", async () => {
+    stubProbe(1, RESPONSES_OK);
+    const first = await callWithProbe("opencode-zen", "theta-model", ZEN, "k", msgs, o);
+    expect(first.via).toBe("openai-responses");
+    expect(urls()).toHaveLength(2);
+    const second = await callWithProbe("opencode-zen", "theta-model", ZEN, "k", msgs, o);
+    expect(second.result).toEqual({ ok: true, findings: [FINDING] });
+    expect(second.via).toBe("openai-responses");
+    // The memoized style is tried directly: one more fetch, straight to /responses.
+    expect(urls()).toHaveLength(3);
+    expect(urls().at(-1)).toBe(`${ZEN}/responses`);
+  });
+
+  it("redaction holds across every probe attempt", async () => {
+    const key = "sk-SECRET-KEY-123";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response(JSON.stringify({ error: { message: `no route for ${key}` } }), { status: 404 })),
+    );
+    const r = await callWithProbe("opencode-zen", "iota-model", ZEN, key, msgs, o);
+    expect(r.result.ok === false && r.result.reason).toBe("http-error");
+    const detail = r.result.ok === false ? r.result.detail : "";
+    expect(detail).toContain("[REDACTED]");
+    expect(detail).not.toContain(key);
+    for (const w of warnings()) expect(w).not.toContain(key);
+  });
+
+  it("explicit style never probes (single fetch even on 404)", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response(JSON.stringify({ error: { message: "not found" } }), { status: 404 })),
+    );
+    const r = await callWithProbe("opencode-zen", "kappa-model", ZEN, "k", msgs, o, "openai-responses");
+    expect(r.result.ok === false && r.result.reason).toBe("http-error");
+    expect(r.result.ok === false && r.result.detail).toContain("HTTP 404");
+    expect(r.via).toBe("openai-responses");
+    expect(vi.mocked(fetch)).toHaveBeenCalledTimes(1);
+    expect(urls()).toEqual([`${ZEN}/responses`]);
+  });
+
+  it("no key: no-key without a fetch", async () => {
+    vi.stubGlobal("fetch", vi.fn());
+    const r = await callWithProbe("opencode-zen", "lambda-model", ZEN, "", msgs, o);
+    expect(r.result).toEqual({ ok: false, reason: "no-key", detail: "no API key configured" });
+    expect(vi.mocked(fetch)).not.toHaveBeenCalled();
+  });
+
+  it("probe keeps the go session header on every style", async () => {
+    stubProbe(0, MESSAGES_OK);
+    await callWithProbe("opencode-go", "mu-model", "https://opencode.ai/zen/go/v1", "k", msgs, { ...o, prNumber: 7 });
+    const headers = (vi.mocked(fetch).mock.calls[0][1] as RequestInit).headers as Record<string, string>;
+    expect(headers["x-opencode-session"]).toBe("pr-7");
+  });
+});

@@ -19,7 +19,7 @@ import { runL0, type Finding } from "./fastpath.js";
 import { runL2 } from "./l2.js";
 import { postIssueFallback, postReview, ReadonlyTokenError, resolvePrNumber, shouldTrigger } from "./github.js";
 import { getInputs, type ActionInputs } from "./inputs.js";
-import { callByStyle, callLlm, ensureOllama, type LlmResult } from "./llm.js";
+import { callByStyle, callWithProbe, ensureOllama, type LlmResult } from "./llm.js";
 import { buildMessages, linkedIssueNumber } from "./prompt.js";
 import { authHeaderFor, resolveEndpoint, validateModelExists, type ResolvedEndpoint } from "./providers.js";
 import { buildBody, eventFor, exitFor, mapToComments, type ReviewPayload } from "./review.js";
@@ -68,7 +68,17 @@ export interface Analysis {
   runL2(dir: string): Promise<Finding[]>;
   ensureOllama(baseUrl: string, model: string, o: { timeoutSeconds?: number; apiKey?: string }): Promise<void>;
   validateModelExists(baseUrl: string, model: string, apiKey: string, auth?: { header?: string }): Promise<boolean>;
-  callLlm(ep: ResolvedEndpoint, messages: { system: string; user: string }, o: Parameters<typeof callLlm>[2]): Promise<LlmResult>;
+  /** Single call to the endpoint's already-resolved style (explicit style / llm_path override). */
+  callByStyle(ep: ResolvedEndpoint, messages: { system: string; user: string }, o: Parameters<typeof callByStyle>[2]): Promise<LlmResult>;
+  /** Error-driven style routing (spec §9.5); the real seam logs the winning style. */
+  callWithProbe(
+    provider: string,
+    model: string,
+    baseUrl: string,
+    apiKey: string,
+    messages: { system: string; user: string },
+    o: Parameters<typeof callWithProbe>[5],
+  ): Promise<LlmResult>;
 }
 
 export interface Deps {
@@ -485,7 +495,7 @@ async function slowPath(
     return undefined;
   }
   const messages = buildMessages(fast, promptText, issueBody, skipped);
-  const res = await deps.analysis.callLlm(ep, messages, {
+  const llmOpts = {
     model: i.llmModel,
     apiKey: i.llmApiKey,
     temperature: i.llmTemperature,
@@ -493,7 +503,16 @@ async function slowPath(
     maxTokens: i.llmMaxTokens,
     timeoutSeconds: i.timeoutSeconds,
     provider: i.llmProvider,
-  });
+    prNumber: pr,
+  };
+  // Spec §9.5: plain `auto` (no llm_path override) is error-driven — the probe
+  // walks the styles and learns from 400/404. An explicit llm_api_style — and
+  // any llm_path override, which pins the path the probe would rebuild — is
+  // honored as-is through the resolved endpoint, with no probing.
+  const res: LlmResult =
+    i.llmApiStyle === "auto" && i.llmPath === ""
+      ? await deps.analysis.callWithProbe(i.llmProvider, i.llmModel, ep.baseUrl, i.llmApiKey, messages, llmOpts)
+      : await deps.analysis.callByStyle(ep, messages, llmOpts);
   if (!res.ok) {
     core.warning(`slow path failed (${res.reason}): ${res.detail}`);
     return undefined;
@@ -806,10 +825,15 @@ function realAnalysis(): Analysis {
     runL2: (dir) => runL2(dir),
     ensureOllama,
     validateModelExists,
-    // The slow path invokes this seam; it dispatches by the endpoint's resolved
-    // API style (openai-chat keeps callLlm; v2 styles use their adapter), so
-    // every provider/model pair works end-to-end.
-    callLlm: callByStyle,
+    // Explicit styles (and llm_path overrides) dispatch straight to the resolved
+    // endpoint's adapter; plain `auto` goes through the error-driven probe
+    // (spec §9.5), which logs the style that won.
+    callByStyle,
+    callWithProbe: async (provider, model, baseUrl, apiKey, messages, o) => {
+      const { result, via } = await callWithProbe(provider, model, baseUrl, apiKey, messages, o);
+      if (via !== undefined) core.info(`llm api style: ${via}`);
+      return result;
+    },
   };
 }
 

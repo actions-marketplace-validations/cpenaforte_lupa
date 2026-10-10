@@ -1,9 +1,11 @@
 import type { Finding } from "./fastpath.js";
 import { PR_REVIEW_SCHEMA } from "./prompt.js";
-import type { ResolvedEndpoint } from "./providers.js";
+import { buildEndpointForStyle } from "./providers.js";
+import type { ApiStyle, ResolvedApiStyle, ResolvedEndpoint } from "./providers.js";
 import { callGoogle } from "./adapters/google.js";
 import { callMessages } from "./adapters/messages.js";
 import { callResponses } from "./adapters/responses.js";
+import * as core from "@actions/core";
 
 export class InvalidJsonError extends Error {}
 export class OllamaMissingError extends Error {}
@@ -329,6 +331,115 @@ export async function callByStyle(
       // Unreachable by type; guards forged/malformed endpoints at runtime.
       throw new Error("unsupported apiStyle: " + String(ep.apiStyle));
   }
+}
+
+// ---------------------------------------------------------------------------
+// Error-driven style routing (spec §9.5): no hardcoded (provider,model)->style
+// map. `auto` walks the probe order and learns the style from 400/404 errors;
+// the catalog GET /models check stays the only existence source of truth.
+// Probing is safe by construction: adapters only generate text (read-only,
+// idempotent) — they never write.
+// ---------------------------------------------------------------------------
+
+/** Probe order for `auto`: chat first (the common case), then the native styles. */
+export const PROBE_ORDER = ["openai-chat", "openai-responses", "anthropic-messages", "google-models"] as const;
+
+/** In-process memo of the style that worked, keyed provider:model (session determinism). */
+const PROBE_MEMO = new Map<string, ResolvedApiStyle>();
+
+/**
+ * Only a 400 or 404 advances the probe (route/contract error: the endpoint or
+ * the body shape is wrong for this style). 429/5xx belong to the adapter's own
+ * retry; every other outcome (timeout, refusal, content filter, bad JSON, auth
+ * error) is not a style signal.
+ */
+function isProbeTrigger(result: LlmResult): boolean {
+  return result.ok === false && result.reason === "http-error" && /^HTTP (400|404)(?!\d)/.test(result.detail);
+}
+
+export interface ProbeOptions {
+  maxTokens: number;
+  timeoutSeconds: number;
+  temperature?: number;
+  topP?: number;
+  /** Preserves the opencode-go x-opencode-session header across probe attempts. */
+  prNumber?: number | null;
+}
+
+export interface ProbeOutcome {
+  result: LlmResult;
+  /** The style whose adapter produced the result; set whenever a call was made. */
+  via?: ResolvedApiStyle;
+}
+
+/**
+ * Error-driven routing (spec §9.5). An explicit style is honored as-is: one
+ * call, no probe. `auto` (or no style) walks PROBE_ORDER and memoizes the
+ * style that worked for the process. A 400/404 advances to the next style;
+ * any other failure is returned as-is. When every style answers 400/404 the
+ * result is http-error carrying the last (redacted) detail, plus a warning
+ * naming the model and the styles tried.
+ */
+export async function callWithProbe(
+  provider: string,
+  model: string,
+  baseUrl: string,
+  key: string,
+  messages: { system: string; user: string },
+  o: ProbeOptions,
+  explicitStyle?: ApiStyle,
+): Promise<ProbeOutcome> {
+  if (key === "") {
+    return { result: { ok: false, reason: "no-key", detail: "no API key configured" } };
+  }
+
+  const callOpts = {
+    model,
+    apiKey: key,
+    temperature: o.temperature,
+    topP: o.topP,
+    maxTokens: o.maxTokens,
+    timeoutSeconds: o.timeoutSeconds,
+    provider,
+  };
+
+  const run = async (style: ResolvedApiStyle): Promise<ProbeOutcome> => {
+    const ep = buildEndpointForStyle(provider, model, baseUrl, key, style, o.prNumber ?? null);
+    return { result: await callByStyle(ep, messages, callOpts), via: style };
+  };
+
+  // Explicit style: the user decided; exactly one call, no probe.
+  if (explicitStyle !== undefined && explicitStyle !== "auto") {
+    return run(explicitStyle as ResolvedApiStyle);
+  }
+
+  const memoKey = `${provider}:${model}`;
+  const memoized = PROBE_MEMO.get(memoKey);
+  const order: readonly ResolvedApiStyle[] = memoized !== undefined ? [memoized] : PROBE_ORDER;
+
+  const attempted: ResolvedApiStyle[] = [];
+  let last: LlmResult | undefined;
+  for (const style of order) {
+    attempted.push(style);
+    const out = await run(style);
+    if (out.result.ok) {
+      PROBE_MEMO.set(memoKey, style);
+      return out;
+    }
+    last = out.result;
+    if (!isProbeTrigger(last)) return out;
+  }
+
+  // Every style answered 400/404: report the last failure, name what was tried.
+  core.warning(
+    `model "${model}": no API style accepted the request; tried ${attempted.join(" → ")}. ` +
+      `Set llm_api_style explicitly to skip the probe.`,
+  );
+  const detail = last !== undefined && !last.ok ? last.detail : "no API style accepted the request";
+  return {
+    result: { ok: false, reason: "http-error", detail: redact(detail, key) },
+    via: attempted.at(-1),
+  };
 }
 
 /**

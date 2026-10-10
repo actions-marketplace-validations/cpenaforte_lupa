@@ -6,14 +6,12 @@ export class UnsupportedModelError extends Error {}
 /** Same six members as LlmApiStyle in inputs.ts (identical union). */
 export type ApiStyle = LlmApiStyle;
 
-/** API styles that need a non-chat body adapter (v2 only). */
-export type NonChatStyle = Exclude<ApiStyle, "auto" | "openai-chat" | "custom-path">;
-
 /**
- * What a resolved endpoint actually speaks: "auto" is resolved away, and
- * "custom-path" (path-only override) resolves to the openai-chat body.
+ * The body-adapter styles: `auto` is discovered per call by the probe driver
+ * (spec §9.5), and "custom-path" (path-only override) resolves to the
+ * openai-chat body.
  */
-export type ResolvedApiStyle = "openai-chat" | NonChatStyle;
+export type ResolvedApiStyle = "openai-chat" | "openai-responses" | "anthropic-messages" | "google-models";
 
 export interface ResolvedEndpoint {
   /** Base URL only; never includes the request path. */
@@ -45,79 +43,8 @@ const USER_AGENT = "pr-reviewer/1.0";
 /** Timeout for the GET {base}/models existence check. */
 const VALIDATE_TIMEOUT_MS = 15_000;
 
-/**
- * Provider:model pairs that are NOT served by the OpenAI chat-completions
- * endpoint. `auto` resolves these pairs to their adapter (v2: no more
- * fail-fast), and so does an explicit v2 `llm_api_style`. Explicit
- * `openai-chat` on one of these pairs still throws UnsupportedModelError
- * (chat cannot serve them). Chat-supported pairs (e.g. opencode-zen:qwen3.8-max)
- * must NOT appear here.
- *
- * Go per-model limits (documented for operators, enforced by the provider):
- * 5h window 20%, weekly 50%, monthly 100%, per-model caps $15–60.
- * When a Go subscription limit is hit, the Zen balance is used as fallback
- * by the provider; this action does not switch providers on its own.
- */
-export const NON_CHAT: ReadonlyMap<string, NonChatStyle> = new Map<string, NonChatStyle>([
-  // opencode-go
-  ["opencode-go:qwen3.8-max", "anthropic-messages"],
-  ["opencode-go:qwen3.8-flash", "anthropic-messages"],
-  ["opencode-go:qwen3.7-max", "anthropic-messages"],
-  ["opencode-go:qwen3.7-plus", "anthropic-messages"],
-  ["opencode-go:minimax-m3", "anthropic-messages"],
-  ["opencode-go:minimax-m2.7", "anthropic-messages"],
-  ["opencode-go:claude-haiku-5-5", "anthropic-messages"],
-  ["opencode-go:claude-sonnet-5-5", "anthropic-messages"],
-  ["opencode-go:claude-opus-5-5", "anthropic-messages"],
-  ["opencode-go:grok-4.7", "openai-responses"],
-  ["opencode-go:grok-4.6", "openai-responses"],
-  ["opencode-go:gpt-6-luna", "openai-responses"],
-  ["opencode-go:gpt-5.6-luna", "openai-responses"],
-  ["opencode-go:gpt-6.1-sol", "openai-responses"],
-  ["opencode-go:gpt-6-astra", "openai-responses"],
-  ["opencode-go:muse-spark-1.3-contributor", "openai-responses"],
-  ["opencode-go:gemini-3.8-flash", "google-models"],
-  ["opencode-go:gemini-3.5-flash-lite", "google-models"],
-  // opencode-zen
-  ["opencode-zen:gpt-6-luna", "openai-responses"],
-  ["opencode-zen:gpt-6.1-sol", "openai-responses"],
-  ["opencode-zen:gpt-6-astra", "openai-responses"],
-  ["opencode-zen:grok-4.7", "openai-responses"],
-  ["opencode-zen:grok-4.6", "openai-responses"],
-  // Spec §9.1: Muse-Spark ships a free variant on Zen; it is a responses model too.
-  ["opencode-zen:muse-spark-1.3-contributor-free", "openai-responses"],
-  ["opencode-zen:claude-haiku-5-5", "anthropic-messages"],
-  ["opencode-zen:claude-sonnet-5-5", "anthropic-messages"],
-  ["opencode-zen:claude-opus-5-5", "anthropic-messages"],
-  ["opencode-zen:qwen3.7-max", "anthropic-messages"],
-  ["opencode-zen:qwen3.7-plus", "anthropic-messages"],
-  ["opencode-zen:gemini-3.8-flash", "google-models"],
-  ["opencode-zen:gemini-3.5-flash-lite", "google-models"],
-]);
-
-/**
- * Claude Fable family on Zen/Go (spec §9.2 names Fable alongside Opus/Sonnet/
- * Haiku): resolved by id prefix because the exact versioned ids are not
- * enumerated in NON_CHAT.
- */
-const CLAUDE_FABLE_PREFIX = /^claude-fable-/;
-
-/**
- * Single non-chat lookup used by both `auto` and the explicit `openai-chat`
- * fail-fast: the exact (provider, model) map first, then the Fable family rule
- * for Zen/Go only (a `claude-fable-*` id on any other provider stays chat).
- */
-function nonChatFor(provider: string, model: string): NonChatStyle | undefined {
-  const exact = NON_CHAT.get(`${provider}:${model}`);
-  if (exact !== undefined) return exact;
-  if ((provider === "opencode-zen" || provider === "opencode-go") && CLAUDE_FABLE_PREFIX.test(model)) {
-    return "anthropic-messages";
-  }
-  return undefined;
-}
-
 /** Last path segments that identify a non-chat endpoint (path-only misuse). */
-const NON_CHAT_PATH_SEGMENTS: ReadonlySet<string> = new Set(["messages", "responses", "models"]);
+const PATH_ONLY_SEGMENTS: ReadonlySet<string> = new Set(["messages", "responses", "models"]);
 
 /**
  * Contract: the caller passes a path that is already normalized (leading "/")
@@ -129,7 +56,7 @@ const NON_CHAT_PATH_SEGMENTS: ReadonlySet<string> = new Set(["messages", "respon
 function isPathOnlyNonChat(path: string): boolean {
   const pathname = path.replace(/\/+$/, "");
   const last = pathname.slice(pathname.lastIndexOf("/") + 1);
-  return NON_CHAT_PATH_SEGMENTS.has(last);
+  return PATH_ONLY_SEGMENTS.has(last);
 }
 
 export interface ResolveEndpointOptions {
@@ -168,26 +95,18 @@ export function resolveEndpoint(o: ResolveEndpointOptions): ResolvedEndpoint {
     throw new Error(`llm_api_style "custom-path" requires llm_path`);
   }
 
-  // Resolve the API style. `auto` consults the versioned (provider, model) map
-  // and now RESOLVES non-chat pairs to their adapter; explicit v2 styles are
-  // honored as-is (functional); openai-chat and custom-path use the chat body.
+  // Resolve the API style. An explicit v2 style is honored as-is (functional);
+  // openai-chat, custom-path and `auto` all resolve to the chat body here.
+  // `auto` consults no map (spec §9.5): the probe driver (callWithProbe in
+  // llm.ts) discovers the working style from 400/404 errors, building each
+  // style's endpoint with buildEndpointForStyle. The chat endpoint resolved
+  // for `auto` is the default: first probe style, catalog-check base and host
+  // for any llm_path override.
   let apiStyle: ResolvedApiStyle;
   if (o.llmApiStyle === "openai-responses" || o.llmApiStyle === "anthropic-messages" || o.llmApiStyle === "google-models") {
     apiStyle = o.llmApiStyle;
-  } else if (o.llmApiStyle === "auto") {
-    apiStyle = nonChatFor(o.llmProvider, o.llmModel) ?? "openai-chat";
   } else {
     apiStyle = "openai-chat";
-    if (o.llmApiStyle === "openai-chat") {
-      const nonChat = nonChatFor(o.llmProvider, o.llmModel);
-      if (nonChat !== undefined) {
-        throw new UnsupportedModelError(
-          `Model "${o.llmModel}" on "${o.llmProvider}" is served by "${nonChat}", which openai-chat cannot reach. ` +
-            `Set llm_api_style to auto (resolves it automatically) or "${nonChat}". ` +
-            `Supported API styles: auto, openai-chat, openai-responses, anthropic-messages, google-models, custom-path.`,
-        );
-      }
-    }
   }
 
   // The google preset base ends in the OpenAI-compat segment (/openai); the
@@ -233,6 +152,32 @@ export function resolveEndpoint(o: ResolveEndpointOptions): ResolvedEndpoint {
   }
 
   return { baseUrl: effectiveBase, path, headers, apiStyle };
+}
+
+/**
+ * Endpoint (baseUrl + path + headers) for ONE API style, used by the probe
+ * driver in llm.ts to walk PROBE_ORDER. Thin wrapper over resolveEndpoint with
+ * an empty llm_path (the probe always uses each style's default path), so the
+ * base rewrite, normalization and header rules stay in one place. `prNumber`
+ * preserves the opencode-go session header across probe attempts.
+ */
+export function buildEndpointForStyle(
+  provider: string,
+  model: string,
+  baseUrl: string,
+  apiKey: string,
+  style: ResolvedApiStyle,
+  prNumber: number | null = null,
+): ResolvedEndpoint {
+  return resolveEndpoint({
+    llmProvider: provider as ActionInputs["llmProvider"],
+    llmBaseUrl: baseUrl,
+    llmApiStyle: style,
+    llmPath: "",
+    llmModel: model,
+    llmApiKey: apiKey,
+    prNumber,
+  });
 }
 
 /**

@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { callByStyle } from "../src/llm.js";
-import { resolveEndpoint, UnsupportedModelError, type ResolvedApiStyle } from "../src/providers.js";
+import { resolveEndpoint, type ResolvedApiStyle } from "../src/providers.js";
 import { googleSchema } from "../src/adapters/google.js";
 import { PR_REVIEW_SCHEMA } from "../src/prompt.js";
 
@@ -45,42 +45,9 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-// ---------- routing table: auto resolves non-chat pairs to their adapter ----------
+// ---------- routing: auto defers to the probe; providers own base + headers ----------
 
-describe("resolveEndpoint: auto routes non-chat pairs to their adapter", () => {
-  it.each([
-    // [provider, model, apiStyle, path]
-    ["opencode-zen", "gpt-6-luna", "openai-responses", "/responses"],
-    ["opencode-zen", "claude-sonnet-5-5", "anthropic-messages", "/messages"],
-    ["opencode-zen", "gemini-3.8-flash", "google-models", "/models/gemini-3.8-flash:generateContent"],
-    ["opencode-go", "qwen3.8-max", "anthropic-messages", "/messages"],
-    ["opencode-go", "gpt-6-luna", "openai-responses", "/responses"],
-    // Spec ids: Zen Muse-Spark free variant (§9.1) and the Claude Fable family (§9.2).
-    ["opencode-zen", "muse-spark-1.3-contributor-free", "openai-responses", "/responses"],
-    ["opencode-zen", "claude-fable-5-5", "anthropic-messages", "/messages"],
-    ["opencode-go", "claude-fable-5-5", "anthropic-messages", "/messages"],
-  ] as const)("auto %s:%s → %s at %s", (provider, model, apiStyle, path) => {
-    const r = resolveEndpoint({ ...base, llmProvider: provider, llmModel: model });
-    expect(r.apiStyle).toBe(apiStyle);
-    expect(r.path).toBe(path);
-  });
-
-  it("auto chat pairs are unchanged (openai-chat at /chat/completions)", () => {
-    for (const [provider, model] of [
-      ["opencode-zen", "qwen3.8-max"],
-      ["opencode-zen", "deepseek-v4.1-flash"],
-      ["opencode-go", "glm-5.3"],
-      ["openai", "gpt-test"],
-      // Claude ids outside the map and the Fable family stay chat.
-      ["opencode-zen", "claude-3-5-haiku"],
-      ["openai", "claude-fable-x"],
-    ] as const) {
-      const r = resolveEndpoint({ ...base, llmProvider: provider, llmModel: model });
-      expect(r.apiStyle).toBe("openai-chat");
-      expect(r.path).toBe("/chat/completions");
-    }
-  });
-
+describe("resolveEndpoint: base URLs and auth headers are per provider", () => {
   it("base URLs and auth headers are unchanged by routing", () => {
     const zen = resolveEndpoint({ ...base, llmProvider: "opencode-zen", llmModel: "gpt-6-luna" });
     expect(zen.baseUrl).toBe("https://opencode.ai/zen/v1");
@@ -146,24 +113,6 @@ describe("resolveEndpoint: explicit v2 llm_api_style values are functional", () 
 // ---------- fail-fast cases that stay ----------
 
 describe("resolveEndpoint: fail-fast cases that stay", () => {
-  it("explicit openai-chat on a non-chat pair still fails fast, naming the required style", () => {
-    let msg = "";
-    try {
-      resolveEndpoint({ ...base, llmProvider: "opencode-zen", llmModel: "gpt-6-luna", llmApiStyle: "openai-chat" });
-    } catch (e) {
-      msg = (e as Error).message;
-    }
-    expect(msg).toContain('"openai-responses"');
-    expect(msg).toContain("Supported API styles");
-    expect(() =>
-      resolveEndpoint({ ...base, llmProvider: "opencode-go", llmModel: "qwen3.8-max", llmApiStyle: "openai-chat" }),
-    ).toThrow(UnsupportedModelError);
-    // The Fable family is non-chat on Zen/Go, so explicit chat fails there too.
-    expect(() =>
-      resolveEndpoint({ ...base, llmProvider: "opencode-zen", llmModel: "claude-fable-5-5", llmApiStyle: "openai-chat" }),
-    ).toThrow(UnsupportedModelError);
-  });
-
   it("unknown custom pair with a non-chat llm_path and no v2 style stays path-only", () => {
     expect(() =>
       resolveEndpoint({
@@ -188,7 +137,7 @@ describe("resolveEndpoint: fail-fast cases that stay", () => {
 describe("callByStyle dispatches to the adapter of the resolved style", () => {
   it("openai-chat → callLlm request shape, identical LlmResult", async () => {
     stubFetch(() => new Response(JSON.stringify(CHAT_OK), { status: 200 }));
-    const ep = resolveEndpoint({ ...base, llmProvider: "openai", llmModel: "m" });
+    const ep = resolveEndpoint({ ...base, llmProvider: "openai", llmModel: "m", llmApiStyle: "openai-chat" });
     const r = await callByStyle(ep, msgs, { ...opts, model: "m", provider: "openai" });
     expect(r).toEqual({ ok: true, findings: [FINDING] });
     const [url, init] = lastCall();
@@ -206,7 +155,7 @@ describe("callByStyle dispatches to the adapter of the resolved style", () => {
 
   it("openai-responses → callResponses request shape, identical LlmResult", async () => {
     stubFetch(() => new Response(JSON.stringify(RESPONSES_OK), { status: 200 }));
-    const ep = resolveEndpoint({ ...base, llmProvider: "opencode-zen", llmModel: "gpt-6-luna" });
+    const ep = resolveEndpoint({ ...base, llmProvider: "opencode-zen", llmModel: "gpt-6-luna", llmApiStyle: "openai-responses" });
     const r = await callByStyle(ep, msgs, { ...opts, model: "gpt-6-luna" });
     expect(r).toEqual({ ok: true, findings: [FINDING] });
     const [url, init] = lastCall();
@@ -224,7 +173,7 @@ describe("callByStyle dispatches to the adapter of the resolved style", () => {
 
   it("anthropic-messages → callMessages request shape, identical LlmResult", async () => {
     stubFetch(() => new Response(JSON.stringify(MESSAGES_OK), { status: 200 }));
-    const ep = resolveEndpoint({ ...base, llmProvider: "opencode-zen", llmModel: "claude-sonnet-5-5" });
+    const ep = resolveEndpoint({ ...base, llmProvider: "opencode-zen", llmModel: "claude-sonnet-5-5", llmApiStyle: "anthropic-messages" });
     const r = await callByStyle(ep, msgs, { ...opts, model: "claude-sonnet-5-5" });
     expect(r).toEqual({ ok: true, findings: [FINDING] });
     const [url, init] = lastCall();
@@ -243,7 +192,7 @@ describe("callByStyle dispatches to the adapter of the resolved style", () => {
 
   it("google-models → callGoogle request shape (Google-native schema), identical LlmResult", async () => {
     stubFetch(() => new Response(JSON.stringify(GOOGLE_OK), { status: 200 }));
-    const ep = resolveEndpoint({ ...base, llmProvider: "opencode-zen", llmModel: "gemini-3.8-flash" });
+    const ep = resolveEndpoint({ ...base, llmProvider: "opencode-zen", llmModel: "gemini-3.8-flash", llmApiStyle: "google-models" });
     const r = await callByStyle(ep, msgs, { ...opts, model: "gemini-3.8-flash" });
     expect(r).toEqual({ ok: true, findings: [FINDING] });
     const [url, init] = lastCall();
@@ -267,10 +216,10 @@ describe("callByStyle dispatches to the adapter of the resolved style", () => {
 
   it("protocol refusals/blocks all map to the same content-filter reason", async () => {
     const cases: Array<[Parameters<typeof resolveEndpoint>[0], unknown]> = [
-      [{ ...base, llmProvider: "openai", llmModel: "m" }, { choices: [{ finish_reason: "stop", message: { content: "", refusal: "no" } }] }],
-      [{ ...base, llmProvider: "opencode-zen", llmModel: "gpt-6-luna" }, { output: [{ content: [{ type: "refusal", refusal: "no" }] }] }],
-      [{ ...base, llmProvider: "opencode-zen", llmModel: "claude-sonnet-5-5" }, { stop_reason: "refusal", content: [] }],
-      [{ ...base, llmProvider: "opencode-zen", llmModel: "gemini-3.8-flash" }, { promptFeedback: { blockReason: "SAFETY" } }],
+      [{ ...base, llmProvider: "openai", llmModel: "m", llmApiStyle: "openai-chat" }, { choices: [{ finish_reason: "stop", message: { content: "", refusal: "no" } }] }],
+      [{ ...base, llmProvider: "opencode-zen", llmModel: "gpt-6-luna", llmApiStyle: "openai-responses" }, { output: [{ content: [{ type: "refusal", refusal: "no" }] }] }],
+      [{ ...base, llmProvider: "opencode-zen", llmModel: "claude-sonnet-5-5", llmApiStyle: "anthropic-messages" }, { stop_reason: "refusal", content: [] }],
+      [{ ...base, llmProvider: "opencode-zen", llmModel: "gemini-3.8-flash", llmApiStyle: "google-models" }, { promptFeedback: { blockReason: "SAFETY" } }],
     ];
     for (const [o, envelope] of cases) {
       stubFetch(() => new Response(JSON.stringify(envelope), { status: 200 }));
