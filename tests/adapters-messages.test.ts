@@ -81,6 +81,8 @@ describe("callMessages", () => {
     expect(headers["anthropic-version"]).toBe("2023-06-01");
     expect(headers["User-Agent"]).toBe("pr-reviewer/1.0");
     expect(headers["x-opencode-session"]).toBe("pr-123");
+    // Deliberate: the Messages protocol authenticates via x-api-key only.
+    expect(headers.Authorization).toBeUndefined();
     expect(lastBody()).toEqual({
       model: "claude-sonnet-5-5",
       max_tokens: 50,
