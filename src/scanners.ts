@@ -270,7 +270,7 @@ export async function runScanners(o: {
     const sb = await run("docker", dockerArgs(dir, TRIVY_IMAGE, TRIVY_DIGEST, sbomArgv(".")), dir);
     if (sb.missing) {
       findings.push(warning("scanner-missing", "sbom unavailable: docker not found"));
-    } else if (!isJsonObject(sb.stdout)) {
+    } else if (!isCycloneDx(sb.stdout)) {
       // Parity with SARIF (R2/R14): the exit code is not decisive; a valid document is accepted.
       findings.push(warning("scanner-failed", `sbom exited ${sb.code ?? "abnormally"} without a CycloneDX document`));
     } else {
@@ -291,10 +291,11 @@ export async function runScanners(o: {
   return { findings, sbomPath };
 }
 
-/** True when `text` parses as a JSON object (the SBOM's valid-document check). */
-function isJsonObject(text: string): boolean {
+/** True when `text` is a CycloneDX document: a JSON object with bomFormat "CycloneDX". */
+function isCycloneDx(text: string): boolean {
   try {
-    return isObj(JSON.parse(text));
+    const parsed: unknown = JSON.parse(text);
+    return isObj(parsed) && parsed.bomFormat === "CycloneDX";
   } catch {
     return false;
   }

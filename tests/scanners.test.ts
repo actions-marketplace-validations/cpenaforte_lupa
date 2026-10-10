@@ -166,6 +166,7 @@ case "$*" in
       fail) exit 4;;
       garbage) printf '%s' 'nope'; exit 0;;
       valid-nonzero) printf '%s' '{"bomFormat":"CycloneDX"}'; exit 4;;
+      no-bomformat) printf '%s' '{}'; exit 0;;
     esac
     printf '%s' '{"bomFormat":"CycloneDX"}'; exit 0;;
   *--severity*) if [ -n "$EMPTY_TRIVY" ]; then exit 5; fi;;
@@ -329,6 +330,19 @@ describe("runScanners", () => {
     expect(r.sbomPath).toBeDefined();
     expect(readFileSync(r.sbomPath as string, "utf8")).toBe('{"bomFormat":"CycloneDX"}');
     expect(r.findings.some((f) => f.rule === "scanner-failed")).toBe(false);
+  });
+
+  it("sbom JSON without bomFormat CycloneDX is a scanner-failed warning", async () => {
+    process.env.PATH = makeBin({ semgrep: FAKE_SEMGREP_CLEAN, docker: FAKE_DOCKER });
+    process.env.SBOM_MODE = "no-bomformat";
+    const r = await runScanners({ dir: tmp, baselineSha: "abc", sbom: true, outDir: tmp });
+    expect(r.sbomPath).toBeUndefined();
+    expect(r.findings).toContainEqual({
+      severity: "warning",
+      file: "",
+      rule: "scanner-failed",
+      message: "sbom exited 0 without a CycloneDX document",
+    });
   });
 
   it("sbom writeFile failure removes the sbom dir and returns an sbom-write warning, no throw", async () => {
