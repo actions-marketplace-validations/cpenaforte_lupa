@@ -70,7 +70,7 @@ v1 supports the `openai-chat` API style only: `POST {base_url}/chat/completions`
 
 ### opencode-zen and opencode-go
 
-- **Key:** `Bearer` with your OpenCode API key , passed as the `llm_api_key` input (the `LLM_API_KEY` secret in the template).
+- **Key:** `Bearer` with your OpenCode API key, passed as the `llm_api_key` input (the `LLM_API_KEY` secret in the template).
 - **Headers:** the action sends `User-Agent: pr-reviewer/1.0`. `opencode-go` also sends `x-opencode-session: pr-<number>`, stable per PR, so the provider can group the calls.
 - **Model check:** the action calls `GET {base}/models` to confirm the model id exists. It checks the id only and never changes the endpoint.
 - **Routing table:** the action keeps a versioned map of `(provider, model) → API style` in code. Some models are not served by chat completions. Examples: `claude-*`, `minimax-m3`, `minimax-m2.7`, `qwen3.8-max` and `qwen3.7-*` on Go use `anthropic-messages`; `grok-*`, `gpt-6*` and `gpt-5.6-luna` use `openai-responses`; `gemini-*` use `google-models`. The same model can differ by provider: `qwen3.8-max` is chat-capable on Zen but `anthropic-messages` on Go. For non-chat pairs the action fails fast with a clear message instead of sending an incompatible request. Non-chat styles are v2.
@@ -87,7 +87,7 @@ v1 supports the `openai-chat` API style only: `POST {base_url}/chat/completions`
 Budget figures are estimates. Prices change: check your provider's price page, and compare **Zen vs direto** (calling the model provider directly with its own key). Zen is pay-per-use through OpenCode, and its prices can differ from the direct provider prices.
 
 - **Cost of a typical PR:** about 3k input tokens plus 600 output tokens.
-- **Ceiling:** `max_diff_chars` 60000 is about 15k input tokens plus prompt overhead. At frontier-model prices a PR at the ceiling costs roughly $0.15 to $0.30, far more than the cost of a typical PR. Lower `max_diff_chars` to cap spend. Files larger than the per-file cap (8000 characters) are truncated, and files over the total ceiling are skipped with a note.
+- **Ceiling:** `max_diff_chars` 60000 is about 15k input tokens plus prompt overhead. At frontier-model prices a PR at the ceiling costs roughly $0.15 to $0.30. Compare with the typical figure above (about 3k input and 600 output tokens). Lower `max_diff_chars` to cap spend. Files larger than the per-file cap (8000 characters) are truncated, and files over the total ceiling are skipped with a note.
 - **peak/off-peak pricing:** some models price by time of day. For example, `deepseek-v4.1-flash` has different peak and off-peak prices. Check the current rates before choosing a model for high-volume repositories.
 - **Retries:** one retry with exponential backoff, only on 5xx and 429 (honouring `Retry-After`). Timeouts and output truncation (`finish_reason: length`) are not retried with a smaller diff, because truncating the input does not fix truncated output.
 

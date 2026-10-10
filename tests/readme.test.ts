@@ -40,6 +40,13 @@ describe("README", () => {
     ]) {
       expect(r).toContain(s);
     }
+    // R8: the sampling note must sit in the Anthropic-compatible paragraph.
+    const note = r.slice(r.indexOf("Anthropic-compatible presets"), r.indexOf("Anthropic-compatible presets") + 600);
+    expect(note).toContain("temperature");
+    expect(note).toContain("top_p");
+    expect(note).toContain("family");
+    expect(note).toContain("n");
+    expect(r).toContain("Compare with the typical figure above (about 3k input and 600 output tokens)");
     expect(r).not.toContain("has evidence");
     expect(r).not.toContain("writable App token");
     expect(r).not.toContain("OPENCODE_API_KEY");

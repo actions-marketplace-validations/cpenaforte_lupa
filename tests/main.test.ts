@@ -365,9 +365,22 @@ describe("run() orchestration", () => {
     expect(r.posted).toBe(false);
     const lines = info.mock.calls.map((c) => String(c[0]));
     const dry = lines.find((l) => l.includes("dry-run, nothing posted"));
-    expect(dry).toBeDefined();
-    expect(dry).toMatch(/would post event=(COMMENT|REQUEST_CHANGES), inline=\d+, general=\d+, high=\d+\)/);
-    expect(dry).not.toContain("## ");
+    // Fixture: one warning finding on src/a.ts:2, which is an added line in DIFF, so it maps inline.
+    expect(dry).toBe(
+      "post_comment is false: dry-run, nothing posted (would post event=COMMENT, inline=1, general=0, high=0)",
+    );
+  });
+
+  it("dry-run counts high findings and REQUEST_CHANGES with fail_level high", async () => {
+    const info = vi.mocked(core.info);
+    info.mockClear();
+    const high: Finding = { ...LLM_FINDING, severity: "high", message: "high message" };
+    const r = await runWithMocks({ postComment: false, failLevel: "high", llm: [high] });
+    expect(r.posted).toBe(false);
+    const dry = info.mock.calls.map((c) => String(c[0])).find((l) => l.includes("dry-run, nothing posted"));
+    expect(dry).toBe(
+      "post_comment is false: dry-run, nothing posted (would post event=REQUEST_CHANGES, inline=1, general=0, high=1)",
+    );
   });
 
   it("validateModelExists rejection skips the slow path with a warning but still posts fast-path", async () => {
