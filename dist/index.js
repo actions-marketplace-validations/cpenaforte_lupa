@@ -26051,7 +26051,10 @@ function writeFindings(dir, findings) {
   writeFileSync2(join4(dir, "findings.json"), JSON.stringify(findings, null, 2) + "\n", "utf8");
 }
 function capText(s, cap) {
-  return s.length <= cap ? s : s.slice(0, cap - TRUNC_MARK.length) + TRUNC_MARK;
+  const cps = Array.from(s);
+  if (cps.length <= cap)
+    return s;
+  return cps.slice(0, cap - Array.from(TRUNC_MARK).length).join("") + TRUNC_MARK;
 }
 var CONTROL_KEEP_TEXT = /[\u0000-\u0008\u000b-\u001f\u007f]/g;
 var CONTROL_ALL = /[\u0000-\u001f\u007f]/g;
@@ -26166,7 +26169,7 @@ async function slowPath(env, deps, pr, fast, promptText, issueBody, skipped) {
   return res.findings;
 }
 async function publishReview(a) {
-  const findings = a.findings.map(sanitizeFinding);
+  const findings = a.findings;
   const { inline, general } = mapToComments(findings, parseHunks(a.hunks));
   const body = buildBody(general, summaryFor(findings));
   const payload = {
@@ -26347,7 +26350,7 @@ async function runFlowB(env, deps, out) {
   if (live.headRef !== runBranch) {
     throw new Error("pr-reviewer: PR head branch does not match workflow_run.head_branch; refusing to post");
   }
-  const findings = readFindings(env.artifactDir);
+  const findings = readFindings(env.artifactDir).map(sanitizeFinding);
   const hunks = parseDiffFiles(readDiff(env.artifactDir));
   await publishReview({ env, deps, out, pr, isFork: live.isFork, findings, hunks, headSha });
   out.exitCode = exitFor(env.inputs.failLevel, findings);

@@ -1,10 +1,10 @@
-import { defineConfig } from "vitest/config";
+import { configDefaults, defineConfig } from "vitest/config";
 
 export default defineConfig({
   test: {
-    // Default test globs. lib/ holds tsc output (compiled copies of the tests) and dist/ the bundle:
-    // neither may be collected as tests.
     include: ["**/*.{test,spec}.?(c|m)[jt]s?(x)"],
-    exclude: ["lib/**", "dist/**", "node_modules/**"],
+    // Extends the vitest defaults (node_modules, .git, .cache, ...). lib/ holds tsc output, which
+    // contains compiled copies of the tests, and dist/ holds the bundle: neither is collected.
+    exclude: [...configDefaults.exclude, "lib/**", "dist/**"],
   },
 });

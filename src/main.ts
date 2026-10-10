@@ -317,8 +317,14 @@ function writeFindings(dir: string, findings: Finding[]): void {
 // Finding sanitizing (R7). LLM output and the privileged artifact are untrusted text.
 // ---------------------------------------------------------------------------
 
+/**
+ * Caps by code points (not UTF-16 units), so a cut never splits a surrogate pair.
+ * The cap includes the truncation marker.
+ */
 function capText(s: string, cap: number): string {
-  return s.length <= cap ? s : s.slice(0, cap - TRUNC_MARK.length) + TRUNC_MARK;
+  const cps = Array.from(s);
+  if (cps.length <= cap) return s;
+  return cps.slice(0, cap - Array.from(TRUNC_MARK).length).join("") + TRUNC_MARK;
 }
 
 /** C0 and DEL controls except TAB and LF (kept for multi-line messages and suggestions). */
@@ -339,6 +345,9 @@ function unsafePath(file: string): boolean {
 /**
  * Strips control characters, caps lengths, and turns unsafe paths into repository-level notes
  * (general body). Unsafe-path check runs after the control strip, before the length cap.
+ *
+ * Paths longer than FILE_CAP (200 chars) are intentionally capped and then fall back to general
+ * notes: a truncated path matches no diff line, so mapToComments never places it inline.
  */
 export function sanitizeFinding(f: Finding): Finding {
   let file = f.file.replace(CONTROL_ALL, "");
@@ -485,7 +494,7 @@ interface PublishArgs {
  * A failed issue fallback is a warning; it never changes the exit code.
  */
 async function publishReview(a: PublishArgs): Promise<void> {
-  const findings = a.findings.map(sanitizeFinding);
+  const findings = a.findings;
   const { inline, general } = mapToComments(findings, parseHunks(a.hunks));
   const body = buildBody(general, summaryFor(findings));
   const payload: ReviewPayload = {
@@ -659,6 +668,7 @@ async function runFlowA(env: RunEnv, deps: Deps, out: Outcome): Promise<void> {
  */
 async function runFlowB(env: RunEnv, deps: Deps, out: Outcome): Promise<void> {
   out.slowPathSkipped = true;
+  // Sanitizing pass for the privileged flow (Flow A sanitizes in runFlowA; publish never does).
   const meta = readPrMeta(env.artifactDir);
   if (meta === undefined) {
     throw new Error(
@@ -698,7 +708,7 @@ async function runFlowB(env: RunEnv, deps: Deps, out: Outcome): Promise<void> {
   if (live.headRef !== runBranch) {
     throw new Error("pr-reviewer: PR head branch does not match workflow_run.head_branch; refusing to post");
   }
-  const findings = readFindings(env.artifactDir);
+  const findings = readFindings(env.artifactDir).map(sanitizeFinding);
   const hunks = parseDiffFiles(readDiff(env.artifactDir));
   await publishReview({ env, deps, out, pr, isFork: live.isFork, findings, hunks, headSha });
   out.exitCode = exitFor(env.inputs.failLevel, findings);

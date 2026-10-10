@@ -576,6 +576,15 @@ describe("Fluxo B bindings and sanitizing", () => {
     expect(r.payloads[0].body).toContain(TRUNC);
   });
 
+  it("caps by code points: an emoji message never leaves a lone surrogate", async () => {
+    const f: Finding = { severity: "warning", file: "src/a.ts", line: 2, rule: "r", message: "😀".repeat(2500) };
+    const r = await runPrivileged({ findings: [f] });
+    const body = r.payloads[0].comments[0].body;
+    expect(body).toContain(TRUNC);
+    expect(body).not.toContain("😀".repeat(2000));
+    expect(body).not.toMatch(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/);
+  });
+
   it("caps long messages at 2000 chars and marks the truncation", async () => {
     const f: Finding = { severity: "warning", file: "src/a.ts", line: 2, rule: "r", message: "x".repeat(5000) };
     const r = await runPrivileged({ findings: [f] });

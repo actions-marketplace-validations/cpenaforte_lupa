@@ -122,12 +122,15 @@ describe("workflow templates", () => {
   it("SARIF comments state the no-op condition and the skipped events", () => {
     const t = fs.readFileSync("docs/workflow-template.yml", "utf8");
     expect(t).toContain("issue_comment and workflow_dispatch");
-    expect(t).toMatch(/skipped \(no-op\) unless/);
+    expect(t).toMatch(/This step runs on every event/);
+    expect(t).toContain("issue_comment and workflow_dispatch");
+    expect(t).toContain("continue-on-error absorbs it");
   });
 
   it("vitest config excludes compiled lib/ and the dist/ bundle from collection", () => {
     const cfg = fs.readFileSync("vitest.config.ts", "utf8");
     expect(cfg).toContain('"lib/**"');
+    expect(cfg).toContain("configDefaults");
     expect(cfg).toContain('"dist/**"');
     expect(cfg).toContain("exclude:");
     expect(cfg).toContain("include:");
