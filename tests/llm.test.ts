@@ -123,7 +123,10 @@ describe("validateSampling", () => {
     expect(() => validateSampling({ model: "o1", temperature: 0.5, provider: "openai" })).toThrow(/reasoning/);
     expect(() => validateSampling({ model: "o3-mini", provider: "openai", n: 2 })).toThrow(/reasoning/);
     expect(() => validateSampling({ model: "claude-sonnet-5-5", temperature: 0, provider: "anthropic" })).toThrow(/400|reasoning/);
-    expect(() => validateSampling({ model: "x", provider: "anthropic", n: 2 })).toThrow(/n/);
+    expect(() => validateSampling({ model: "x", provider: "anthropic", n: 2 })).toThrow(
+      "Anthropic-compat supports only n=1; n must be 1 or unset",
+    );
+    expect(() => validateSampling({ model: "x", provider: "anthropic", n: 1 })).not.toThrow();
     expect(() => validateSampling({ model: "m", provider: "custom", apiStyle: "anthropic-messages", temperature: 0.5, topP: 0.9 })).toThrow(/both|together/);
     expect(() => validateSampling({ model: "generic-claude", provider: "anthropic", temperature: 0.5 })).not.toThrow();
     expect(() => validateSampling({ model: "generic-claude", provider: "anthropic", topP: 0.9 })).not.toThrow();
@@ -138,6 +141,38 @@ describe("validateSampling", () => {
     expect(() => validateSampling({ model: "claude-4.8", provider: "custom", temperature: 0.5 })).toThrow(/reasoning/);
     expect(() => validateSampling({ model: "claude-4.10", provider: "custom", topP: 0.5 })).toThrow(/reasoning/);
     expect(() => validateSampling({ model: "claude-haiku-5-5", provider: "anthropic", topP: 0.5 })).toThrow(/400|reasoning/);
+  });
+
+  it.each([
+    "claude-sonnet-5-5",
+    "claude-opus-5-5",
+    "claude-haiku-5-5",
+    "claude-sonnet-4-7",
+    "claude-opus-4-8",
+    "claude-4.10",
+    "claude-opus-4-10-20260101",
+    "claude-6",
+    "gpt-5.6-luna",
+    "gpt-6-luna",
+    "o1",
+    "o3-mini",
+  ])("strict family: %s rejects an explicit temperature on openai", (model) => {
+    expect(() => validateSampling({ model, provider: "openai", temperature: 0 })).toThrow(/reasoning/);
+  });
+
+  it.each([
+    "claude-haiku-4-5",
+    "claude-haiku-4-5-20251001",
+    "claude-sonnet-4-6",
+    "claude-opus-4-6",
+    "claude-opus-4-20250514",
+    "claude-3-5-sonnet-20241022",
+    "claude-3-7-sonnet-20250219",
+    "claude-2.1",
+  ])("not strict: %s accepts an explicit temperature on openai", (model) => {
+    expect(() => validateSampling({ model, provider: "openai", temperature: 0 })).not.toThrow();
+    expect(() => validateSampling({ model, provider: "openai", topP: 0.9, n: 2 })).not.toThrow();
+    expect(tokenFieldFor(model)).toBe("max_tokens");
   });
 
   it("generic anthropic-compat range checks: out-of-range throws, in-range passes", () => {
@@ -184,6 +219,23 @@ describe("callLlm request shape", () => {
     await callLlm(fakeEp("groq"), msgs(), opts("groq"));
     expect(lastBody().response_format.type).toBe("json_object");
     expect(lastBody().response_format.json_schema?.strict).not.toBe(true);
+  });
+
+  it.each(["mistral", "openrouter", "google", "groq", "ollama", "custom"])(
+    "%s gets json_object, never strict",
+    async (p) => {
+      await callLlm(fakeEp(p), msgs(), opts(p));
+      expect(lastBody().response_format).toEqual({ type: "json_object" });
+    },
+  );
+
+  it.each(["openai", "opencode-zen", "opencode-go"])("%s gets the full strict json_schema shape", async (p) => {
+    await callLlm(fakeEp(p), msgs(), opts(p));
+    expect(lastBody().response_format).toMatchObject({
+      type: "json_schema",
+      json_schema: { name: "pr_review", strict: true },
+    });
+    expect(lastBody().response_format.json_schema.schema.required).toContain("findings");
   });
 
   it("omits response_format for anthropic, non-strict for ollama, full shape for openai", async () => {
@@ -305,6 +357,39 @@ describe("retry and timeout", () => {
     expect(fetchCallCount()).toBe(2);
   });
 
+  it("honors Retry-After: waits the advertised seconds before the retry", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    stubFetch((_c, n) => (n === 1 ? json(429, {}, { "retry-after": "2" }) : json(200, okChat())));
+    const p = callLlm(fakeOpenAiEp(), msgs(), { ...opts(), timeoutSeconds: 30 });
+    await vi.advanceTimersByTimeAsync(1999);
+    expect(fetchCallCount()).toBe(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(fetchCallCount()).toBe(2);
+    expect(await p).toEqual({ ok: true, findings: [] });
+  });
+
+  it("clamps an oversized Retry-After to 5s", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    stubFetch((_c, n) => (n === 1 ? json(503, {}, { "retry-after": "60" }) : json(200, okChat())));
+    const p = callLlm(fakeOpenAiEp(), msgs(), { ...opts(), timeoutSeconds: 30 });
+    await vi.advanceTimersByTimeAsync(4999);
+    expect(fetchCallCount()).toBe(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(fetchCallCount()).toBe(2);
+    expect(await p).toEqual({ ok: true, findings: [] });
+  });
+
+  it("without Retry-After, backs off 500ms before the retry", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    stubFetch((_c, n) => (n === 1 ? json(500, {}) : json(200, okChat())));
+    const p = callLlm(fakeOpenAiEp(), msgs(), { ...opts(), timeoutSeconds: 30 });
+    await vi.advanceTimersByTimeAsync(499);
+    expect(fetchCallCount()).toBe(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(fetchCallCount()).toBe(2);
+    expect(await p).toEqual({ ok: true, findings: [] });
+  });
+
   it("gives up after one retry on persistent 5xx", async () => {
     stubFetch(() => json(500, {}));
     expect(await callLlm(fakeOpenAiEp(), msgs(), opts())).toMatchObject({ ok: false, reason: "http-error" });
@@ -327,12 +412,73 @@ describe("retry and timeout", () => {
 });
 
 describe("secret redaction", () => {
-  it("never leaks api key in result or throw", async () => {
+  it("never leaks api key in an http-500 result", async () => {
     const r = await callLlmFailing("sk-secret-xyz");
+    expect(r).toMatchObject({ ok: false, reason: "http-error" });
     expect(JSON.stringify(r)).not.toContain("sk-secret-xyz");
-    const err = await callLlmThrowing("sk-secret-xyz").catch((e) => String(e));
-    expect(String(err)).not.toContain("sk-secret-xyz");
+    expect(JSON.stringify(r)).toContain("[REDACTED]");
   }, 15000);
+
+  it("network throw echoing the key resolves to a redacted result (never rejects)", async () => {
+    const r = await callLlmThrowing("sk-secret-xyz");
+    expect(r).toMatchObject({ ok: false, reason: "http-error" });
+    expect(JSON.stringify(r)).not.toContain("sk-secret-xyz");
+    expect(JSON.stringify(r)).toContain("[REDACTED]");
+  });
+
+  it("redacts the key before truncating the body snippet (no partial key prefix leaks)", async () => {
+    const key = "sk-secret-xyz";
+    // `{"error":"` is 10 chars, so the key starts at index 195 and straddles the 200-char cut.
+    stubFetch(() => json(400, { error: "a".repeat(185) + key }));
+    const r = await callLlm(fakeEp("openai", key), msgs(), { ...opts(), apiKey: key });
+    expect(r).toMatchObject({ ok: false, reason: "http-error" });
+    expect(JSON.stringify(r)).not.toContain("sk-");
+    expect(JSON.stringify(r)).not.toContain(key);
+  });
+});
+
+describe("timeout bounds the body read", () => {
+  it("a stalled response body times out (no retry)", async () => {
+    stubFetch(
+      (c) =>
+        new Response(
+          new ReadableStream({
+            start(ctrl) {
+              c.init.signal?.addEventListener("abort", () =>
+                ctrl.error(Object.assign(new Error("aborted"), { name: "AbortError" })),
+              );
+            },
+          }),
+          { status: 200 },
+        ),
+    );
+    const r = await callLlm(fakeOpenAiEp(), msgs(), { ...opts(), timeoutSeconds: 1 });
+    expect(r).toMatchObject({ ok: false, reason: "timeout" });
+    expect(fetchCallCount()).toBe(1);
+  }, 15000);
+});
+
+describe("findings line coercion", () => {
+  it.each([
+    [0, undefined],
+    [-3, undefined],
+    [1.5, undefined],
+    ["7", undefined],
+    [null, undefined],
+    [1, 1],
+    [42, 42],
+  ])("line %j maps to %j", async (line, expected) => {
+    const content = JSON.stringify({
+      findings: [{ severity: "info", file: "a.ts", line, rule: "r", message: "m", suggestion: null }],
+    });
+    stubFetch(() => json(200, okChat(content)));
+    const r = await callLlm(fakeOpenAiEp(), msgs(), opts());
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.findings[0]!.line).toBe(expected);
+      expect("line" in r.findings[0]!).toBe(expected !== undefined);
+    }
+  });
 });
 
 describe("ensureOllama", () => {
@@ -359,11 +505,21 @@ describe("ensureOllama", () => {
     await expect(ensureOllama("http://localhost:11434/v1", "m")).rejects.toThrow(/disk full/);
   });
 
-  it("unreachable server throws before pulling", async () => {
+  it("unreachable server throws the pinned message before pulling", async () => {
     stubFetch(() => {
       throw new Error("ECONNREFUSED");
     });
-    await expect(ensureOllama("http://localhost:11434/v1", "m")).rejects.toThrow();
+    await expect(ensureOllama("http://localhost:11434/v1", "m")).rejects.toThrow(
+      "Ollama is not reachable at http://localhost:11434: ECONNREFUSED",
+    );
+    expect(fetchCallCount()).toBe(1);
+  });
+
+  it("non-2xx healthcheck throws the pinned message before pulling", async () => {
+    stubFetch(() => new Response("down", { status: 503 }));
+    await expect(ensureOllama("http://localhost:11434/v1", "m")).rejects.toThrow(
+      "Ollama is not reachable at http://localhost:11434 (HTTP 503)",
+    );
     expect(fetchCallCount()).toBe(1);
   });
 });

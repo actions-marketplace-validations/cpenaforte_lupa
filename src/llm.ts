@@ -5,10 +5,10 @@ import type { ResolvedEndpoint } from "./providers.js";
 export class InvalidJsonError extends Error {}
 export class OllamaMissingError extends Error {}
 
-/** STRICT family: sampling params are rejected unless at their defaults. */
-const STRICT_RE = /\bo\d|gpt-5|gpt-6|claude.*4\.([7-9]|\d{2,})|claude.*[5-9]/i;
-/** OpenAI reasoning models only (never Claude). */
-const REASONING_RE = /\bo\d|gpt-5|gpt-6/i;
+/** OpenAI reasoning models (strict family, and the max_completion_tokens family). */
+const OPENAI_REASONING_RE = /\bo\d|gpt-5|gpt-6/i;
+/** Claude version token: major, then an optional 1–2 digit minor not followed by another digit (so dates are never read as minors). */
+const CLAUDE_VERSION_RE = /claude[^\d]*(\d+)(?:[.-](\d{1,2})(?!\d))?/i;
 /** Providers that accept the full strict json_schema shape. */
 const FULL_SCHEMA_PROVIDERS: ReadonlySet<string> = new Set(["openai", "opencode-zen", "opencode-go"]);
 
@@ -25,6 +25,26 @@ export type LlmResult =
       detail: string;
     };
 
+type ResponseFormat = { type: "json_schema"; json_schema: typeof PR_REVIEW_SCHEMA } | { type: "json_object" };
+
+function errMessage(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
+}
+
+/**
+ * STRICT family (sampling params rejected unless at defaults):
+ * OpenAI reasoning models, or Claude major >= 5, or Claude 4.7 and later.
+ * Claude 4.0–4.6, Claude 3.x and dated ids are not strict.
+ */
+function isStrictFamily(model: string): boolean {
+  if (OPENAI_REASONING_RE.test(model)) return true;
+  const m = CLAUDE_VERSION_RE.exec(model);
+  if (m === null) return false;
+  const major = Number(m[1]);
+  const minor = m[2] === undefined ? 0 : Number(m[2]);
+  return major >= 5 || (major === 4 && minor >= 7);
+}
+
 function isAnthropicCompat(provider: string, apiStyle?: string): boolean {
   return provider === "anthropic" || apiStyle === "anthropic-messages";
 }
@@ -39,7 +59,7 @@ export function validateSampling(o: {
 }): void {
   const anthropic = isAnthropicCompat(o.provider, o.apiStyle);
 
-  if (STRICT_RE.test(o.model)) {
+  if (isStrictFamily(o.model)) {
     const explicit =
       (o.temperature !== undefined && o.temperature !== 1) ||
       o.topP !== undefined ||
@@ -70,8 +90,9 @@ export function validateSampling(o: {
   }
 }
 
+/** OpenAI reasoning only. Claude always uses max_tokens (Anthropic API). */
 export function tokenFieldFor(model: string): "max_completion_tokens" | "max_tokens" {
-  return REASONING_RE.test(model) ? "max_completion_tokens" : "max_tokens";
+  return OPENAI_REASONING_RE.test(model) ? "max_completion_tokens" : "max_tokens";
 }
 
 /** Strips a surrounding ```json or bare ``` fence, then parses. */
@@ -86,7 +107,11 @@ export function parseContent(raw: string): unknown {
 
 const SEVERITIES: ReadonlySet<unknown> = new Set(["info", "warning", "high"]);
 
-/** Hand-written structural check against PR_REVIEW_SCHEMA's required fields. */
+/**
+ * Hand-written structural check against PR_REVIEW_SCHEMA's required fields.
+ * Returns undefined when the response is invalid. Line is coerced rather than
+ * rejected: only an integer >= 1 is kept, anything else becomes undefined.
+ */
 function toFindings(v: unknown): Finding[] | undefined {
   if (typeof v !== "object" || v === null || Array.isArray(v)) return undefined;
   const list = (v as { findings?: unknown }).findings;
@@ -97,7 +122,6 @@ function toFindings(v: unknown): Finding[] | undefined {
     const i = item as Record<string, unknown>;
     if (!SEVERITIES.has(i.severity)) return undefined;
     if (typeof i.file !== "string" || typeof i.rule !== "string" || typeof i.message !== "string") return undefined;
-    if (!(i.line === null || Number.isInteger(i.line))) return undefined;
     if (!(i.suggestion === null || typeof i.suggestion === "string")) return undefined;
     const f: Finding = {
       severity: i.severity as Finding["severity"],
@@ -105,31 +129,63 @@ function toFindings(v: unknown): Finding[] | undefined {
       rule: i.rule,
       message: i.message,
     };
-    if (i.line !== null) f.line = i.line as number;
-    if (i.suggestion !== null) f.suggestion = i.suggestion as string;
+    if (Number.isInteger(i.line) && (i.line as number) >= 1) f.line = i.line as number;
+    if (typeof i.suggestion === "string") f.suggestion = i.suggestion;
     out.push(f);
   }
   return out;
 }
 
-function responseFormatFor(provider: string): unknown {
+function responseFormatFor(provider: string): ResponseFormat | undefined {
   if (FULL_SCHEMA_PROVIDERS.has(provider)) return { type: "json_schema", json_schema: PR_REVIEW_SCHEMA };
   if (provider === "anthropic") return undefined;
   return { type: "json_object" };
 }
 
 function redact(text: string, key: string): string {
-  return key === "" ? text : text.split(key).join("[REDACTED]");
+  return text.split(key).join("[REDACTED]");
 }
 
-function retryDelayMs(res: Response): number {
-  const raw = res.headers.get("retry-after");
+function retryDelayMs(raw: string | null): number {
   const secs = raw === null ? NaN : Number(raw);
   if (!Number.isFinite(secs)) return RETRY_BACKOFF_MS;
   return Math.min(Math.max(secs, 0) * 1000, MAX_RETRY_AFTER_MS);
 }
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+type Attempt =
+  | { kind: "fail"; result: LlmResult }
+  | { kind: "response"; status: number; ok: boolean; retryAfter: string | null; text: string };
+
+/**
+ * One HTTP attempt. The abort timer covers the headers AND the body read, and is
+ * cleared only after the body is fully read.
+ */
+async function attempt(ep: ResolvedEndpoint, payload: string, o: { timeoutSeconds: number; apiKey: string }): Promise<Attempt> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), o.timeoutSeconds * 1000);
+  try {
+    const res = await fetch(`${ep.baseUrl}${ep.path}`, {
+      method: "POST",
+      headers: { ...ep.headers, "Content-Type": "application/json" },
+      body: payload,
+      signal: controller.signal,
+    });
+    const text = await res.text();
+    return { kind: "response", status: res.status, ok: res.ok, retryAfter: res.headers.get("retry-after"), text };
+  } catch (e) {
+    if (controller.signal.aborted) {
+      return { kind: "fail", result: { ok: false, reason: "timeout", detail: `no complete response within ${o.timeoutSeconds}s` } };
+    }
+    return {
+      kind: "fail",
+      result: { ok: false, reason: "http-error", detail: redact(`request failed: ${errMessage(e)}`, o.apiKey) },
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 export async function callLlm(
   ep: ResolvedEndpoint,
@@ -151,7 +207,7 @@ export async function callLlm(
   try {
     validateSampling({ model: o.model, temperature: o.temperature, topP: o.topP, provider: o.provider });
   } catch (e) {
-    return { ok: false, reason: "unsupported", detail: redact((e as Error).message, key) };
+    return { ok: false, reason: "unsupported", detail: redact(errMessage(e), key) };
   }
 
   const body: Record<string, unknown> = {
@@ -170,46 +226,23 @@ export async function callLlm(
   }
   const payload = JSON.stringify(body);
 
-  const send = async (): Promise<Response | LlmResult> => {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), o.timeoutSeconds * 1000);
-    try {
-      return await fetch(`${ep.baseUrl}${ep.path}`, {
-        method: "POST",
-        headers: { ...ep.headers, "Content-Type": "application/json" },
-        body: payload,
-        signal: controller.signal,
-      });
-    } catch (e) {
-      if (controller.signal.aborted) {
-        return { ok: false, reason: "timeout", detail: `no response within ${o.timeoutSeconds}s` };
-      }
-      return { ok: false, reason: "http-error", detail: redact(`request failed: ${(e as Error).message}`, key) };
-    } finally {
-      clearTimeout(timer);
-    }
-  };
-
-  let res = await send();
-  if (!(res instanceof Response)) return res;
-  if (res.status === 429 || res.status >= 500) {
-    const delay = retryDelayMs(res);
-    await res.body?.cancel().catch(() => undefined);
-    await sleep(delay);
-    const again = await send();
-    if (!(again instanceof Response)) return again;
-    res = again;
+  let a = await attempt(ep, payload, o);
+  if (a.kind === "fail") return a.result;
+  // Retry once on 429 or 5xx only; the delay honors Retry-After (clamped).
+  if (a.status === 429 || a.status >= 500) {
+    await sleep(retryDelayMs(a.retryAfter));
+    a = await attempt(ep, payload, o);
+    if (a.kind === "fail") return a.result;
   }
 
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    const snippet = redact(text.slice(0, SNIPPET_CHARS), key);
-    return { ok: false, reason: "http-error", detail: `HTTP ${res.status}${snippet ? `: ${snippet}` : ""}` };
+  if (!a.ok) {
+    const snippet = redact(a.text, key).slice(0, SNIPPET_CHARS);
+    return { ok: false, reason: "http-error", detail: `HTTP ${a.status}${snippet ? `: ${snippet}` : ""}` };
   }
 
   let json: unknown;
   try {
-    json = await res.json();
+    json = JSON.parse(a.text);
   } catch {
     return { ok: false, reason: "invalid-json", detail: "response body is not JSON" };
   }
@@ -217,12 +250,16 @@ export async function callLlm(
     ?.choices?.[0];
   const msg = choice?.message;
 
+  // Refusal is honored everywhere except Anthropic-compat (which never sends it).
+  // Pinned union: a refusal maps to "content-filter".
   if (!anthropic && typeof msg?.refusal === "string" && msg.refusal !== "") {
     return { ok: false, reason: "content-filter", detail: "model refused the request" };
   }
+  // Pinned union: provider content filtering maps to "content-filter".
   if (choice?.finish_reason === "content_filter") {
     return { ok: false, reason: "content-filter", detail: "provider content filter stopped the response" };
   }
+  // Pinned union has no "length" member: truncation degrades as "invalid-json" (no diff-shrink retry).
   if (choice?.finish_reason === "length") {
     return { ok: false, reason: "invalid-json", detail: "response truncated (finish_reason=length)" };
   }
@@ -234,7 +271,7 @@ export async function callLlm(
   try {
     parsed = parseContent(msg.content);
   } catch (e) {
-    return { ok: false, reason: "invalid-json", detail: (e as Error).message };
+    return { ok: false, reason: "invalid-json", detail: errMessage(e) };
   }
   const findings = toFindings(parsed);
   if (findings === undefined) {
@@ -250,7 +287,12 @@ export async function callLlm(
  */
 export async function ensureOllama(baseUrl: string, model: string): Promise<void> {
   const root = baseUrl.replace(/\/+$/, "").replace(/\/v1$/, "");
-  const health = await fetch(`${root}/`, { signal: AbortSignal.timeout(REQUEST_TIMEOUT_HEALTH_MS) });
+  let health: Response;
+  try {
+    health = await fetch(`${root}/`, { signal: AbortSignal.timeout(REQUEST_TIMEOUT_HEALTH_MS) });
+  } catch (e) {
+    throw new Error(`Ollama is not reachable at ${root}: ${errMessage(e)}`);
+  }
   await health.text().catch(() => "");
   if (!health.ok) {
     throw new Error(`Ollama is not reachable at ${root} (HTTP ${health.status})`);
