@@ -1,7 +1,8 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, writeFileSync, chmodSync, existsSync, readFileSync, rmSync } from "node:fs";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { mkdtempSync, writeFileSync, chmodSync, existsSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import {
   semgrepArgv,
   shouldUploadSarif,
@@ -21,6 +22,12 @@ import {
   GITLEAKS_DIGEST,
   SEMGREP_VERSION,
 } from "../src/scanners.js";
+
+// Only writeFile is wrapped; everything else passes through. Tests opt into failures.
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  return { ...actual, writeFile: vi.fn(actual.writeFile) };
+});
 
 // ---- argv / gating / pins ------------------------------------------------
 
@@ -158,6 +165,7 @@ case "$*" in
     case "$SBOM_MODE" in
       fail) exit 4;;
       garbage) printf '%s' 'nope'; exit 0;;
+      valid-nonzero) printf '%s' '{"bomFormat":"CycloneDX"}'; exit 4;;
     esac
     printf '%s' '{"bomFormat":"CycloneDX"}'; exit 0;;
   *--severity*) if [ -n "$EMPTY_TRIVY" ]; then exit 5; fi;;
@@ -306,11 +314,35 @@ describe("runScanners", () => {
     expect(r1.sbomPath).toBeDefined();
     expect(r2.sbomPath).toBeDefined();
     const p1 = r1.sbomPath as string;
-    expect(p1.startsWith(tmp + "/sbom-")).toBe(true);
-    expect(p1.endsWith("/sbom.cdx.json")).toBe(true);
+    expect(basename(p1)).toBe("sbom.cdx.json");
+    expect(basename(dirname(p1)).startsWith("sbom-")).toBe(true);
+    expect(dirname(dirname(p1))).toBe(tmp);
     expect(p1).not.toBe(r2.sbomPath);
     expect(readFileSync(p1, "utf8")).toBe('{"bomFormat":"CycloneDX"}');
     expect(r1.findings.some((f) => f.rule === "sbom")).toBe(false);
+  });
+
+  it("sbom non-zero exit with valid CycloneDX stdout is accepted (parity with SARIF)", async () => {
+    process.env.PATH = makeBin({ semgrep: FAKE_SEMGREP_CLEAN, docker: FAKE_DOCKER });
+    process.env.SBOM_MODE = "valid-nonzero";
+    const r = await runScanners({ dir: tmp, baselineSha: "abc", sbom: true, outDir: tmp });
+    expect(r.sbomPath).toBeDefined();
+    expect(readFileSync(r.sbomPath as string, "utf8")).toBe('{"bomFormat":"CycloneDX"}');
+    expect(r.findings.some((f) => f.rule === "scanner-failed")).toBe(false);
+  });
+
+  it("sbom writeFile failure removes the sbom dir and returns an sbom-write warning, no throw", async () => {
+    process.env.PATH = makeBin({ semgrep: FAKE_SEMGREP_CLEAN, docker: FAKE_DOCKER });
+    vi.mocked(writeFile).mockRejectedValueOnce(new Error("disk full"));
+    const r = await runScanners({ dir: tmp, baselineSha: "abc", sbom: true, outDir: tmp });
+    expect(r.sbomPath).toBeUndefined();
+    expect(r.findings).toContainEqual({
+      severity: "warning",
+      file: "",
+      rule: "sbom-write",
+      message: "could not write SBOM: disk full",
+    });
+    expect(readdirSync(tmp).filter((n) => n.startsWith("sbom-"))).toEqual([]);
   });
 
   it("sbom non-zero exit is a scanner-failed warning and no sbomPath", async () => {

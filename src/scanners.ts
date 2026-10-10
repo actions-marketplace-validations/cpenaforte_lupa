@@ -270,15 +270,19 @@ export async function runScanners(o: {
     const sb = await run("docker", dockerArgs(dir, TRIVY_IMAGE, TRIVY_DIGEST, sbomArgv(".")), dir);
     if (sb.missing) {
       findings.push(warning("scanner-missing", "sbom unavailable: docker not found"));
-    } else if (sb.code !== 0 || !isJson(sb.stdout)) {
+    } else if (!isJsonObject(sb.stdout)) {
+      // Parity with SARIF (R2/R14): the exit code is not decisive; a valid document is accepted.
       findings.push(warning("scanner-failed", `sbom exited ${sb.code ?? "abnormally"} without a CycloneDX document`));
     } else {
+      let sbomDir: string | undefined;
       try {
-        const sbomDir = await mkdtemp(join(o.outDir ?? os.tmpdir(), "sbom-"));
+        sbomDir = await mkdtemp(join(o.outDir ?? os.tmpdir(), "sbom-"));
         const out = join(sbomDir, "sbom.cdx.json");
         await writeFile(out, sb.stdout, "utf8");
         sbomPath = out;
       } catch (e) {
+        // Remove the half-created dir so a failed write leaves nothing behind (R15).
+        if (sbomDir) await rm(sbomDir, { recursive: true, force: true }).catch(() => undefined);
         findings.push(warning("sbom-write", `could not write SBOM: ${(e as Error).message}`));
       }
     }
@@ -287,10 +291,10 @@ export async function runScanners(o: {
   return { findings, sbomPath };
 }
 
-function isJson(text: string): boolean {
+/** True when `text` parses as a JSON object (the SBOM's valid-document check). */
+function isJsonObject(text: string): boolean {
   try {
-    JSON.parse(text);
-    return true;
+    return isObj(JSON.parse(text));
   } catch {
     return false;
   }
