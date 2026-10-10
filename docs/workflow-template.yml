@@ -1,0 +1,111 @@
+# PR Reviewer: Fluxo A (unprivileged). Copy into .github/workflows/ of the consuming repository.
+# Replace OWNER and the action SHA below with a released commit of pr-reviewer.
+name: PR Reviewer
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  issue_comment:
+    types: [created]
+  pull_request_review:
+    types: [submitted]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "PR number to review"
+        required: false
+
+permissions:
+  contents: read
+  pull-requests: write
+  # issues: write is used only by the issue-comment fallback (PR_REVIEWER_ISSUE_FALLBACK).
+  issues: write
+
+concurrency:
+  group: pr-reviewer-${{ github.event.pull_request.number || github.event.issue.number || inputs.pr_number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    if: github.event_name != 'issue_comment' || github.event.issue.pull_request
+    runs-on: ubuntu-latest
+    env:
+      PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number || inputs.pr_number }}
+      OUT_DIR: ${{ runner.temp }}/pr-reviewer-out
+    steps:
+      - name: Checkout (full history, no persisted credentials)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve base and head SHAs from the API
+        id: shas
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          echo "base_sha=$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq .base.sha)" >> "$GITHUB_OUTPUT"
+          echo "head_sha=$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq .head.sha)" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch PR head and base, check out the PR head
+        env:
+          BASE_SHA: ${{ steps.shas.outputs.base_sha }}
+          HEAD_SHA: ${{ steps.shas.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin "pull/${PR_NUMBER}/head:refs/remotes/pr-reviewer/head-${PR_NUMBER}"
+          git fetch --no-tags origin "${BASE_SHA}"
+          git checkout --detach --force "${HEAD_SHA}"
+
+      - name: Write diff (base...head, never the runner HEAD)
+        env:
+          BASE_SHA: ${{ steps.shas.outputs.base_sha }}
+          HEAD_SHA: ${{ steps.shas.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$OUT_DIR"
+          git diff -U3 --no-ext-diff --no-color "${BASE_SHA}...${HEAD_SHA}" > "$OUT_DIR/diff.patch"
+
+      - name: Review
+        id: review
+        # Exit 2 (warning) must never block the merge; the gate step below decides.
+        continue-on-error: true
+        uses: OWNER/pr-reviewer@0000000000000000000000000000000000000000 # replace with a released SHA
+        env:
+          PR_REVIEWER_BASE_SHA: ${{ steps.shas.outputs.base_sha }}
+          PR_REVIEWER_HEAD_SHA: ${{ steps.shas.outputs.head_sha }}
+          PR_REVIEWER_ARTIFACT_DIR: ${{ runner.temp }}/pr-reviewer-out
+          PR_REVIEWER_TOKEN_TYPE: github-token
+          PR_REVIEWER_ISSUE_FALLBACK: "true"
+          SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+        with:
+          github_token: ${{ github.token }}
+          pr_number: ${{ github.event.pull_request.number || github.event.issue.number || inputs.pr_number }}
+          llm_provider: openai
+          llm_model: ${{ vars.PR_REVIEWER_MODEL }}
+          llm_api_key: ${{ secrets.LLM_API_KEY }}
+          fail_level: warning
+
+      - name: Upload review artifact
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: pr-reviewer-out
+          if-no-files-found: warn
+          path: |
+            ${{ runner.temp }}/pr-reviewer-out/diff.patch
+            ${{ runner.temp }}/pr-reviewer-out/pr-meta.json
+            ${{ runner.temp }}/pr-reviewer-out/findings.json
+            ${{ runner.temp }}/pr-reviewer-out/sbom.cdx.json
+
+      - name: Enforce fail_level (warning check never blocks)
+        if: always()
+        env:
+          EXIT_CODE: ${{ steps.review.outputs.exit-code }}
+        run: |
+          case "$EXIT_CODE" in
+            0|2) exit 0 ;;
+            *) echo "pr-reviewer: gate failed (exit code: ${EXIT_CODE:-none})" >&2; exit 1 ;;
+          esac
