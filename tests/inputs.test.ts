@@ -108,6 +108,16 @@ describe("getInputs fail_level / pr_number", () => {
     setInputs({ pr_number: "9007199254740993" });
     expect(() => getInputs()).toThrow(/pr_number/);
   });
+
+  it("accepts pr_number boundary '1' (minimum)", () => {
+    setInputs({ pr_number: "1" });
+    expect(getInputs().prNumber).toBe(1);
+  });
+
+  it("accepts pr_number boundary '9007199254740991' (MAX_SAFE_INTEGER)", () => {
+    setInputs({ pr_number: "9007199254740991" });
+    expect(getInputs().prNumber).toBe(Number.MAX_SAFE_INTEGER);
+  });
 });
 
 describe("getInputs enums (single source of truth)", () => {
@@ -175,6 +185,18 @@ describe("getInputs sampling (llm_temperature / llm_top_p)", () => {
       expect(() => getInputs()).toThrow(/llm_temperature/);
     },
   );
+
+  // Deliberate (controller ruling): decimal form is strict `-?\d+(\.\d+)?`.
+  // Leading-dot and explicit-plus forms are rejected, not normalized.
+  it.each([".5", "+0.5"])("rejects llm_temperature %s by design (strict decimal form)", (v) => {
+    setInputs({ llm_temperature: v });
+    expect(() => getInputs()).toThrow(/llm_temperature/);
+  });
+
+  it.each([".5", "+0.5"])("rejects llm_top_p %s by design (strict decimal form)", (v) => {
+    setInputs({ llm_top_p: v });
+    expect(() => getInputs()).toThrow(/llm_top_p/);
+  });
 
   it.each(["Infinity", "NaN", "0x10", "1e3"])("rejects llm_top_p %s naming the input", (v) => {
     setInputs({ llm_top_p: v });

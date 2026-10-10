@@ -56,14 +56,18 @@ function readString(name: string, fallback = ""): string {
   return v === "" ? fallback : v;
 }
 
-function readInt(name: string, fallback: number, min: number): number {
-  const raw = readString(name);
-  if (raw === "") return fallback;
+function parseIntValue(name: string, raw: string, min: number): number {
   const n = Number(raw);
   if (!/^\d+$/.test(raw) || !Number.isSafeInteger(n) || n < min) {
     throw new Error(`Invalid ${name} "${raw}": expected an integer >= ${min} (safe integer)`);
   }
   return n;
+}
+
+function readInt(name: string, fallback: number, min: number): number {
+  const raw = readString(name);
+  if (raw === "") return fallback;
+  return parseIntValue(name, raw, min);
 }
 
 function readOptionalDecimal(name: string): number | undefined {
@@ -115,8 +119,9 @@ export function getInputs(): ActionInputs {
   };
 }
 
+// Single read: empty input means "not set" (null); otherwise validated like readInt.
 function readOptionalInt(name: string, min: number): number | null {
   const raw = readString(name);
   if (raw === "") return null;
-  return readInt(name, 0, min);
+  return parseIntValue(name, raw, min);
 }
