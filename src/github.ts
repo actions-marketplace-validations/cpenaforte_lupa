@@ -37,7 +37,7 @@ export interface PostReviewOptions {
 
 const OFF_DIFF = /could not be resolved|part of the diff|line.*(diff|resolve)/i;
 // Commit-centric only: a bare "sha" would also match unrelated text such as "sha256:...".
-const STALE_SHA = /commit[ _]id|head[- ]commit|not a valid commit/i;
+const STALE_SHA = /commit[ _-]id|head[- ]commit|not a valid commit/i;
 
 interface HttpLikeError {
   status?: unknown;
@@ -92,7 +92,8 @@ function repoOf(): { owner: string; repo: string } {
 function foldComments(body: string, comments: InlineComment[]): string {
   if (comments.length === 0) return body;
   const items = comments.map((c) => {
-    const text = c.body.replace(/\r\n?/g, "\n");
+    // Drop trailing whitespace-only lines so a body ending in "\r" or "\n" adds no bare "  " line.
+    const text = c.body.replace(/\r\n?/g, "\n").replace(/(\n[ \t]*)+$/, "");
     return `- ${c.path}:${c.line}\n  ${text.replace(/\n/g, "\n  ")}`;
   });
   return `${body}\n\n**Findings not placed inline:**\n${items.join("\n")}`;

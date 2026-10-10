@@ -215,6 +215,18 @@ describe("postReview", () => {
     expect(body).not.toContain("\r");
   });
 
+  it("a comment body ending in CR adds no trailing whitespace-only line to the fold", async () => {
+    const trailing: ReviewPayload = {
+      ...payload,
+      comments: [{ path: "d.ts", line: 5, side: "RIGHT", body: "only line\r" }],
+    };
+    const f = fakeOctokit([httpError(422, OFF_DIFF_MSG, OFF_DIFF_ERRORS), "ok"]);
+    await postReview(f.octokit, 1, trailing);
+    const body = String(f.reviewArgs[1].body);
+    expect(body.endsWith("- d.ts:5\n  only line")).toBe(true);
+    expect(body).not.toMatch(/\n[ \t]+$/);
+  });
+
   it("stale then off-diff: three POSTs, ends as a general-only COMMENT with empty comments", async () => {
     const f = fakeOctokit([httpError(422, STALE_MSG), httpError(422, OFF_DIFF_MSG, OFF_DIFF_ERRORS), "ok"]);
     const r = await postReview(f.octokit, 1, payload);
@@ -258,6 +270,13 @@ describe("postReview", () => {
 
   it("a 422 whose message says 'Commit ID' (with a space) takes the stale path", async () => {
     const f = fakeOctokit([httpError(422, "Unprocessable Entity: Commit ID is out of date"), "ok"]);
+    const r = await postReview(f.octokit, 1, payload);
+    expect(f.calls).toEqual(["post", "get", "post"]);
+    expect(r.retriedWithNewSha).toBe(true);
+  });
+
+  it("a 422 whose message says 'commit-id' (hyphen) takes the stale path", async () => {
+    const f = fakeOctokit([httpError(422, "Unprocessable Entity: commit-id is out of date"), "ok"]);
     const r = await postReview(f.octokit, 1, payload);
     expect(f.calls).toEqual(["post", "get", "post"]);
     expect(r.retriedWithNewSha).toBe(true);
