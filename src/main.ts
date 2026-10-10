@@ -21,7 +21,7 @@ import { postIssueFallback, postReview, ReadonlyTokenError, resolvePrNumber, sho
 import { getInputs, type ActionInputs } from "./inputs.js";
 import { callByStyle, callLlm, ensureOllama, type LlmResult } from "./llm.js";
 import { buildMessages, linkedIssueNumber } from "./prompt.js";
-import { resolveEndpoint, validateModelExists, type ResolvedEndpoint } from "./providers.js";
+import { authHeaderFor, resolveEndpoint, validateModelExists, type ResolvedEndpoint } from "./providers.js";
 import { buildBody, eventFor, exitFor, mapToComments, type ReviewPayload } from "./review.js";
 import { runScanners, type ScannerResult } from "./scanners.js";
 
@@ -67,7 +67,7 @@ export interface Analysis {
   runScanners(o: Parameters<typeof runScanners>[0]): Promise<ScannerResult>;
   runL2(dir: string): Promise<Finding[]>;
   ensureOllama(baseUrl: string, model: string, o: { timeoutSeconds?: number; apiKey?: string }): Promise<void>;
-  validateModelExists(baseUrl: string, model: string, apiKey: string): Promise<boolean>;
+  validateModelExists(baseUrl: string, model: string, apiKey: string, auth?: { header?: string }): Promise<boolean>;
   callLlm(ep: ResolvedEndpoint, messages: { system: string; user: string }, o: Parameters<typeof callLlm>[2]): Promise<LlmResult>;
 }
 
@@ -469,7 +469,13 @@ async function slowPath(
     }
   }
   try {
-    const listed = await deps.analysis.validateModelExists(ep.baseUrl, i.llmModel, i.llmApiKey);
+    // R1: the /models existence check authenticates like the endpoint it talks to.
+    const listed = await deps.analysis.validateModelExists(
+      ep.baseUrl,
+      i.llmModel,
+      i.llmApiKey,
+      authHeaderFor(i.llmProvider, ep.apiStyle),
+    );
     if (!listed) {
       core.warning(`slow path skipped: model "${i.llmModel}" is not listed by the provider`);
       return undefined;

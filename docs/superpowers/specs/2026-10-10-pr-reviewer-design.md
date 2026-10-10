@@ -102,7 +102,7 @@ Objetivo: `llm_api_style` explícito e `auto` passam a suportar todos os endpoin
 - Modelos: Claude (Opus/Sonnet/Haiku/Fable) + Qwen-Plus/Flash + MiniMax no Go via `.../messages`.
 
 ### 9.3 `google-models` — POST `{base}/v1beta/models/<id>:generateContent`
-- Para Zen (`.../zen/v1/models/<id>`): segue o path do catálogo com a mesma semântica (adapter detecta `/models/` no endpoint e usa corpo Google).
+- Para Zen (`.../zen/v1`) e Go (`.../zen/go/v1`): a chamada HTTP é o protocolo Google real, `POST {base}/models/<id>:generateContent`. A entrada `/models/<id>` do catálogo Zen/Go é o descritor de pacote do AI SDK (SDK package descriptor), não o endpoint de inferência — o adapter usa o path `:generateContent` com o corpo Google.
 - Request: `{contents: [{role:"user",parts:[{text}]}], systemInstruction: {parts:[{text}]}, generationConfig: {responseMimeType:"application/json", responseSchema:<schema>, maxOutputTokens}}`. Sem `responseSchema` se 400 → retry sem + parse.
 - Response: `candidates[0].content.parts[]` text → parse. `finishReason`: `STOP`=ok, `MAX_TOKENS`=degradar, `SAFETY`/outros=pular sem retry.
 - Auth: `key` via query `?key=` OU header `x-goog-api-key` (preferir header; nunca logar).

@@ -4,6 +4,7 @@ import {
   resolveEndpoint,
   UnsupportedModelError,
   validateModelExists,
+  authHeaderFor,
   NON_CHAT,
 } from "../src/providers.js";
 
@@ -81,6 +82,27 @@ describe("resolveEndpoint", () => {
 
   it("explicit v2 api_style is functional and picks the adapter path", () => {
     expect(resolveEndpoint({ ...base, llmProvider: "openai", llmModel: "m", llmApiStyle: "anthropic-messages" }).path).toBe("/messages");
+  });
+
+  // R3: the /openai-suffix strip is surfaced when it rewrites a USER-SUPPLIED base URL.
+  it("warns when a user-supplied custom base ending in /openai is rewritten for google-models", () => {
+    const r = resolveEndpoint({
+      ...base,
+      llmProvider: "custom",
+      llmBaseUrl: "https://x/v1beta/openai",
+      llmModel: "gemini-x",
+      llmApiStyle: "google-models",
+    });
+    expect(r.baseUrl).toBe("https://x/v1beta");
+    expect(core.warning).toHaveBeenCalledTimes(1);
+    const msg = vi.mocked(core.warning).mock.calls[0][0] as string;
+    expect(msg).toContain("https://x/v1beta/openai");
+    expect(msg).toContain("https://x/v1beta");
+  });
+
+  it("preset google base rewrite (not user-supplied) does not warn", () => {
+    resolveEndpoint({ ...base, llmProvider: "google", llmModel: "gemini-x", llmApiStyle: "google-models" });
+    expect(core.warning).not.toHaveBeenCalled();
   });
 
   it("prNumber null ok, go without number omits session header", () => {
@@ -253,6 +275,27 @@ describe("validateModelExists", () => {
     const init = fetchMock.mock.calls[0][1] as RequestInit;
     expect((init.headers as Record<string, string>).Authorization).toBe("Bearer k");
     expect(await validateModelExists("https://x", "missing", "k")).toBe(false);
+  });
+
+  // R1: Google-native endpoints authenticate with x-goog-api-key, never Authorization.
+  it("google-native sends x-goog-api-key and NOT Authorization", async () => {
+    const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) =>
+      new Response(JSON.stringify({ data: [{ id: "m" }] }), { status: 200 }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    expect(await validateModelExists("https://x", "m", "SECRETKEY", { header: "x-goog-api-key" })).toBe(true);
+    const headers = (fetchMock.mock.calls[0][1] as RequestInit).headers as Record<string, string>;
+    expect(headers["x-goog-api-key"]).toBe("SECRETKEY");
+    expect(headers.Authorization).toBeUndefined();
+    expect(fetchMock.mock.calls[0][0]).not.toContain("SECRETKEY");
+  });
+
+  // R1: the auth header is derived from provider + resolved style at the call site.
+  it("authHeaderFor: google + google-models is x-goog-api-key, everything else is Authorization", () => {
+    expect(authHeaderFor("google", "google-models").header).toBe("x-goog-api-key");
+    expect(authHeaderFor("google", "openai-chat").header).toBe("Authorization");
+    expect(authHeaderFor("opencode-zen", "google-models").header).toBe("Authorization");
+    expect(authHeaderFor("custom", "anthropic-messages").header).toBe("Authorization");
   });
 
   // R4 / F2

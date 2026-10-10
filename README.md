@@ -64,8 +64,8 @@ The default wire format is `openai-chat`: `POST {base_url}/chat/completions` wit
 | `mistral` | `https://api.mistral.ai/v1` | `openai-chat`. |
 | `openrouter` | `https://openrouter.ai/api/v1` | `openai-chat`. Model slugs look like `author/model`. |
 | `ollama` | `http://localhost:11434/v1` | `openai-chat`. Needs a daemon in the job (`services:` or a setup step), a healthcheck, `ollama pull <model>` before the run, `llm_api_key: dummy`, and no strict schema. |
-| `opencode-zen` | `https://opencode.ai/zen/v1` | Chat-capable models use `openai-chat`; Claude/Qwen3.7, GPT/Grok and Gemini models are routed by `auto` to `anthropic-messages`, `openai-responses` and `google-models`. |
-| `opencode-go` | `https://opencode.ai/zen/go/v1` | Same split as Zen, with a different model list: Qwen3.7/3.8 and MiniMax join the Claude models on `anthropic-messages`; Gemini models on `google-models`. |
+| `opencode-zen` | `https://opencode.ai/zen/v1` | Chat-capable models (e.g. `deepseek-*`, `glm-*`, `kimi-*`, `qwen3.8-max`, `minimax-m3`) use `openai-chat`. `auto` routes the rest: `claude-*` and `qwen3.7-*` to `anthropic-messages`; `gpt-6-luna`, `gpt-6.1-sol`, `gpt-6-astra` and `grok-4.6/4.7` to `openai-responses`; `gemini-*` to `google-models`. |
+| `opencode-go` | `https://opencode.ai/zen/go/v1` | Chat-capable models (e.g. `deepseek-*`, `glm-*`, `kimi-*`, `mimo-*`) use `openai-chat`. `auto` routes the rest: `claude-*`, `qwen3.7-*`, `qwen3.8-*`, `minimax-m3` and `minimax-m2.7` to `anthropic-messages`; `gpt-6-luna`, `gpt-6.1-sol`, `gpt-6-astra` and `grok-4.6/4.7` to `openai-responses`, plus the Go-only `gpt-5.6-luna` and `muse-spark-1.3-contributor`; `gemini-*` to `google-models`. |
 | `custom` | (you set `llm_base_url`) | `openai-chat`, or a v2 style with the matching path; `custom-path` for a path-only override. |
 
 ### opencode-zen and opencode-go
@@ -82,7 +82,7 @@ The default wire format is `openai-chat`: `POST {base_url}/chat/completions` wit
 |---|---|---|
 | `auto` (default) | Resolved per `(provider, model)` from the versioned map, then chat or the adapter below. | Everything, automatically. |
 | `openai-chat` | `POST {base}/chat/completions` | `openai`, `groq`, `mistral`, `openrouter`, `ollama`, `custom`; `anthropic` and `google` through their OpenAI-compatible layers; chat-capable Zen/Go models. |
-| `openai-responses` | `POST {base}/responses` | Zen/Go `gpt-6*`, `gpt-5.6-luna`, `grok-4.6/4.7`, `muse-spark-1.3-contributor`. Also native on the `openai` preset. |
+| `openai-responses` | `POST {base}/responses` | Zen and Go: `gpt-6-luna`, `gpt-6.1-sol`, `gpt-6-astra`, `grok-4.6/4.7`; Go-only: `gpt-5.6-luna`, `muse-spark-1.3-contributor`. Also native on the `openai` preset. |
 | `anthropic-messages` | `POST {base}/messages` | Zen/Go `claude-*`; Go `qwen3.8-*`, `qwen3.7-*`, `minimax-m3`, `minimax-m2.7`; Zen `qwen3.7-*`. Also native on the `anthropic` preset. |
 | `google-models` | `POST {base}/models/<id>:generateContent` | Zen/Go `gemini-*`. Also native on the `google` preset. |
 | `custom-path` | Path-only override via `llm_path` (experimental). | Custom OpenAI-compatible endpoints. |

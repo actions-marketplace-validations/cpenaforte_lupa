@@ -1,6 +1,6 @@
 import type { Finding } from "./fastpath.js";
 import { PR_REVIEW_SCHEMA } from "./prompt.js";
-import type { ResolvedEndpoint, ResolvedApiStyle } from "./providers.js";
+import type { ResolvedEndpoint } from "./providers.js";
 import { callGoogle } from "./adapters/google.js";
 import { callMessages } from "./adapters/messages.js";
 import { callResponses } from "./adapters/responses.js";
@@ -313,8 +313,9 @@ export async function callByStyle(
     provider: string;
   },
 ): Promise<LlmResult> {
-  const style: ResolvedApiStyle = ep.apiStyle ?? "openai-chat";
-  switch (style) {
+  // No fallback for a missing/malformed apiStyle: resolveEndpoint always sets it,
+  // so an endpoint without one is a programming error that should fail loudly.
+  switch (ep.apiStyle) {
     case "openai-responses":
       return callResponses(ep, messages, o);
     case "anthropic-messages":

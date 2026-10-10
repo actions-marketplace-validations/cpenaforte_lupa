@@ -60,6 +60,9 @@ export function googleSchema(schema: Record<string, unknown>): Record<string, un
   for (const [k, v] of Object.entries(schema)) {
     if (k === "additionalProperties") continue;
     if (k === "type" && Array.isArray(v)) {
+      // Single-type assumption: the schema subset used here has at most one
+      // non-null type (e.g. ["integer", "null"]). A true multi-type union would
+      // keep only its first member here; real unions need an anyOf expansion.
       const types = v.filter((t): t is string => typeof t === "string" && t !== "null");
       if (v.includes("null")) out.nullable = true;
       if (types.length > 0) out.type = types[0];

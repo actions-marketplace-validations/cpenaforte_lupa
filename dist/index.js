@@ -25750,8 +25750,7 @@ async function callLlm(ep, messages, o) {
 }
 var PULL_TIMEOUT_DEFAULT_S = 300;
 async function callByStyle(ep, messages, o) {
-  const style = ep.apiStyle ?? "openai-chat";
-  switch (style) {
+  switch (ep.apiStyle) {
     case "openai-responses":
       return callResponses(ep, messages, o);
     case "anthropic-messages":
@@ -25907,6 +25906,9 @@ function resolveEndpoint(o) {
     }
   }
   const effectiveBase = apiStyle === "google-models" && baseUrl2.endsWith("/openai") ? baseUrl2.slice(0, -"/openai".length) : baseUrl2;
+  if (effectiveBase !== baseUrl2 && o.llmBaseUrl !== "") {
+    warning(`llm_base_url "${baseUrl2}" rewritten to "${effectiveBase}": google-models needs the API root, not the OpenAI-compat "/openai" suffix`);
+  }
   const rawPath = o.llmPath !== "" ? o.llmPath : defaultPathFor(apiStyle, o.llmModel);
   const normalized = rawPath.startsWith("/") ? rawPath : `/${rawPath}`;
   const path = normalized.split(/[?#]/)[0];
@@ -25931,13 +25933,22 @@ function resolveEndpoint(o) {
   }
   return { baseUrl: effectiveBase, path, headers, apiStyle };
 }
-async function validateModelExists(baseUrl2, model, apiKey) {
+function authHeaderFor(provider, apiStyle) {
+  return { header: provider === "google" && apiStyle === "google-models" ? "x-goog-api-key" : "Authorization" };
+}
+async function validateModelExists(baseUrl2, model, apiKey, auth2 = {}) {
   const url = `${baseUrl2.replace(/\/+$/, "")}/models`;
+  const headers = { "User-Agent": USER_AGENT };
+  if (auth2.header === "x-goog-api-key") {
+    headers["x-goog-api-key"] = apiKey;
+  } else {
+    headers.Authorization = `Bearer ${apiKey}`;
+  }
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), VALIDATE_TIMEOUT_MS);
   try {
     const res = await fetch(url, {
-      headers: { Authorization: `Bearer ${apiKey}`, "User-Agent": USER_AGENT },
+      headers,
       signal: controller.signal
     });
     if (res.status === 404) {
@@ -26560,7 +26571,7 @@ async function slowPath(env, deps, pr, fast, promptText, issueBody, skipped) {
     }
   }
   try {
-    const listed = await deps.analysis.validateModelExists(ep.baseUrl, i.llmModel, i.llmApiKey);
+    const listed = await deps.analysis.validateModelExists(ep.baseUrl, i.llmModel, i.llmApiKey, authHeaderFor(i.llmProvider, ep.apiStyle));
     if (!listed) {
       warning(`slow path skipped: model "${i.llmModel}" is not listed by the provider`);
       return void 0;

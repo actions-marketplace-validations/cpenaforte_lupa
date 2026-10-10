@@ -171,6 +171,12 @@ export function resolveEndpoint(o: ResolveEndpointOptions): ResolvedEndpoint {
   // native generateContent path hangs off the API root, so drop that segment.
   const effectiveBase =
     apiStyle === "google-models" && baseUrl.endsWith("/openai") ? baseUrl.slice(0, -"/openai".length) : baseUrl;
+  // R3: surface the rewrite when it changes a USER-SUPPLIED custom base URL.
+  if (effectiveBase !== baseUrl && o.llmBaseUrl !== "") {
+    core.warning(
+      `llm_base_url "${baseUrl}" rewritten to "${effectiveBase}": google-models needs the API root, not the OpenAI-compat "/openai" suffix`,
+    );
+  }
 
   const rawPath = o.llmPath !== "" ? o.llmPath : defaultPathFor(apiStyle, o.llmModel);
   // Normalize (leading slash), then strip query and fragment from the returned
@@ -207,8 +213,20 @@ export function resolveEndpoint(o: ResolveEndpointOptions): ResolvedEndpoint {
 }
 
 /**
+ * Auth header for the GET {base}/models existence check, derived from
+ * provider + resolved style at the call site: Google-native endpoints
+ * (provider `google` speaking the google-models protocol) use `x-goog-api-key`;
+ * everything else — including Zen/Go catalog checks — keeps Bearer.
+ */
+export function authHeaderFor(provider: string, apiStyle: ResolvedApiStyle): { header: string } {
+  return { header: provider === "google" && apiStyle === "google-models" ? "x-goog-api-key" : "Authorization" };
+}
+
+/**
  * Checks that `model` is listed by GET {baseUrl}/models. Checks id presence
  * only; never infers or changes the endpoint used for chat requests.
+ * `auth.header` (see authHeaderFor) picks the auth header name; the default
+ * keeps `Authorization: Bearer`. Non-2xx behavior is unchanged.
  *
  * - 2xx with a JSON `data` array: true iff some entry has id === model.
  * - 404: false (model list endpoint absent / model not found).
@@ -220,13 +238,20 @@ export async function validateModelExists(
   baseUrl: string,
   model: string,
   apiKey: string,
+  auth: { header?: string } = {},
 ): Promise<boolean> {
   const url = `${baseUrl.replace(/\/+$/, "")}/models`;
+  const headers: Record<string, string> = { "User-Agent": USER_AGENT };
+  if (auth.header === "x-goog-api-key") {
+    headers["x-goog-api-key"] = apiKey;
+  } else {
+    headers.Authorization = `Bearer ${apiKey}`;
+  }
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), VALIDATE_TIMEOUT_MS);
   try {
     const res = await fetch(url, {
-      headers: { Authorization: `Bearer ${apiKey}`, "User-Agent": USER_AGENT },
+      headers,
       signal: controller.signal,
     });
     if (res.status === 404) {

@@ -74,6 +74,7 @@ interface Rec {
   issueBodyFetched?: number;
   llmCalled: number;
   ollamaCalled: number;
+  validateAuth?: { header?: string };
   scanEnv?: NodeJS.ProcessEnv;
   l2Env?: NodeJS.ProcessEnv;
 }
@@ -229,7 +230,8 @@ async function runWithMocks(o: MockOpts = {}) {
       ensureOllama: async () => {
         rec.ollamaCalled += 1;
       },
-      validateModelExists: async () => {
+      validateModelExists: async (_baseUrl, _model, _key, auth) => {
+        rec.validateAuth = auth;
         if (o.validateModel === "reject") throw new Error("GET /models failed with HTTP 500");
         return o.validateModel !== false;
       },
@@ -250,6 +252,7 @@ async function runWithMocks(o: MockOpts = {}) {
     reviewAttempts: rec.reviewAttempts,
     issueComments: rec.issueComments,
     getPrCalls: rec.getPrCalls,
+    validateAuth: rec.validateAuth,
     body: rec.reviews.at(-1)?.body,
     llmCalled: rec.llmCalled,
     scanEnv: rec.scanEnv,
@@ -566,6 +569,18 @@ describe("run() orchestration", () => {
       { role: "system", content: expect.any(String) },
       { role: "user", content: expect.any(String) },
     ]);
+  });
+
+  // R1: the slow path derives the /models auth header from provider + resolved style.
+  it("models check uses Authorization Bearer by default", async () => {
+    const r = await runWithMocks({});
+    expect(r.validateAuth?.header).toBe("Authorization");
+  });
+
+  it("models check uses x-goog-api-key for the google preset speaking google-models", async () => {
+    const r = await runWithMocks({ llmProvider: "google", llmApiStyle: "google-models", llmModel: "gemini-x", llmBaseUrl: "" });
+    expect(r.validateAuth?.header).toBe("x-goog-api-key");
+    expect(r.slowPathSkipped).toBe(false);
   });
 
   it("a failed sbom copy is a warning and the run continues", async () => {
