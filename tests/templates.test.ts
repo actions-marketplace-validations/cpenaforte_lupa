@@ -86,6 +86,53 @@ describe("workflow templates", () => {
     expect(t).not.toMatch(/^ {2}security-events:\s*write/m);
   });
 
+  it("explicit fetches use portable base64 (no GNU-only -w0)", () => {
+    const t = fs.readFileSync("docs/workflow-template.yml", "utf8");
+    expect(t).not.toContain("-w0");
+    expect(t).toContain("base64 | tr -d '\\n'");
+  });
+
+  it("every step name is valid as a plain YAML scalar or is quoted (colon-safe)", () => {
+    for (const file of ["docs/workflow-template.yml", "docs/workflow-template-privileged.yml"]) {
+      const text = fs.readFileSync(file, "utf8");
+      for (const line of text.split("\n")) {
+        const m = /^\s*(?:- )?name:\s*(.+)$/.exec(line);
+        if (!m) continue;
+        const v = m[1].trim();
+        if (v.startsWith('"') || v.startsWith("'")) continue;
+        expect(v, `${file}: ${line}`).not.toMatch(/:\s/);
+        expect(v, `${file}: ${line}`).not.toMatch(/\s#/);
+      }
+    }
+  });
+
+  it("the SARIF step name is quoted (the colon in its name broke the YAML before)", () => {
+    const t = fs.readFileSync("docs/workflow-template.yml", "utf8");
+    expect(t).toContain('- name: "Upload SARIF (same-repo PRs; needs security-events: write above)"');
+  });
+
+  it("trust model comment states the precise claim and the /proc-vector limitation", () => {
+    const t = fs.readFileSync("docs/workflow-template.yml", "utf8");
+    expect(t).toContain("L2 native toolchains");
+    expect(t).toContain("/proc-vector");
+    expect(t).toContain("separate the review of untrusted code");
+    expect(t).toContain("This is NOT a sandbox");
+  });
+
+  it("SARIF comments state the no-op condition and the skipped events", () => {
+    const t = fs.readFileSync("docs/workflow-template.yml", "utf8");
+    expect(t).toContain("issue_comment and workflow_dispatch");
+    expect(t).toMatch(/skipped \(no-op\) unless/);
+  });
+
+  it("vitest config excludes compiled lib/ and the dist/ bundle from collection", () => {
+    const cfg = fs.readFileSync("vitest.config.ts", "utf8");
+    expect(cfg).toContain('"lib/**"');
+    expect(cfg).toContain('"dist/**"');
+    expect(cfg).toContain("exclude:");
+    expect(cfg).toContain("include:");
+  });
+
   it("unprivileged template uploads SARIF behind same-repo and permission guards", () => {
     const t = fs.readFileSync("docs/workflow-template.yml", "utf8");
     expect(t).toMatch(/upload-sarif@[0-9a-f]{40}/);

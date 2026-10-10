@@ -2,13 +2,17 @@
 # Replace OWNER and the action SHA below with a released commit of pr-reviewer.
 #
 # Trust model (read before enabling):
-# - issue_comment and pull_request_review run in the BASE repository context WITH secrets, and
-#   the review checks out and executes PR-controlled code (scanners, linters). Those triggers are
-#   gated to trusted author associations (OWNER, MEMBER, COLLABORATOR) by the action.
-# - The exec environment is scrubbed (no *TOKEN*, *KEY*, *SECRET*, *PASSWORD*, *AUTH*, GITHUB_TOKEN,
-#   ACTIONS_*), so PR code cannot read the GitHub token or the LLM key from the environment.
-# - Accepted risk: a malicious trusted-author PR could still run code on the ephemeral runner.
-#   The runner holds no secrets after the scrub and is discarded with the job.
+# - issue_comment and pull_request_review run in the BASE repository context WITH secrets. Those
+#   triggers are gated to trusted author associations (OWNER, MEMBER, COLLABORATOR) by the action.
+# - On FORK PRs with secrets in scope (any non-pull_request trigger, a writable App token, or an
+#   LLM key), the action does NOT execute L2 native toolchains (linters, build tooling). Semgrep,
+#   gitleaks and trivy still run as trusted, data-driven binaries.
+# - Every scanner and L2 process gets a scrubbed environment (no *TOKEN*, *KEY*, *SECRET*,
+#   *PASSWORD*, *AUTH*, GITHUB_TOKEN, ACTIONS_*). This is NOT a sandbox: a residual
+#   /proc-vector remains (a process can read its own parent's environment and memory maps).
+#   Known limitation. For high-threat repositories, separate the review of untrusted code into a
+#   workflow with no secrets and no base-repository context, and post results through the
+#   privileged workflow (docs/workflow-template-privileged.yml) only.
 name: PR Reviewer
 
 on:
@@ -72,7 +76,7 @@ jobs:
           # Without a token the fetch is anonymous (public repositories only).
           git_auth() {
             if [ -n "${FETCH_TOKEN:-}" ]; then
-              basic=$(printf 'x-access-token:%s' "$FETCH_TOKEN" | base64 -w0)
+              basic=$(printf 'x-access-token:%s' "$FETCH_TOKEN" | base64 | tr -d '\n')
               export GIT_CONFIG_COUNT=1
               export GIT_CONFIG_KEY_0=http.extraheader
               export GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $basic"
@@ -115,9 +119,11 @@ jobs:
           llm_api_key: ${{ secrets.LLM_API_KEY }}
           fail_level: warning
 
-      - name: Upload SARIF (same-repo PRs; needs security-events: write above)
-        # Fork PRs get a read-only token, so the upload is limited to same-repository PRs.
-        # continue-on-error: a missing permission or disabled code scanning never fails the job.
+      # The SARIF step is evaluated on every run. It is skipped (no-op) unless the event has a
+      # same-repository PR head AND security-events: write is uncommented above. It is silently
+      # skipped on issue_comment and workflow_dispatch, because those events carry no head context.
+      # continue-on-error: a missing permission or disabled code scanning never fails the job.
+      - name: "Upload SARIF (same-repo PRs; needs security-events: write above)"
         if: always() && github.event.pull_request.head.repo.full_name == github.repository
         continue-on-error: true
         uses: github/codeql-action/upload-sarif@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3

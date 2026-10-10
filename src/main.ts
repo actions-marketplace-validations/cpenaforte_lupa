@@ -55,6 +55,8 @@ export interface PrInfo {
 /** GitHub API boundary. Production wraps Octokit; tests inject fakes. */
 export interface Gateway {
   getPr(pr: number): Promise<PrInfo>;
+  /** Open PR numbers in the base repository whose head is `headRepo:headRef`. */
+  findPrsByHead(headRepo: string, headRef: string): Promise<number[]>;
   getIssueBody(issue: number): Promise<string>;
   createReview(pr: number, payload: ReviewPayload, opts: { canWrite: boolean }): Promise<void>;
   createIssueComment(pr: number, body: string, opts: { enabled: boolean; issuesWrite: boolean }): Promise<void>;
@@ -101,7 +103,17 @@ const SHA_RE = /^[0-9a-f]{40}$/;
 const SEVERITIES: ReadonlySet<string> = new Set(["info", "warning", "high"]);
 const MSG_CAP = 2000;
 const SUGGESTION_CAP = 4000;
+const FILE_CAP = 200;
+const RULE_CAP = 100;
 const TRUNC_MARK = "…[truncated]";
+/** Emitted in place of L2 execution on fork PRs with secrets in scope. */
+const L2_SKIPPED: Finding = {
+  severity: "info",
+  file: "",
+  rule: "l2-skipped",
+  message:
+    "L2 native toolchains were not executed: fork PR with secrets in scope. Semgrep, gitleaks and trivy still ran.",
+};
 
 /** Lockfile basename to the manifest that must change with it. Unmapped lockfiles are not flagged. */
 const MANIFEST_FOR: Readonly<Record<string, string>> = {
@@ -309,6 +321,11 @@ function capText(s: string, cap: number): string {
   return s.length <= cap ? s : s.slice(0, cap - TRUNC_MARK.length) + TRUNC_MARK;
 }
 
+/** C0 and DEL controls except TAB and LF (kept for multi-line messages and suggestions). */
+const CONTROL_KEEP_TEXT = /[\u0000-\u0008\u000b-\u001f\u007f]/g;
+/** Every C0 and DEL control, for single-line fields (file, rule). */
+const CONTROL_ALL = /[\u0000-\u001f\u007f]/g;
+
 /** Absolute, drive-qualified, or parent-traversing paths are never placed on a diff line. */
 function unsafePath(file: string): boolean {
   return (
@@ -319,16 +336,29 @@ function unsafePath(file: string): boolean {
   );
 }
 
-/** Caps text lengths and turns unsafe paths into repository-level notes (general body). */
+/**
+ * Strips control characters, caps lengths, and turns unsafe paths into repository-level notes
+ * (general body). Unsafe-path check runs after the control strip, before the length cap.
+ */
 export function sanitizeFinding(f: Finding): Finding {
-  let out: Finding = { ...f };
-  if (out.file !== "" && unsafePath(out.file)) {
-    const { line: _line, ...rest } = out;
-    void _line;
-    out = { ...rest, file: "", message: `artifact path rejected: ${out.message}` };
+  let file = f.file.replace(CONTROL_ALL, "");
+  let message = f.message.replace(CONTROL_KEEP_TEXT, "");
+  let line = f.line;
+  if (file !== "" && unsafePath(file)) {
+    message = `artifact path rejected: ${message}`;
+    file = "";
+    line = undefined;
   }
-  out.message = capText(out.message, MSG_CAP);
-  if (out.suggestion !== undefined) out.suggestion = capText(out.suggestion, SUGGESTION_CAP);
+  const out: Finding = {
+    severity: f.severity,
+    file: capText(file, FILE_CAP),
+    rule: capText(f.rule.replace(CONTROL_ALL, ""), RULE_CAP),
+    message: capText(message, MSG_CAP),
+  };
+  if (line !== undefined) out.line = line;
+  if (f.suggestion !== undefined) {
+    out.suggestion = capText(f.suggestion.replace(CONTROL_KEEP_TEXT, ""), SUGGESTION_CAP);
+  }
   return out;
 }
 
@@ -565,6 +595,11 @@ async function runFlowA(env: RunEnv, deps: Deps, out: Outcome): Promise<void> {
 
   // Scanners and L2 run PR-controlled code: scrubbed env. The semgrep token is never passed
   // here, so semgrep always runs in `scan` mode (a secret never reaches PR code).
+  // Fork PR with secrets in scope (non-pull_request trigger, writable App token, or LLM key):
+  // L2 toolchains (linters, build tooling) would execute PR-controlled config with secrets nearby,
+  // so they are skipped. Trusted, data-driven scanners still run.
+  const forkWithSecrets =
+    pull.isFork && (env.eventName !== "pull_request" || env.tokenIsApp || env.inputs.llmApiKey !== "");
   const { scan, l2 } = await withScrubbedEnv(async () => {
     const s = await deps.analysis.runScanners({
       dir: env.workDir,
@@ -574,6 +609,10 @@ async function runFlowA(env: RunEnv, deps: Deps, out: Outcome): Promise<void> {
       lockfiles,
       outDir: env.artifactDir,
     });
+    if (forkWithSecrets) {
+      core.warning("fork PR with secrets in scope: L2 native toolchains skipped");
+      return { scan: s, l2: [L2_SKIPPED] };
+    }
     const l = await deps.analysis.runL2(env.workDir);
     return { scan: s, l2: l };
   });
@@ -627,31 +666,41 @@ async function runFlowB(env: RunEnv, deps: Deps, out: Outcome): Promise<void> {
     );
   }
   const wr = fields(env).workflow_run;
-  if (wr?.head_sha !== meta.head_sha) {
+  const runRepo = wr?.head_repository?.full_name;
+  const runBranch = wr?.head_branch;
+  if (wr?.head_sha === undefined || runRepo === undefined || runRepo === "" || runBranch === undefined) {
+    throw new Error("pr-reviewer: workflow_run head context is incomplete; refusing to post");
+  }
+  // Lowercase at the binding site: readPrMeta accepts either case, the API returns lowercase.
+  const headSha = meta.head_sha.toLowerCase();
+  if (headSha !== wr.head_sha.toLowerCase()) {
     throw new Error("pr-reviewer: artifact head_sha does not match workflow_run.head_sha; refusing to post");
   }
-  const live = await deps.gh.getPr(meta.pr_number);
-  if (live.headRepo !== (wr?.head_repository?.full_name ?? "")) {
+  // The PR comes from trusted event fields, never from the artifact: exactly one open PR must
+  // have this head (repo + branch), and the artifact's pr_number must name that same PR.
+  const prs = await deps.gh.findPrsByHead(runRepo, runBranch);
+  if (prs.length !== 1) {
+    throw new Error(
+      `pr-reviewer: expected exactly one open PR for ${runRepo}:${runBranch}, found ${prs.length}; refusing to post`,
+    );
+  }
+  const pr = prs[0];
+  if (pr !== meta.pr_number) {
+    throw new Error("pr-reviewer: artifact pr_number does not match the PR derived from workflow_run; refusing to post");
+  }
+  const live = await deps.gh.getPr(pr);
+  if (live.headRepo !== runRepo) {
     throw new Error("pr-reviewer: PR head repository does not match workflow_run.head_repository; refusing to post");
   }
-  if (live.headSha !== wr?.head_sha) {
+  if (live.headSha.toLowerCase() !== headSha) {
     throw new Error("pr-reviewer: live PR head does not match workflow_run.head_sha; refusing to post");
   }
-  if (live.headRef !== wr?.head_branch) {
+  if (live.headRef !== runBranch) {
     throw new Error("pr-reviewer: PR head branch does not match workflow_run.head_branch; refusing to post");
   }
   const findings = readFindings(env.artifactDir);
   const hunks = parseDiffFiles(readDiff(env.artifactDir));
-  await publishReview({
-    env,
-    deps,
-    out,
-    pr: meta.pr_number,
-    isFork: live.isFork,
-    findings,
-    hunks,
-    headSha: meta.head_sha,
-  });
+  await publishReview({ env, deps, out, pr, isFork: live.isFork, findings, hunks, headSha });
   out.exitCode = exitFor(env.inputs.failLevel, findings);
 }
 
@@ -677,6 +726,23 @@ function realGateway(token: string): Gateway {
         headRef: r.data.head.ref,
         isFork: headRepo !== r.data.base.repo.full_name,
       };
+    },
+    async findPrsByHead(headRepo, headRef) {
+      const { owner, repo } = context.repo;
+      const headOwner = headRepo.split("/")[0];
+      const prs = await octokit.paginate(octokit.rest.pulls.list, {
+        owner,
+        repo,
+        state: "open",
+        head: `${headOwner}:${headRef}`,
+        per_page: 100,
+      });
+      return prs
+        .filter(
+          (p) =>
+            p.head.repo?.full_name === headRepo && p.head.ref === headRef && p.base.repo.full_name === `${owner}/${repo}`,
+        )
+        .map((p) => p.number);
     },
     async getIssueBody(issue) {
       const { owner, repo } = context.repo;

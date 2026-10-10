@@ -73,6 +73,7 @@ function newRec(): Rec {
 }
 
 interface GwOpts {
+  prsByHead?: number[];
   write403?: boolean;
   issue403?: boolean;
   body?: string;
@@ -91,6 +92,7 @@ function gatewayFor(rec: Rec, o: GwOpts): Gateway {
     ...o.info,
   };
   return {
+    findPrsByHead: async () => o.prsByHead ?? [7],
     getPr: async () => {
       rec.getPrCalls += 1;
       if (o.headMoves && rec.getPrCalls > 1) return { ...base, headSha: SHA_OTHER };
@@ -149,6 +151,9 @@ interface MockOpts {
   diff?: string;
   action?: string;
   sbomMissing?: boolean;
+  /** Re-trigger via an issue comment (non-pull_request event). */
+  comment?: boolean;
+  tokenIsApp?: boolean;
 }
 
 async function runWithMocks(o: MockOpts = {}) {
@@ -162,16 +167,24 @@ async function runWithMocks(o: MockOpts = {}) {
   const sbomDir = join(root, "sbom-x");
   if (o.sbomMissing) mkdirSync(sbomDir);
 
+  const commentPayload = {
+    action: "created",
+    comment: { body: "/review", author_association: "MEMBER" },
+    issue: { number: 7, pull_request: { url: "https://api.example/pulls/7" } },
+  };
   const env: RunEnv = {
-    eventName: o.prNumber === null ? "workflow_dispatch" : "pull_request",
-    payload:
-      o.prNumber === null ? {} : { action: o.action ?? "synchronize", pull_request: { number: 7 } },
+    eventName: o.comment ? "issue_comment" : o.prNumber === null ? "workflow_dispatch" : "pull_request",
+    payload: o.comment
+      ? commentPayload
+      : o.prNumber === null
+        ? {}
+        : { action: o.action ?? "synchronize", pull_request: { number: 7 } },
     inputs: inputsFor(o),
     workDir: root,
     artifactDir,
     baseSha: SHA_BASE,
     headSha: SHA_HEAD,
-    tokenIsApp: false,
+    tokenIsApp: o.tokenIsApp === true,
     issueFallback: o.issueFallback === true,
     summaryPath,
   };
@@ -226,6 +239,8 @@ async function runWithMocks(o: MockOpts = {}) {
 }
 
 interface PrivOpts {
+  metaPr?: number;
+  prsByHead?: number[];
   findings?: unknown[];
   metaHead?: string;
   wrHead?: string;
@@ -245,7 +260,7 @@ async function runPrivileged(o: PrivOpts = {}) {
   writeFileSync(
     join(artifactDir, "pr-meta.json"),
     JSON.stringify({
-      pr_number: 7,
+      pr_number: o.metaPr ?? 7,
       head_sha: o.metaHead ?? SHA_HEAD,
       base_sha: SHA_BASE,
       head_repo_full_name: "o/r",
@@ -280,6 +295,7 @@ async function runPrivileged(o: PrivOpts = {}) {
   };
   const deps: Deps = {
     gh: gatewayFor(rec, {
+      prsByHead: o.prsByHead,
       info: { headRepo: o.liveRepo ?? "o/r", headRef: o.liveRef ?? "feature", headSha: o.liveSha ?? SHA_HEAD },
     }),
     analysis: {
@@ -483,6 +499,19 @@ describe("run() orchestration", () => {
     expect(sarif.runs[0].results[0].locations).toHaveLength(1);
   });
 
+  it("fork PR re-triggered by comment with an App token: L2 is skipped, a finding says so, the review still posts", async () => {
+    const r = await runWithMocks({ comment: true, forkReadonly: true, tokenIsApp: true });
+    expect(r.l2Env).toBeUndefined();
+    expect(r.body).toContain("l2-skipped");
+    expect(r.posted).toBe(true);
+  });
+
+  it("same-repo comment re-trigger still runs L2", async () => {
+    const r = await runWithMocks({ comment: true });
+    expect(r.l2Env).toBeDefined();
+    expect(r.body).not.toContain("l2-skipped");
+  });
+
   it("quoted non-ASCII git paths decode to real names (quotePath residue)", async () => {
     const r = await runWithMocks({ diff: QUOTED_BINARY });
     expect(r.body).toContain("café.bin");
@@ -505,6 +534,46 @@ describe("Fluxo B bindings and sanitizing", () => {
 
   it("rejects when the live PR head moved after the PR run", async () => {
     await expect(runPrivileged({ liveSha: SHA_OTHER })).rejects.toThrow(/live PR head/);
+  });
+
+  it("rejects when no open PR has the workflow_run head", async () => {
+    await expect(runPrivileged({ prsByHead: [] })).rejects.toThrow(/exactly one open PR/);
+  });
+
+  it("rejects when more than one open PR has the workflow_run head", async () => {
+    await expect(runPrivileged({ prsByHead: [7, 9] })).rejects.toThrow(/exactly one open PR/);
+  });
+
+  it("rejects when the artifact pr_number is not the PR derived from trusted fields", async () => {
+    await expect(runPrivileged({ metaPr: 8, prsByHead: [7] })).rejects.toThrow(/does not match the PR derived/);
+  });
+
+  it("accepts an uppercase artifact head_sha (compared lowercased) and posts", async () => {
+    const r = await runPrivileged({ metaHead: SHA_HEAD.toUpperCase() });
+    expect(r.posted).toBe(true);
+  });
+
+  it("strips C0 controls from messages (keeps tab and newline) and caps file and rule lengths", async () => {
+    const f: Finding = {
+      severity: "warning",
+      file: "src/a.ts",
+      line: 2,
+      rule: "r".repeat(150),
+      message: "abc\u0007def\nline\tend\u0000",
+    };
+    const r = await runPrivileged({ findings: [f] });
+    const body = r.payloads[0].comments[0].body;
+    expect(body).toContain("abcdef\nline\tend");
+    expect(body).not.toContain("\u0007");
+    expect(body).not.toContain("r".repeat(100));
+    expect(body).toContain(TRUNC);
+  });
+
+  it("caps file paths at 200 chars (over-long safe path becomes a capped general note)", async () => {
+    const f: Finding = { severity: "warning", file: "d/".repeat(150), line: 2, rule: "r", message: "m" };
+    const r = await runPrivileged({ findings: [f] });
+    expect(r.payloads[0].body).not.toContain("d/".repeat(120));
+    expect(r.payloads[0].body).toContain(TRUNC);
   });
 
   it("caps long messages at 2000 chars and marks the truncation", async () => {

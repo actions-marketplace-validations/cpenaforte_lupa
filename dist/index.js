@@ -25877,7 +25877,15 @@ var SHA_RE = /^[0-9a-f]{40}$/;
 var SEVERITIES2 = /* @__PURE__ */ new Set(["info", "warning", "high"]);
 var MSG_CAP = 2e3;
 var SUGGESTION_CAP = 4e3;
+var FILE_CAP = 200;
+var RULE_CAP = 100;
 var TRUNC_MARK = "\u2026[truncated]";
+var L2_SKIPPED = {
+  severity: "info",
+  file: "",
+  rule: "l2-skipped",
+  message: "L2 native toolchains were not executed: fork PR with secrets in scope. Semgrep, gitleaks and trivy still ran."
+};
 var MANIFEST_FOR = {
   "package-lock.json": "package.json",
   "npm-shrinkwrap.json": "package.json",
@@ -26045,19 +26053,31 @@ function writeFindings(dir, findings) {
 function capText(s, cap) {
   return s.length <= cap ? s : s.slice(0, cap - TRUNC_MARK.length) + TRUNC_MARK;
 }
+var CONTROL_KEEP_TEXT = /[\u0000-\u0008\u000b-\u001f\u007f]/g;
+var CONTROL_ALL = /[\u0000-\u001f\u007f]/g;
 function unsafePath(file) {
   return file.startsWith("/") || file.startsWith("\\") || /^[A-Za-z]:[\\/]/.test(file) || file.split(/[\\/]/).includes("..");
 }
 function sanitizeFinding(f) {
-  let out = { ...f };
-  if (out.file !== "" && unsafePath(out.file)) {
-    const { line: _line, ...rest } = out;
-    void _line;
-    out = { ...rest, file: "", message: `artifact path rejected: ${out.message}` };
+  let file = f.file.replace(CONTROL_ALL, "");
+  let message = f.message.replace(CONTROL_KEEP_TEXT, "");
+  let line = f.line;
+  if (file !== "" && unsafePath(file)) {
+    message = `artifact path rejected: ${message}`;
+    file = "";
+    line = void 0;
   }
-  out.message = capText(out.message, MSG_CAP);
-  if (out.suggestion !== void 0)
-    out.suggestion = capText(out.suggestion, SUGGESTION_CAP);
+  const out = {
+    severity: f.severity,
+    file: capText(file, FILE_CAP),
+    rule: capText(f.rule.replace(CONTROL_ALL, ""), RULE_CAP),
+    message: capText(message, MSG_CAP)
+  };
+  if (line !== void 0)
+    out.line = line;
+  if (f.suggestion !== void 0) {
+    out.suggestion = capText(f.suggestion.replace(CONTROL_KEEP_TEXT, ""), SUGGESTION_CAP);
+  }
   return out;
 }
 function fields(env) {
@@ -26245,6 +26265,7 @@ async function runFlowA(env, deps, out) {
     }
   });
   const lockfiles = files.filter((f) => isLockfile(f.file)).map((f) => f.file);
+  const forkWithSecrets = pull.isFork && (env.eventName !== "pull_request" || env.tokenIsApp || env.inputs.llmApiKey !== "");
   const { scan, l2 } = await withScrubbedEnv(async () => {
     const s = await deps.analysis.runScanners({
       dir: env.workDir,
@@ -26254,6 +26275,10 @@ async function runFlowA(env, deps, out) {
       lockfiles,
       outDir: env.artifactDir
     });
+    if (forkWithSecrets) {
+      warning("fork PR with secrets in scope: L2 native toolchains skipped");
+      return { scan: s, l2: [L2_SKIPPED] };
+    }
     const l = await deps.analysis.runL2(env.workDir);
     return { scan: s, l2: l };
   });
@@ -26295,31 +26320,36 @@ async function runFlowB(env, deps, out) {
     throw new Error(`pr-reviewer: pr-meta.json not found in ${env.artifactDir}; refusing to post without the PR run's artifact`);
   }
   const wr = fields(env).workflow_run;
-  if (wr?.head_sha !== meta.head_sha) {
+  const runRepo = wr?.head_repository?.full_name;
+  const runBranch = wr?.head_branch;
+  if (wr?.head_sha === void 0 || runRepo === void 0 || runRepo === "" || runBranch === void 0) {
+    throw new Error("pr-reviewer: workflow_run head context is incomplete; refusing to post");
+  }
+  const headSha = meta.head_sha.toLowerCase();
+  if (headSha !== wr.head_sha.toLowerCase()) {
     throw new Error("pr-reviewer: artifact head_sha does not match workflow_run.head_sha; refusing to post");
   }
-  const live = await deps.gh.getPr(meta.pr_number);
-  if (live.headRepo !== (wr?.head_repository?.full_name ?? "")) {
+  const prs = await deps.gh.findPrsByHead(runRepo, runBranch);
+  if (prs.length !== 1) {
+    throw new Error(`pr-reviewer: expected exactly one open PR for ${runRepo}:${runBranch}, found ${prs.length}; refusing to post`);
+  }
+  const pr = prs[0];
+  if (pr !== meta.pr_number) {
+    throw new Error("pr-reviewer: artifact pr_number does not match the PR derived from workflow_run; refusing to post");
+  }
+  const live = await deps.gh.getPr(pr);
+  if (live.headRepo !== runRepo) {
     throw new Error("pr-reviewer: PR head repository does not match workflow_run.head_repository; refusing to post");
   }
-  if (live.headSha !== wr?.head_sha) {
+  if (live.headSha.toLowerCase() !== headSha) {
     throw new Error("pr-reviewer: live PR head does not match workflow_run.head_sha; refusing to post");
   }
-  if (live.headRef !== wr?.head_branch) {
+  if (live.headRef !== runBranch) {
     throw new Error("pr-reviewer: PR head branch does not match workflow_run.head_branch; refusing to post");
   }
   const findings = readFindings(env.artifactDir);
   const hunks = parseDiffFiles(readDiff(env.artifactDir));
-  await publishReview({
-    env,
-    deps,
-    out,
-    pr: meta.pr_number,
-    isFork: live.isFork,
-    findings,
-    hunks,
-    headSha: meta.head_sha
-  });
+  await publishReview({ env, deps, out, pr, isFork: live.isFork, findings, hunks, headSha });
   out.exitCode = exitFor(env.inputs.failLevel, findings);
 }
 async function run2(env, deps) {
@@ -26344,6 +26374,18 @@ function realGateway(token) {
         headRef: r.data.head.ref,
         isFork: headRepo !== r.data.base.repo.full_name
       };
+    },
+    async findPrsByHead(headRepo, headRef) {
+      const { owner, repo } = context2.repo;
+      const headOwner = headRepo.split("/")[0];
+      const prs = await octokit.paginate(octokit.rest.pulls.list, {
+        owner,
+        repo,
+        state: "open",
+        head: `${headOwner}:${headRef}`,
+        per_page: 100
+      });
+      return prs.filter((p) => p.head.repo?.full_name === headRepo && p.head.ref === headRef && p.base.repo.full_name === `${owner}/${repo}`).map((p) => p.number);
     },
     async getIssueBody(issue2) {
       const { owner, repo } = context2.repo;
