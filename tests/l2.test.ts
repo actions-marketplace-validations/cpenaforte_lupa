@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdirSync, mkdtempSync, writeFileSync, rmSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { detectL2Tools, l2Argv, runL2, type ToolFailure } from "../src/l2.js";
+import { detectL2Tools, execTool, L2_TIMEOUT_MS, l2Argv, runL2, type ToolFailure } from "../src/l2.js";
 
 const tmpDirs: string[] = [];
 function makeTmp(files: Record<string, string> = {}, dirs: string[] = []): string {
@@ -144,4 +144,32 @@ describe("runL2 behavior", () => {
       { cmd: "go", args: ["vet", "./..."], cwd: "tests/fixtures/go" },
     ]);
   });
+});
+
+describe("L2 per-tool timeout", () => {
+  it("default budget is 10 minutes per tool invocation", () => {
+    expect(L2_TIMEOUT_MS).toBe(600_000);
+  });
+
+  it("a runaway tool is killed at its timeout and reported as a warning, never a hang", async () => {
+    // A `go` stub that sleeps far longer than the budget, first on PATH for this test only.
+    const stubDir = mkdtempSync(join(tmpdir(), "l2-stub-"));
+    const stub = join(stubDir, "go");
+    writeFileSync(stub, `#!${process.execPath}\nsetTimeout(() => {}, 30000);\n`, "utf8");
+    chmodSync(stub, 0o755);
+    const savedPath = process.env.PATH;
+    process.env.PATH = `${stubDir}:${savedPath ?? ""}`;
+    try {
+      const started = Date.now();
+      const findings = await runL2("tests/fixtures/go", execTool, 300);
+      expect(Date.now() - started).toBeLessThan(20_000);
+      const timed = findings.find((f) => f.rule === "go vet");
+      expect(timed).toBeDefined();
+      expect(timed?.severity).toBe("warning");
+      expect(timed?.message).toContain("timed out after 0.3s");
+    } finally {
+      process.env.PATH = savedPath;
+      rmSync(stubDir, { recursive: true, force: true });
+    }
+  }, 30_000);
 });

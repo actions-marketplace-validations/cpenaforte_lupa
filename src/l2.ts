@@ -17,10 +17,20 @@ export interface ToolFailure {
   signal: string | null;
   /** Combined stdout+stderr. */
   output: string;
+  /** True when the per-tool timeout killed the process. */
+  timedOut?: boolean;
 }
 
+/** Per-tool wall-clock budget for L2 toolchains (same budget as the scanners). */
+export const L2_TIMEOUT_MS = 600_000;
+
 /** Injectable process runner. Tests stub it; production uses `execTool`. */
-export type Spawner = (cmd: string, args: string[], cwd: string) => Promise<ToolFailure | undefined>;
+export type Spawner = (
+  cmd: string,
+  args: string[],
+  cwd: string,
+  timeoutMs?: number,
+) => Promise<ToolFailure | undefined>;
 
 const MAX_BUFFER = 16 * 1024 * 1024;
 
@@ -99,23 +109,28 @@ export function l2Argv(name: string): { cmd: string; args: string[] } {
   }
 }
 
-/** Real runner: `execFile` with args array (no shell). Resolves `undefined` on success. */
-const execTool: Spawner = (cmd, args, cwd) =>
+/**
+ * Real runner: `execFile` with args array (no shell). Resolves `undefined` on success.
+ * `timeoutMs` kills the tool when it outlives its budget; the failure is marked `timedOut`.
+ */
+export const execTool: Spawner = (cmd, args, cwd, timeoutMs = L2_TIMEOUT_MS) =>
   new Promise((resolve) => {
-    execFile(cmd, args, { cwd, maxBuffer: MAX_BUFFER }, (err, stdout, stderr) => {
+    execFile(cmd, args, { cwd, maxBuffer: MAX_BUFFER, timeout: timeoutMs }, (err, stdout, stderr) => {
       if (!err) return resolve(undefined);
-      const e = err as NodeJS.ErrnoException & { signal?: NodeJS.Signals | null };
+      const e = err as NodeJS.ErrnoException & { signal?: NodeJS.Signals | null; killed?: boolean };
       const code = typeof e.code === "string" || typeof e.code === "number" ? e.code : null;
       resolve({
         code,
         signal: e.signal ?? null,
         output: `${String(stdout)}${String(stderr)}`,
+        timedOut: e.killed === true,
       });
     });
   });
 
 /** Human-readable failure reason: signal kill, errno (e.g. EACCES), or non-zero exit. */
-function describeFailure(name: string, f: ToolFailure): string {
+function describeFailure(name: string, f: ToolFailure, timeoutMs: number): string {
+  if (f.timedOut) return `${name} timed out after ${timeoutMs / 1000}s`;
   if (f.signal) return `${name} killed by signal ${f.signal}`;
   if (typeof f.code === "string") return `${name} could not run (${f.code})`;
   if (typeof f.code === "number") return `${name} reported issues (exit ${f.code})`;
@@ -123,9 +138,9 @@ function describeFailure(name: string, f: ToolFailure): string {
 }
 
 /** Run one check-only command. `undefined` when clean or when the binary is missing (ENOENT). */
-async function runOne(name: string, dir: string, spawn: Spawner): Promise<Finding | undefined> {
+async function runOne(name: string, dir: string, spawn: Spawner, timeoutMs: number): Promise<Finding | undefined> {
   const { cmd, args } = l2Argv(name);
-  const failure = await spawn(cmd, args, dir);
+  const failure = await spawn(cmd, args, dir, timeoutMs);
   if (!failure) return undefined;
   // Binary not installed on this runner: skip silently.
   if (failure.code === "ENOENT") return undefined;
@@ -134,7 +149,7 @@ async function runOne(name: string, dir: string, spawn: Spawner): Promise<Findin
     severity: "warning",
     file: "",
     rule: name,
-    message: `${describeFailure(name, failure)}${detail ? `:\n${detail}` : ""}`,
+    message: `${describeFailure(name, failure, timeoutMs)}${detail ? `:\n${detail}` : ""}`,
   };
 }
 
@@ -143,10 +158,10 @@ async function runOne(name: string, dir: string, spawn: Spawner): Promise<Findin
  * non-zero exit, signal kill, or other errno → one warning finding per tool.
  * `spawn` is injectable for tests; defaults to the real `execTool`.
  */
-export async function runL2(dir: string, spawn: Spawner = execTool): Promise<Finding[]> {
+export async function runL2(dir: string, spawn: Spawner = execTool, timeoutMs: number = L2_TIMEOUT_MS): Promise<Finding[]> {
   const findings: Finding[] = [];
   for (const name of detectL2Tools(dir)) {
-    const f = await runOne(name, dir, spawn);
+    const f = await runOne(name, dir, spawn, timeoutMs);
     if (f) findings.push(f);
   }
   return findings;
