@@ -133,15 +133,15 @@ describe("runL2 behavior", () => {
   it("clean run (exit 0) → tool invoked via the seam, yields no findings", async () => {
     // Spawner returns undefined === exit 0. Recording the call proves the tool was
     // actually invoked (not silently skipped as ENOENT).
-    const calls: Array<{ cmd: string; args: string[]; cwd: string }> = [];
-    const spawn = async (cmd: string, args: string[], cwd: string): Promise<ToolFailure | undefined> => {
-      calls.push({ cmd, args, cwd });
+    const calls: Array<{ cmd: string; args: string[]; cwd: string; timeoutMs?: number }> = [];
+    const spawn = async (cmd: string, args: string[], cwd: string, timeoutMs?: number): Promise<ToolFailure | undefined> => {
+      calls.push({ cmd, args, cwd, timeoutMs });
       return undefined;
     };
     expect(await runL2("tests/fixtures/go", spawn)).toEqual([]);
     expect(calls).toEqual([
-      { cmd: "gofmt", args: ["-l", "."], cwd: "tests/fixtures/go" },
-      { cmd: "go", args: ["vet", "./..."], cwd: "tests/fixtures/go" },
+      { cmd: "gofmt", args: ["-l", "."], cwd: "tests/fixtures/go", timeoutMs: L2_TIMEOUT_MS },
+      { cmd: "go", args: ["vet", "./..."], cwd: "tests/fixtures/go", timeoutMs: L2_TIMEOUT_MS },
     ]);
   });
 });
