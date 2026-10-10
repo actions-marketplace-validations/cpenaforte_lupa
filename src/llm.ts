@@ -142,19 +142,21 @@ function responseFormatFor(provider: string): ResponseFormat | undefined {
   return { type: "json_object" };
 }
 
-// Callers must pass a non-empty key: callLlm returns no-key before any request,
-// so split("") (which would insert the marker between every character) never runs.
+// Requires a non-empty key: callLlm's early no-key return guarantees it, and ensureOllama guards empty keys in its scrub wrapper, so split("") never runs.
 function redact(text: string, key: string): string {
   return text.split(key).join("[REDACTED]");
 }
 
-/** Missing, empty, whitespace-only, or non-numeric Retry-After falls back to the backoff. */
+/**
+ * Missing, empty, whitespace-only, non-numeric, or negative Retry-After falls back to the backoff.
+ * Values above the cap are clamped to MAX_RETRY_AFTER_MS.
+ */
 function retryDelayMs(raw: string | null): number {
   const trimmed = raw?.trim() ?? "";
   if (trimmed === "") return RETRY_BACKOFF_MS;
   const secs = Number(trimmed);
-  if (!Number.isFinite(secs)) return RETRY_BACKOFF_MS;
-  return Math.min(Math.max(secs, 0) * 1000, MAX_RETRY_AFTER_MS);
+  if (!Number.isFinite(secs) || secs < 0) return RETRY_BACKOFF_MS;
+  return Math.min(secs * 1000, MAX_RETRY_AFTER_MS);
 }
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));

@@ -392,8 +392,9 @@ describe("retry and timeout", () => {
 
   it.each([
     ["an empty Retry-After", ""],
-    ["a whitespace-only Retry-After", "   "],
+    ["a whitespace-only Retry-After (Headers strips it to empty)", "   "],
     ["a non-numeric Retry-After", "soon"],
+    ["a negative Retry-After", "-5"],
   ])("%s falls back to the 500ms backoff (not 0ms)", async (_label, header) => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     stubFetch((_c, n) => (n === 1 ? json(429, {}, { "retry-after": header }) : json(200, okChat())));
