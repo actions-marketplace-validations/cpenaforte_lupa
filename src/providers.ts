@@ -95,13 +95,13 @@ const V2_STYLES: ReadonlySet<string> = new Set<NonChatStyle>([
 const NON_CHAT_PATH_SEGMENTS: ReadonlySet<string> = new Set(["messages", "responses", "models"]);
 
 /**
- * True iff the path starts with "/" and its last segment (ignoring query and
- * trailing slashes) is exactly messages, responses, or models.
+ * True iff the (already normalized, leading-slash) path's last segment,
+ * ignoring query, #fragment, and trailing slashes, is exactly messages,
+ * responses, or models.
  * `/v1/messages` → true; `/openai/models/chat/completions` → false.
  */
 function isPathOnlyNonChat(path: string): boolean {
-  if (!path.startsWith("/")) return false;
-  const pathname = path.split("?")[0].replace(/\/+$/, "");
+  const pathname = path.split(/[?#]/)[0].replace(/\/+$/, "");
   const last = pathname.slice(pathname.lastIndexOf("/") + 1);
   return NON_CHAT_PATH_SEGMENTS.has(last);
 }
@@ -145,14 +145,14 @@ export function resolveEndpoint(o: ResolveEndpointOptions): ResolvedEndpoint {
   }
 
   const rawPath = o.llmPath !== "" ? o.llmPath : CHAT_PATH;
-  if (isPathOnlyNonChat(rawPath)) {
+  // Normalize first so the guard applies to the path actually returned.
+  const path = rawPath.startsWith("/") ? rawPath : `/${rawPath}`;
+  if (isPathOnlyNonChat(path)) {
     throw new UnsupportedModelError(
-      `llm_path "${rawPath}" is path-only: it names a non-chat endpoint. llm_path only overrides the path; ` +
+      `llm_path "${path}" is path-only: it names a non-chat endpoint. llm_path only overrides the path; ` +
         `a non-chat body adapter requires a v2 llm_api_style, which is not supported in v1.`,
     );
   }
-  // Ensure baseUrl + path joins with exactly one "/".
-  const path = rawPath.startsWith("/") ? rawPath : `/${rawPath}`;
 
   const headers: Record<string, string> = {
     Authorization: `Bearer ${o.llmApiKey}`,

@@ -146,10 +146,18 @@ describe("resolveEndpoint", () => {
     expect(r.path).toBe("/openai/models/chat/completions");
   });
 
-  it("path without leading slash does NOT throw path-only and joins with one slash", () => {
-    const r = resolveEndpoint({ ...base, llmProvider: "custom", llmBaseUrl: "https://x", llmModel: "m", llmPath: "messages" });
-    expect(r.path).toBe("/messages");
-    expect(r.baseUrl + r.path).toBe("https://x/messages");
+  it("bare messages (no leading slash) throws path-only after normalization", () => {
+    expect(() => resolveEndpoint({ ...base, llmProvider: "custom", llmBaseUrl: "https://x", llmModel: "m", llmPath: "messages" })).toThrow(/path-only/);
+  });
+
+  it("path without leading slash joins with one slash", () => {
+    const r = resolveEndpoint({ ...base, llmProvider: "custom", llmBaseUrl: "https://x", llmModel: "m", llmPath: "chat/completions" });
+    expect(r.path).toBe("/chat/completions");
+    expect(r.baseUrl + r.path).toBe("https://x/chat/completions");
+  });
+
+  it('"/messages#x" throws path-only (fragment stripped)', () => {
+    expect(() => resolveEndpoint({ ...base, llmProvider: "custom", llmBaseUrl: "https://x", llmModel: "m", llmPath: "/messages#x" })).toThrow(/path-only/);
   });
 
   it("joins baseUrl and path with exactly one slash", () => {
