@@ -135,7 +135,7 @@ describe("callMessages", () => {
     expect(await callMessages(fakeMessagesEp(), msgs(), opts())).toEqual({ ok: true, findings: [] });
   });
 
-  it("retries once on 429/5xx, degrades on timeout without retry, redacts the key", async () => {
+  it("retries once on 429/5xx and degrades on timeout without retry", async () => {
     // 429 → one retry (Retry-After: 0 keeps the backoff instant).
     stubFetch((_c, n) =>
       n === 1
@@ -168,14 +168,17 @@ describe("callMessages", () => {
     ).toMatchObject({ ok: false, reason: "timeout" });
     expect(timeoutFetch).toHaveBeenCalledTimes(1);
     expect(calls.length).toBe(1);
+  });
 
-    // Error detail never leaks the API key.
+  it("persistent 5xx http-error detail redacts the API key", async () => {
     const key = "sk-secret-123";
-    stubFetch(() => json(400, { error: `bad key ${key}` }));
+    stubFetch(() => json(500, { error: `boom ${key}` }, { "retry-after": "0" }));
     const r = await callMessages(fakeMessagesEp(key), msgs(), { ...opts(), apiKey: key });
     expect(r).toMatchObject({ ok: false, reason: "http-error" });
     expect((r as { detail: string }).detail).toContain("[REDACTED]");
     expect((r as { detail: string }).detail).not.toContain(key);
+    // 5xx → exactly one retry, then the plain http-error path.
+    expect(calls.length).toBe(2);
   });
 
   it("rejects explicit sampling on strict Claude via validateSampling", async () => {

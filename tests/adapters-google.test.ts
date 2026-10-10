@@ -190,9 +190,10 @@ describe("callGoogle", () => {
 
   it("promptFeedback.blockReason with empty candidates → content-filter skip, no retry", async () => {
     stubFetch(() => json(200, { promptFeedback: { blockReason: "SAFETY" }, candidates: [] }));
-    expect(await callGoogle(fakeGoogleEp(), MODEL, msgs(), opts())).toMatchObject({
+    expect(await callGoogle(fakeGoogleEp(), MODEL, msgs(), opts())).toEqual({
       ok: false,
       reason: "content-filter",
+      detail: "provider blocked the prompt (blockReason=SAFETY)",
     });
     expect(calls.length).toBe(1);
   });
