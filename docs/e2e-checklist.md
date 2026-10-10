@@ -1,9 +1,9 @@
 # End-to-end checklist
 
-Manual checks against a disposable consumer repository, run on the **canary** commit before any
-floating tag moves. Each case lists the PR to create and the assertions to verify. The unit tests
-cover the mapping logic (`eventFor`, `exitFor`, `buildBody`); these cases cover the wiring in a real
-GitHub run.
+Manual checks against a disposable consumer repository, run on the **canary** (the immutable
+`v0.1.0` SHA) before the marketplace listing goes live. Each case lists the PR to create and the
+assertions to verify. The unit tests cover the mapping logic (`eventFor`, `exitFor`, `buildBody`);
+these cases cover the wiring in a real GitHub run, including live Ollama, which CI does not run.
 
 Setup: a private test repository with the workflow from `docs/workflow-template.yml` pointing at the
 canary SHA, `vars.PR_REVIEWER_MODEL` and `secrets.LLM_API_KEY` set, and `fail_level: warning`
@@ -27,7 +27,7 @@ Every case asserts, in addition to its own rows:
 | 5 | **Force-push**: push a rewritten history to an open PR branch | `COMMENT` for the new head SHA (`synchronize` event) | Review refers to the new head SHA only; no stale findings from the old head | per findings |
 | 6 | **Deleted line**: removes a line that had a finding on the previous head | `COMMENT` | No inline comment on the deleted line (not on the new head's diff); no error | per findings |
 | 7 | **Multi-line finding**: LLM reports a range across five added lines | `COMMENT` | Inline comment anchored to a valid added line inside the range; no 422 from the API | per findings |
-| 8 | **Fork PR, secrets not granted** (`pull_request` from a fork) | `COMMENT` not posted (read-only token): summary and artifact only | Warning `review not posted; summary and artifact only`; L2 toolchains skipped (`fork PR with secrets in scope`) when secrets are in scope | per findings, no POST |
+| 8 | **Fork PR, secrets not granted** (`pull_request` from a fork) | none (no POST) | Summary and artifact only; warning `review not posted; summary and artifact only`; L2 toolchains skipped (`fork PR with secrets in scope`) when secrets are in scope | per findings |
 | 9 | **`/review` retrigger** (`issue_comment` `created` containing `/review`, author `OWNER`/`MEMBER`/`COLLABORATOR`) on a PR | `COMMENT` for the current head | Review posted once; the same comment from an external author (`CONTRIBUTOR`/`NONE`) triggers nothing | per findings |
 
 Negative controls (run once each):
@@ -35,6 +35,10 @@ Negative controls (run once each):
 - `/review` from an external author → no job runs a review, no comment is posted.
 - `issue_comment` on a plain issue (no PR) → the job is skipped by the `if:` guard.
 - `fail_level: none` on case 1 → exit `0`, review still posted with the warning.
+
+Live Ollama (manual, not in CI): point `llm_provider: ollama` at a local Ollama server with a small
+model pulled, open one synthetic PR, and assert the same body and exit-code rules as case 2. CI covers
+the ollama code paths with mocks only.
 
 ## Local smoke (no LLM, no network beyond the GitHub API)
 
@@ -49,41 +53,65 @@ git diff --exit-code -- dist/index.js
 
 ## Release procedure
 
-Digests and pins must already be real before release. Verify:
+Consumers copy the templates from `main` **after** the release. Never copy them from the v0.1.0 tag:
+that tag's templates still carry the `OWNER/pr-reviewer@0000…` placeholder by design.
+
+Before starting, verify that the scanner digests are real (the scoped test in `tests/ci.test.ts`
+checks `src/`, `.github/workflows/ci.yml` and `action.yml` for placeholders):
 
 ```bash
-grep -E '^export const (TRIVY|OSV|GITLEAKS)_DIGEST = "sha256:[0-9a-f]{64}";' src/scanners.ts | wc -l   # must print 3
-grep -n '0000000000000000000000000000000000000000' docs/workflow-template*.yml   # placeholder, replaced in step 4
+grep -cE '^export const (TRIVY|OSV|GITLEAKS)_DIGEST = "sha256:[0-9a-f]{64}";' src/scanners.ts   # must print 3
 ```
 
-1. **Release commit R** on `main`: CI green (`build`, `smoke`, `fork-sim`, `ollama`, `guards`), `dist/index.js` in sync with the build, `action.yml` complete (see step 5 about branding).
+Release order (strict):
+
+1. **Release commit R** on `main`. CI is green (`build`, `smoke`, `no-secret-smoke`, `ollama`,
+   `guards`), and `dist/index.js` matches the build. Branding is already declared in `action.yml`
+   (`branding:` icon `git-pull-request`, color `blue`).
 2. **Immutable tag.** Create an annotated tag on R and push it. The tag is never moved:
 
    ```bash
    git tag -a v0.1.0 -m "pr-reviewer v0.1.0" R
    git push origin v0.1.0
-   SHA=$(git rev-parse "v0.1.0^{commit}")
-   echo "$SHA"   # 40 hex; this is the pin consumers use
    ```
 
-3. **Canary.** In the consumer test repository, point the workflow at `OWNER/pr-reviewer@$SHA` and run every case above. All must pass. If anything fails, fix on `main`, cut a new tag (`v0.1.1`), and repeat. Do not touch `v0.1.0` or `v1`.
-4. **Substitute the template placeholder** (after canary passes; this is a follow-up commit, not R). The placeholder is the exact string `OWNER/pr-reviewer@0000000000000000000000000000000000000000` in `docs/workflow-template.yml` and `docs/workflow-template-privileged.yml`. Replace the owner and the SHA together. `OWNER` is the GitHub owner that publishes the action (`OWNER=your-login`, not a literal):
+3. **Get the SHA.** Never type a SHA by hand:
+
+   ```bash
+   SHA=$(git rev-parse "v0.1.0^{commit}")
+   echo "$SHA"   # 40 hex; the pin consumers use
+   ```
+
+4. **Substitute the placeholder in BOTH templates**, then commit on `main` (a follow-up commit C,
+   not R). The first `sed` replaces the placeholder with the owner and the SHA; the second drops the
+   stale `# replace with a released SHA` instruction comment. Replace `OWNER` with the real owner
+   login before running:
 
    ```bash
    OWNER=your-login
    sed -i "s#OWNER/pr-reviewer@0000000000000000000000000000000000000000#$OWNER/pr-reviewer@$SHA#" docs/workflow-template.yml docs/workflow-template-privileged.yml
-   grep -n "$SHA" docs/workflow-template.yml docs/workflow-template-privileged.yml   # both files
-   npx vitest run tests/templates.test.ts
+   sed -i 's/ # replace with a released SHA$//' docs/workflow-template.yml docs/workflow-template-privileged.yml
+   grep -n "$SHA" docs/workflow-template.yml docs/workflow-template-privileged.yml   # both files, no placeholder left
+   npx vitest run tests/templates.test.ts tests/ci.test.ts
    git add docs/workflow-template.yml docs/workflow-template-privileged.yml
    git commit -m "docs: pin templates to v0.1.0 ($SHA)"
+   git push origin main
    ```
 
-   Never type a SHA by hand. Use the value printed by `git rev-parse` in step 2.
-5. **Floating major tag `v1`**, only after the canary is green. Move it to the same commit as `v0.1.0`:
+5. **Move the floating major tag `v1`** to the same commit R as `v0.1.0` (not to C):
 
    ```bash
-   git tag -f v1 "v0.1.0^{commit}"
+   git tag -f v1 "$SHA"
    git push --force origin v1
    ```
 
-6. **Marketplace.** On the GitHub release for `v0.1.0`, tick "Publish this Action to the GitHub Marketplace" and check the listing copy against `action.yml` (`name: "PR Reviewer"`, the `description` field, the inputs and outputs). The Marketplace also requires a `branding:` block (`icon`, `color`) in `action.yml`. It must be in R before tagging. Missing branding blocks publication.
+   If the canary in step 6 fails, roll back by moving `v1` to the previous good release, then fix
+   on `main` and cut `v0.1.1`.
+
+6. **Canary.** In the consumer test repository, pin the workflow to `OWNER/pr-reviewer@$SHA` and run
+   every case above, including live Ollama. All must pass. Do not touch `v0.1.0`.
+
+7. **Marketplace.** Only after the canary is green, on the GitHub release for `v0.1.0`, tick
+   "Publish this Action to the GitHub Marketplace". Check the listing copy against `action.yml`
+   (`name: "PR Reviewer"`, the `description` field, the inputs and outputs, and the `branding:` block
+   from step 1).

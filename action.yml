@@ -67,3 +67,6 @@ outputs:
 runs:
   using: node24
   main: dist/index.js
+branding:
+  icon: "git-pull-request"
+  color: "blue"

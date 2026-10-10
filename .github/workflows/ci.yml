@@ -1,5 +1,6 @@
 # CI for pr-reviewer itself. Every third-party `uses:` is pinned by a full commit SHA (tests/ci.test.ts
-# enforces this). Only `uses: ./` (the action under test) is unpinned by design.
+# enforces this). Only `uses: ./` (the action under test) is unpinned by design. No remote code is
+# executed in CI (no curl|sh installs).
 name: CI
 
 on:
@@ -11,14 +12,16 @@ on:
 permissions:
   contents: read
 
+# Pull requests supersede older runs of the same PR. Pushes to main (release commits) are never cancelled.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   build:
     name: build (npm ci, vitest, bundle)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Checkout (no persisted credentials)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -52,6 +55,7 @@ jobs:
   smoke:
     name: "smoke on ${{ matrix.os }}"
     needs: build
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -70,11 +74,13 @@ jobs:
           fail_level: none
           llm_api_key: ""
 
-  fork-sim:
-    name: fork simulation (no secrets, summary-only, no POST)
+  no-secret-smoke:
+    name: "no-secret smoke (simulates fork, same repo)"
     needs: build
+    timeout-minutes: 20
     runs-on: ubuntu-latest
-    # Deliberately no secrets: a fork PR has none. The action must not post; it writes the summary.
+    # Deliberately no secrets, mirroring a fork PR. This runs on a same-repo runner, so it simulates the
+    # fork path; a real fork PR is covered by the manual E2E case 8. The action must not post; it writes the summary.
     steps:
       - name: Checkout (no persisted credentials)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -95,6 +101,7 @@ jobs:
     name: SARIF upload (same-repo PRs only)
     needs: build
     if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    timeout-minutes: 20
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -122,8 +129,12 @@ jobs:
           sarif_file: ${{ runner.temp }}/pr-reviewer-out/sarif.json
 
   ollama:
-    name: ollama (local server reachable, provider tests)
+    # Mock-based only: tests/llm.test.ts and tests/providers.test.ts exercise the ollama code paths with
+    # fakes. No Ollama server is installed or started here (no remote install script runs in CI).
+    # A live Ollama run is a manual E2E step; see docs/e2e-checklist.md.
+    name: ollama provider tests (mock-based)
     needs: build
+    timeout-minutes: 20
     runs-on: ubuntu-latest
     steps:
       - name: Checkout (no persisted credentials)
@@ -140,23 +151,12 @@ jobs:
       - name: npm ci
         run: npm ci
 
-      - name: Install and start ollama
-        run: |
-          set -euo pipefail
-          curl -fsSL https://ollama.com/install.sh | sh
-          nohup ollama serve > "$RUNNER_TEMP/ollama.log" 2>&1 &
-          for i in $(seq 1 30); do
-            if curl -fsS http://localhost:11434/api/version >/dev/null 2>&1; then exit 0; fi
-            sleep 2
-          done
-          cat "$RUNNER_TEMP/ollama.log" || true
-          exit 1
-
       - name: Ollama provider tests
         run: npx vitest run tests/llm.test.ts tests/providers.test.ts
 
   guards:
     name: guards (template and pin invariants)
+    timeout-minutes: 10
     runs-on: ubuntu-latest
     steps:
       - name: Checkout (no persisted credentials)
