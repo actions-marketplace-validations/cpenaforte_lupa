@@ -76,7 +76,10 @@ export async function callMessages(
     "x-api-key": key,
     "anthropic-version": "2023-06-01",
   };
-  delete headers.Authorization;
+  // Case-insensitive strip: Authorization is not part of this protocol, whatever its casing.
+  for (const k of Object.keys(headers)) {
+    if (/^authorization$/i.test(k)) delete headers[k];
+  }
   const authEp: ResolvedEndpoint = { baseUrl: ep.baseUrl, path: ep.path, headers };
 
   let a = await attempt(authEp, payload, o);

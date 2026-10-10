@@ -98,13 +98,22 @@ describe("callGoogle", () => {
 
   it("authenticates via x-goog-api-key header, never ?key= on the URL", async () => {
     const key = "SECRETKEY123";
-    await callGoogle(fakeGoogleEp(key), MODEL, msgs(), { ...opts(), apiKey: key });
+    // Carries both Authorization casings: neither is part of this protocol.
+    const ep: ResolvedEndpoint = {
+      ...fakeGoogleEp(key),
+      headers: {
+        ...fakeGoogleEp(key).headers,
+        Authorization: "Bearer stale",
+        authorization: "Bearer stale",
+      },
+    };
+    await callGoogle(ep, MODEL, msgs(), { ...opts(), apiKey: key });
     const headers = calls.at(-1)!.init.headers as Record<string, string>;
     expect(headers["x-goog-api-key"]).toBe(key);
     expect(headers["User-Agent"]).toBe("pr-reviewer/1.0");
     expect(headers["x-opencode-session"]).toBe("pr-123");
-    // The Google protocol authenticates via the header only; Authorization is not part of it.
     expect(headers.Authorization).toBeUndefined();
+    expect(headers["authorization"]).toBeUndefined();
     // The key never rides the URL, so it can never be logged from a request line.
     expect(calls.at(-1)!.url).not.toContain(key);
     expect(calls.at(-1)!.url).not.toContain("?key=");
@@ -130,12 +139,13 @@ describe("callGoogle", () => {
     const r = await callGoogle(fakeGoogleEp(), MODEL, msgs(), opts());
     expect(r).toEqual({ ok: true, findings: [] });
     expect(calls.length).toBe(2);
-    const first = JSON.parse(String(calls[0]!.init.body)) as Record<string, any>;
-    expect(first.generationConfig.responseSchema).toBeDefined();
-    const second = JSON.parse(String(calls[1]!.init.body)) as Record<string, any>;
+    const first = JSON.parse(String(calls[0]!.init.body)) as { generationConfig?: Record<string, unknown> };
+    expect(first.generationConfig?.responseSchema).toBeDefined();
+    const second = JSON.parse(String(calls[1]!.init.body)) as { generationConfig?: Record<string, unknown> };
+    expect(second.generationConfig).toBeDefined();
     expect(second.generationConfig).not.toHaveProperty("responseSchema");
     expect(second.generationConfig).not.toHaveProperty("responseMimeType");
-    expect(second.generationConfig.maxOutputTokens).toBe(50);
+    expect(second.generationConfig?.maxOutputTokens).toBe(50);
   });
 
   it("joins candidates[0].content.parts[].text and parses findings", async () => {
@@ -178,7 +188,16 @@ describe("callGoogle", () => {
     expect(await callGoogle(fakeGoogleEp(), MODEL, msgs(), opts())).toEqual({ ok: true, findings: [] });
   });
 
-  it("retries once on 429/5xx, degrades on timeout without retry, redacts the key", async () => {
+  it("promptFeedback.blockReason with empty candidates → content-filter skip, no retry", async () => {
+    stubFetch(() => json(200, { promptFeedback: { blockReason: "SAFETY" }, candidates: [] }));
+    expect(await callGoogle(fakeGoogleEp(), MODEL, msgs(), opts())).toMatchObject({
+      ok: false,
+      reason: "content-filter",
+    });
+    expect(calls.length).toBe(1);
+  });
+
+  it("retries once on 429/5xx and degrades on timeout without retry", async () => {
     // 429 → one retry (Retry-After: 0 keeps the backoff instant).
     stubFetch((_c, n) =>
       n === 1 ? json(429, { error: "rate limited" }, { "retry-after": "0" }) : json(200, okGoogle('{"findings":[]}')),
@@ -210,13 +229,16 @@ describe("callGoogle", () => {
     });
     expect(timeoutFetch).toHaveBeenCalledTimes(1);
     expect(calls.length).toBe(1);
+  });
 
-    // Error detail never leaks the API key.
+  it("persistent 5xx http-error detail redacts the API key", async () => {
     const key = "sk-secret-123";
-    stubFetch(() => json(400, { error: `bad key ${key}` }));
+    stubFetch(() => json(500, { error: `boom ${key}` }, { "retry-after": "0" }));
     const r = await callGoogle(fakeGoogleEp(key), MODEL, msgs(), { ...opts(), apiKey: key });
     expect(r).toMatchObject({ ok: false, reason: "http-error" });
     expect((r as { detail: string }).detail).toContain("[REDACTED]");
     expect((r as { detail: string }).detail).not.toContain(key);
+    // 5xx → exactly one retry, then the plain http-error path (no schema fallback for 5xx).
+    expect(calls.length).toBe(2);
   });
 });

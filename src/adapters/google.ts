@@ -21,6 +21,14 @@ function firstCandidate(json: unknown): Record<string, unknown> | undefined {
   return typeof c === "object" && c !== null ? (c as Record<string, unknown>) : undefined;
 }
 
+/** promptFeedback.blockReason when set (Gemini prompt-level blocks, often with empty candidates). */
+function promptBlockReason(json: unknown): string | undefined {
+  const feedback = (json as { promptFeedback?: unknown } | null)?.promptFeedback;
+  if (typeof feedback !== "object" || feedback === null) return undefined;
+  const r = (feedback as { blockReason?: unknown }).blockReason;
+  return typeof r === "string" && r !== "" ? r : undefined;
+}
+
 /** Joins `text` blocks from `candidates[0].content.parts[]`. */
 function joinCandidateText(json: unknown): string | undefined {
   const candidate = firstCandidate(json);
@@ -41,10 +49,11 @@ function joinCandidateText(json: unknown): string | undefined {
  * Google generateContent (`POST {base}/models/<id>:generateContent`): the body is
  * `{contents, systemInstruction, generationConfig}` with `maxOutputTokens` for the
  * token budget. Structured output rides as `responseMimeType`+`responseSchema`; a 400
- * on it retries once without both (manual parse, like callResponses). `finishReason`
- * maps MAX_TOKENS→degrade and SAFETY/any other non-STOP value→skip without retry.
- * Auth prefers the `x-goog-api-key` header: the key never rides the URL (`?key=` is
- * never appended by default) and is never logged.
+ * on it retries once without both (manual parse, like callResponses). Prompt-level
+ * blocks (`promptFeedback.blockReason`) and `finishReason` SAFETY/any other non-STOP
+ * value map to a content-filter skip without retry; MAX_TOKENS degrades. Auth prefers
+ * the `x-goog-api-key` header: the key never rides the URL (`?key=` is never appended
+ * by default) and is never logged.
  */
 export async function callGoogle(
   ep: ResolvedEndpoint,
@@ -93,7 +102,10 @@ export async function callGoogle(
     ...ep.headers,
     "x-goog-api-key": key,
   };
-  delete headers.Authorization;
+  // Case-insensitive strip: Authorization is not part of this protocol, whatever its casing.
+  for (const k of Object.keys(headers)) {
+    if (/^authorization$/i.test(k)) delete headers[k];
+  }
   const authEp: ResolvedEndpoint = { baseUrl: ep.baseUrl, path: ep.path, headers };
 
   let a = await attempt(authEp, payload, o);
@@ -122,6 +134,17 @@ export async function callGoogle(
     json = JSON.parse(a.text);
   } catch {
     return { ok: false, reason: "invalid-json", detail: "response body is not JSON" };
+  }
+
+  // A prompt-level block (e.g. SAFETY) is a provider-side skip, never retried —
+  // it arrives as promptFeedback.blockReason, usually with no candidates at all.
+  const blockReason = promptBlockReason(json);
+  if (blockReason !== undefined) {
+    return {
+      ok: false,
+      reason: "content-filter",
+      detail: `provider blocked the prompt (blockReason=${blockReason})`,
+    };
   }
 
   const finishReason = firstCandidate(json)?.finishReason;
