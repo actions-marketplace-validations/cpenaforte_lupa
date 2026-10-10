@@ -8,7 +8,8 @@ vi.mock("@actions/core", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@actions/core")>();
   return { ...actual, info: vi.fn(actual.info) };
 });
-import { cleanEnvForExec, run, sanitizeFinding, unquoteGitPath, type Deps, type Gateway, type PrInfo, type RunEnv } from "../src/main.js";
+import { cleanEnvForExec, main, run, sanitizeFinding, unquoteGitPath, type Deps, type Gateway, type PrInfo, type RunEnv } from "../src/main.js";
+import { readPrMeta } from "../src/diff.js";
 import type { ActionInputs } from "../src/inputs.js";
 import { ReadonlyTokenError } from "../src/github.js";
 import type { ReviewPayload } from "../src/review.js";
@@ -160,6 +161,8 @@ interface MockOpts {
   sbomMissing?: boolean;
   /** Re-trigger via an issue comment (non-pull_request event). */
   comment?: boolean;
+  /** Files created under the work dir (real on-disk sizes for L0's large-file rule). */
+  workFiles?: Record<string, number>;
   tokenIsApp?: boolean;
 }
 
@@ -168,6 +171,7 @@ async function runWithMocks(o: MockOpts = {}) {
   const artifactDir = join(root, "out");
   mkdirSync(artifactDir);
   writeFileSync(join(artifactDir, "diff.patch"), o.diff ?? (o.binaryOnly ? BINARY : DIFF));
+  for (const [name, size] of Object.entries(o.workFiles ?? {})) writeFileSync(join(root, name), Buffer.alloc(size));
   const summaryPath = join(root, "summary.md");
   writeFileSync(summaryPath, "");
   const rec = newRec();
@@ -657,6 +661,109 @@ describe("Fluxo B bindings and sanitizing", () => {
 
   it("sanitizeFinding keeps short findings unchanged", () => {
     expect(sanitizeFinding(LLM_FINDING)).toEqual(LLM_FINDING);
+  });
+});
+
+describe("findings from binaries, renames and skip paths", () => {
+  it("a binary over 500 KB on disk triggers large-file (real stat, not hunk length)", async () => {
+    const big = 'diff --git a/big.bin b/big.bin\nBinary files a/big.bin and b/big.bin differ\n';
+    const r = await runWithMocks({ diff: big, workFiles: { "big.bin": 600 * 1024 } });
+    expect(r.body).toContain("large-file");
+    expect(r.body).toContain("binary-note");
+  });
+
+  it("a small binary does not trigger large-file", async () => {
+    const small = 'diff --git a/small.bin b/small.bin\nBinary files a/small.bin and b/small.bin differ\n';
+    const r = await runWithMocks({ diff: small, workFiles: { "small.bin": 10 * 1024 } });
+    expect(r.body).not.toContain("large-file");
+  });
+
+  it("a rename (a != b) reports the new path, not the old one", async () => {
+    const rename = [
+      "diff --git a/old.bin b/new.bin",
+      "similarity index 90%",
+      "rename from old.bin",
+      "rename to new.bin",
+      "Binary files a/old.bin and b/new.bin differ",
+      "",
+    ].join("\n");
+    const r = await runWithMocks({ diff: rename });
+    expect(r.body).toContain("new.bin");
+    expect(r.body).not.toContain("old.bin");
+  });
+
+  it("a quoted rename reports the decoded new path", async () => {
+    const rename = [
+      'diff --git "a/old.bin" "b/caf\\303\\251.bin"',
+      "similarity index 90%",
+      'Binary files "a/old.bin" and "b/caf\\303\\251.bin" differ',
+      "",
+    ].join("\n");
+    const r = await runWithMocks({ diff: rename });
+    expect(r.body).toContain("café.bin");
+    expect(r.body).not.toContain("old.bin");
+  });
+
+  it("a non-triggering event writes a visible summary line (not an empty summary)", async () => {
+    const r = await runWithMocks({ action: "closed" });
+    expect(r.summaryWritten).toBe(true);
+    expect(readFileSync(r.summaryPath, "utf8")).toContain("does not trigger a review");
+  });
+
+  it("main() on a non-triggering event exits 0 with an EMPTY token (Octokit is built lazily)", async () => {
+    const root = scratch();
+    const eventPath = join(root, "event.json");
+    writeFileSync(eventPath, '{"ref":"refs/heads/main"}');
+    writeFileSync(join(root, "output.txt"), ""); // the runner creates GITHUB_OUTPUT; core requires it
+    const keys = {
+      GITHUB_EVENT_NAME: "push",
+      GITHUB_EVENT_PATH: eventPath,
+      GITHUB_STEP_SUMMARY: join(root, "summary.md"),
+      GITHUB_OUTPUT: join(root, "output.txt"),
+      GITHUB_WORKSPACE: root,
+      INPUT_POST_COMMENT: "false",
+      INPUT_FAIL_LEVEL: "none",
+      INPUT_GITHUB_TOKEN: "",
+      INPUT_LLM_API_KEY: "",
+    };
+    const saved: Record<string, string | undefined> = {};
+    for (const k of Object.keys(keys)) saved[k] = process.env[k];
+    const savedExit = process.exitCode;
+    Object.assign(process.env, keys);
+    try {
+      await main();
+      expect(process.exitCode).toBe(0);
+      expect(readFileSync(keys.GITHUB_STEP_SUMMARY, "utf8")).toContain("does not trigger a review");
+    } finally {
+      for (const [k, v] of Object.entries(saved)) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+      process.exitCode = savedExit;
+    }
+  });
+
+  it("SARIF carries warning and high findings only (info stays out)", async () => {
+    const info: Finding = { severity: "info", file: "src/a.ts", line: 2, rule: "infoonly", message: "i" };
+    const high: Finding = { severity: "high", file: "src/a.ts", line: 2, rule: "hirule", message: "h" };
+    const r = await runWithMocks({ llm: [info, high], failLevel: "none" });
+    const sarif = JSON.parse(readFileSync(join(r.artifactDir, "sarif.json"), "utf8")) as {
+      runs: { results: { ruleId: string }[] }[];
+    };
+    const ids = sarif.runs[0].results.map((x) => x.ruleId);
+    expect(ids).toContain("hirule");
+    expect(ids).not.toContain("infoonly");
+  });
+});
+
+describe("pr-meta validation (M9)", () => {
+  it("readPrMeta rejects a non-hex base_sha", () => {
+    const dir = scratch();
+    writeFileSync(
+      join(dir, "pr-meta.json"),
+      JSON.stringify({ pr_number: 7, head_sha: SHA_HEAD, base_sha: "not-a-sha", head_repo_full_name: "o/r", is_fork: false }),
+    );
+    expect(() => readPrMeta(dir)).toThrow(/Invalid pr-meta\.json/);
   });
 });
 

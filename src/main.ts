@@ -274,7 +274,10 @@ function parseDiffFiles(text: string, workDir?: string): FileDiff[] {
   return sections.map((s) => {
     const at = s.lines.findIndex((l) => l.startsWith("@@"));
     const hunks = at === -1 ? "" : s.lines.slice(at).join("\n").replace(/\n+$/, "");
-    const f: FileDiff = { file: s.file, hunks, truncated: false, size: hunks === "" ? 0 : sizeOf(workDir, s.file) };
+    // Real on-disk size, so the large-file rule fires for binaries over 500 KB. A hunk-less text entry
+    // (mode-only change) reports 0: L0 would otherwise read it as a binary-note.
+    const size = hunks === "" && !s.binary ? 0 : sizeOf(workDir, s.file);
+    const f: FileDiff = { file: s.file, hunks, truncated: false, size };
     if (s.binary) f.binary = true;
     return f;
   });
@@ -394,6 +397,15 @@ function triggerFor(env: RunEnv): boolean {
 function prNumberFor(env: RunEnv): number | null {
   if (env.eventName === "workflow_dispatch") return env.inputs.prNumber;
   return resolvePrNumber(env.eventName, env.payload as Parameters<typeof resolvePrNumber>[1]);
+}
+
+/** Logs a line and, when a summary file exists, appends it there (skip paths must leave evidence). */
+function note(env: RunEnv, out: Outcome, text: string): void {
+  core.info(text);
+  if (env.summaryPath !== undefined) {
+    appendFileSync(env.summaryPath, text + "\n", "utf8");
+    out.summaryWritten = true;
+  }
 }
 
 function summaryFor(findings: Finding[]): string {
@@ -531,6 +543,8 @@ async function publishReview(a: PublishArgs): Promise<void> {
   } catch (e) {
     if (!(e instanceof ReadonlyTokenError)) throw e;
     core.error(`review post refused by GitHub: ${e.detail !== "" ? e.detail : e.message}`);
+    // issuesWrite is derived from the environment: the template grants issues: write explicitly.
+    // A live token-scope check is out of scope; an API refusal still degrades to a warning below.
     const issuesWrite = a.env.issueFallback && canWrite;
     if (!issuesWrite) {
       core.warning("issue fallback unavailable (not enabled, or token lacks issues: write); nothing posted");
@@ -545,11 +559,14 @@ async function publishReview(a: PublishArgs): Promise<void> {
   }
 }
 
-/** SARIF 2.1.0 from findings that have a repository path (code scanning needs a location). */
+/**
+ * SARIF 2.1.0 for code scanning: warning and high findings only (info stays in the review and the
+ * artifact), and only findings with a safe repository path (code scanning needs a location).
+ */
 export function toSarif(findings: Finding[]): unknown {
   const level = (s: Finding["severity"]): string => (s === "high" ? "error" : s === "warning" ? "warning" : "note");
   const results = findings
-    .filter((f) => f.file !== "" && !unsafePath(f.file))
+    .filter((f) => f.severity !== "info" && f.file !== "" && !unsafePath(f.file))
     .map((f) => ({
       ruleId: f.rule,
       level: level(f.severity),
@@ -574,12 +591,12 @@ export function toSarif(findings: Finding[]): unknown {
 async function runFlowA(env: RunEnv, deps: Deps, out: Outcome): Promise<void> {
   out.slowPathSkipped = true;
   if (!triggerFor(env)) {
-    core.info(`event "${env.eventName}" does not trigger a review`);
+    note(env, out, `pr-reviewer: event "${env.eventName}" does not trigger a review; nothing to do.`);
     return;
   }
   const pr = prNumberFor(env);
   if (pr === null) {
-    core.info("no pull request for this event: nothing to review");
+    note(env, out, "pr-reviewer: no pull request for this event; nothing to review.");
     return;
   }
   requireSha("PR_REVIEWER_BASE_SHA", env.baseSha);
@@ -727,11 +744,13 @@ export async function run(env: RunEnv, deps: Deps): Promise<Outcome> {
 }
 
 function realGateway(token: string): Gateway {
-  const octokit = getOctokit(token);
+  // Lazy (M12): the client is built on first use, so a non-triggering run never needs a token.
+  let client: ReturnType<typeof getOctokit> | undefined;
+  const octokit = (): ReturnType<typeof getOctokit> => (client ??= getOctokit(token));
   return {
     async getPr(pr) {
       const { owner, repo } = context.repo;
-      const r = await octokit.rest.pulls.get({ owner, repo, pull_number: pr });
+      const r = await octokit().rest.pulls.get({ owner, repo, pull_number: pr });
       const headRepo = r.data.head.repo?.full_name ?? "";
       return {
         body: r.data.body ?? "",
@@ -744,7 +763,7 @@ function realGateway(token: string): Gateway {
     async findPrsByHead(headRepo, headRef) {
       const { owner, repo } = context.repo;
       const headOwner = headRepo.split("/")[0];
-      const prs = await octokit.paginate(octokit.rest.pulls.list, {
+      const prs = await octokit().paginate(octokit().rest.pulls.list, {
         owner,
         repo,
         state: "open",
@@ -760,12 +779,12 @@ function realGateway(token: string): Gateway {
     },
     async getIssueBody(issue) {
       const { owner, repo } = context.repo;
-      const r = await octokit.rest.issues.get({ owner, repo, issue_number: issue });
+      const r = await octokit().rest.issues.get({ owner, repo, issue_number: issue });
       return r.data.body ?? "";
     },
     createReview: (pr, payload, opts) =>
-      postReview(octokit, pr, payload, { canWrite: opts.canWrite }).then(() => undefined),
-    createIssueComment: (pr, body, opts) => postIssueFallback(octokit, { pr, body, ...opts }),
+      postReview(octokit(), pr, payload, { canWrite: opts.canWrite }).then(() => undefined),
+    createIssueComment: (pr, body, opts) => postIssueFallback(octokit(), { pr, body, ...opts }),
   };
 }
 

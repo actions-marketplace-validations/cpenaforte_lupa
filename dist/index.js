@@ -1,3 +1,4 @@
+import { createRequire as __cr } from "node:module"; const require = __cr(import.meta.url);
 var __create = Object.create;
 var __defProp = Object.defineProperty;
 var __getOwnPropDesc = Object.getOwnPropertyDescriptor;
@@ -24614,7 +24615,7 @@ function readPrMeta(dir) {
     throw new Error(`Invalid ${PR_META_FILE} in ${dir}`);
   }
   const v = parsed;
-  if (typeof v.pr_number !== "number" || typeof v.head_sha !== "string" || typeof v.base_sha !== "string" || typeof v.head_repo_full_name !== "string" || typeof v.is_fork !== "boolean" || !Number.isInteger(v.pr_number) || v.pr_number < 1 || !/^[0-9a-f]{40}$/i.test(v.head_sha)) {
+  if (typeof v.pr_number !== "number" || typeof v.head_sha !== "string" || typeof v.base_sha !== "string" || typeof v.head_repo_full_name !== "string" || typeof v.is_fork !== "boolean" || !Number.isInteger(v.pr_number) || v.pr_number < 1 || !/^[0-9a-f]{40}$/i.test(v.head_sha) || !/^[0-9a-f]{40}$/i.test(v.base_sha)) {
     throw new Error(`Invalid ${PR_META_FILE} in ${dir}`);
   }
   return {
@@ -26020,7 +26021,8 @@ function parseDiffFiles(text, workDir) {
   return sections.map((s) => {
     const at = s.lines.findIndex((l) => l.startsWith("@@"));
     const hunks = at === -1 ? "" : s.lines.slice(at).join("\n").replace(/\n+$/, "");
-    const f = { file: s.file, hunks, truncated: false, size: hunks === "" ? 0 : sizeOf(workDir, s.file) };
+    const size = hunks === "" && !s.binary ? 0 : sizeOf(workDir, s.file);
+    const f = { file: s.file, hunks, truncated: false, size };
     if (s.binary)
       f.binary = true;
     return f;
@@ -26101,6 +26103,13 @@ function prNumberFor(env) {
   if (env.eventName === "workflow_dispatch")
     return env.inputs.prNumber;
   return resolvePrNumber(env.eventName, env.payload);
+}
+function note(env, out, text) {
+  info(text);
+  if (env.summaryPath !== void 0) {
+    appendFileSync2(env.summaryPath, text + "\n", "utf8");
+    out.summaryWritten = true;
+  }
 }
 function summaryFor(findings) {
   return findings.length === 0 ? "pr-reviewer: no findings." : `pr-reviewer: ${findings.length} finding(s).`;
@@ -26219,7 +26228,7 @@ async function publishReview(a) {
 }
 function toSarif(findings) {
   const level = (s) => s === "high" ? "error" : s === "warning" ? "warning" : "note";
-  const results = findings.filter((f) => f.file !== "" && !unsafePath(f.file)).map((f) => ({
+  const results = findings.filter((f) => f.severity !== "info" && f.file !== "" && !unsafePath(f.file)).map((f) => ({
     ruleId: f.rule,
     level: level(f.severity),
     message: { text: f.message },
@@ -26241,12 +26250,12 @@ function toSarif(findings) {
 async function runFlowA(env, deps, out) {
   out.slowPathSkipped = true;
   if (!triggerFor(env)) {
-    info(`event "${env.eventName}" does not trigger a review`);
+    note(env, out, `pr-reviewer: event "${env.eventName}" does not trigger a review; nothing to do.`);
     return;
   }
   const pr = prNumberFor(env);
   if (pr === null) {
-    info("no pull request for this event: nothing to review");
+    note(env, out, "pr-reviewer: no pull request for this event; nothing to review.");
     return;
   }
   requireSha("PR_REVIEWER_BASE_SHA", env.baseSha);
@@ -26365,11 +26374,12 @@ async function run2(env, deps) {
   return out;
 }
 function realGateway(token) {
-  const octokit = getOctokit(token);
+  let client;
+  const octokit = () => client ??= getOctokit(token);
   return {
     async getPr(pr) {
       const { owner, repo } = context2.repo;
-      const r = await octokit.rest.pulls.get({ owner, repo, pull_number: pr });
+      const r = await octokit().rest.pulls.get({ owner, repo, pull_number: pr });
       const headRepo = r.data.head.repo?.full_name ?? "";
       return {
         body: r.data.body ?? "",
@@ -26382,7 +26392,7 @@ function realGateway(token) {
     async findPrsByHead(headRepo, headRef) {
       const { owner, repo } = context2.repo;
       const headOwner = headRepo.split("/")[0];
-      const prs = await octokit.paginate(octokit.rest.pulls.list, {
+      const prs = await octokit().paginate(octokit().rest.pulls.list, {
         owner,
         repo,
         state: "open",
@@ -26393,11 +26403,11 @@ function realGateway(token) {
     },
     async getIssueBody(issue2) {
       const { owner, repo } = context2.repo;
-      const r = await octokit.rest.issues.get({ owner, repo, issue_number: issue2 });
+      const r = await octokit().rest.issues.get({ owner, repo, issue_number: issue2 });
       return r.data.body ?? "";
     },
-    createReview: (pr, payload, opts) => postReview(octokit, pr, payload, { canWrite: opts.canWrite }).then(() => void 0),
-    createIssueComment: (pr, body, opts) => postIssueFallback(octokit, { pr, body, ...opts })
+    createReview: (pr, payload, opts) => postReview(octokit(), pr, payload, { canWrite: opts.canWrite }).then(() => void 0),
+    createIssueComment: (pr, body, opts) => postIssueFallback(octokit(), { pr, body, ...opts })
   };
 }
 function realAnalysis() {

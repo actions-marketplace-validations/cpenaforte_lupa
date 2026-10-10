@@ -142,7 +142,8 @@ function responseFormatFor(provider: string): ResponseFormat | undefined {
   return { type: "json_object" };
 }
 
-// Requires a non-empty key: callLlm's early no-key return guarantees it, and ensureOllama guards empty keys in its scrub wrapper, so split("") never runs.
+// Requires a non-empty key: callLlm's early no-key return guarantees it, and ensureOllama guards
+// empty keys in its scrub wrapper, so split("") never runs.
 function redact(text: string, key: string): string {
   return text.split(key).join("[REDACTED]");
 }

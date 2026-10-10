@@ -49,6 +49,21 @@ jobs:
           test -s dist/index.js
           node --check dist/index.js
 
+      - name: Execute the bundle on a non-triggering event (must exit 0 and write a summary)
+        env:
+          GITHUB_EVENT_NAME: push
+          GITHUB_EVENT_PATH: ${{ github.workspace }}/tests/fixtures/push-event.json
+          GITHUB_STEP_SUMMARY: ${{ runner.temp }}/bundle-summary.md
+          GITHUB_OUTPUT: ${{ runner.temp }}/bundle-output.txt
+          INPUT_POST_COMMENT: "false"
+          INPUT_FAIL_LEVEL: none
+          INPUT_LLM_API_KEY: ""
+        run: |
+          set -euo pipefail
+          : > "$GITHUB_OUTPUT"
+          node dist/index.js
+          test -s "$GITHUB_STEP_SUMMARY"
+
       - name: Committed dist matches the build
         run: git diff --exit-code -- dist/index.js
 
@@ -92,6 +107,10 @@ jobs:
 
       - name: Run the action without an LLM key (dry-run, no comment)
         uses: ./
+        env:
+          # Non-triggering context: CI has no PR head to review. The action must exit 0.
+          GITHUB_EVENT_NAME: push
+          GITHUB_EVENT_PATH: ${{ github.workspace }}/tests/fixtures/push-event.json
         with:
           post_comment: "false"
           fail_level: none
@@ -112,6 +131,9 @@ jobs:
 
       - name: Run the action as a fork PR would (summary only)
         uses: ./
+        env:
+          GITHUB_EVENT_NAME: push
+          GITHUB_EVENT_PATH: ${{ github.workspace }}/tests/fixtures/push-event.json
         with:
           post_comment: "false"
           fail_level: none
@@ -121,7 +143,7 @@ jobs:
         run: test -s "$GITHUB_STEP_SUMMARY"
 
   sarif:
-    name: SARIF upload (same-repo PRs only)
+    name: SARIF upload plumbing (same-repo PRs only)
     needs: build
     if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
     timeout-minutes: 20
@@ -136,15 +158,13 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Run the action (dry-run, no comment)
-        uses: ./
-        env:
-          PR_REVIEWER_ARTIFACT_DIR: ${{ runner.temp }}/pr-reviewer-out
-        with:
-          post_comment: "false"
-          fail_level: none
-          llm_api_key: ""
+      - name: Stage an empty SARIF fixture where the action writes sarif.json
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/pr-reviewer-out"
+          cp tests/fixtures/sarif-sample.json "$RUNNER_TEMP/pr-reviewer-out/sarif.json"
 
+      # Plumbing only: the fixture has no results, so this proves the upload wiring, not findings.
       - name: Upload SARIF
         continue-on-error: true
         uses: github/codeql-action/upload-sarif@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3

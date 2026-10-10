@@ -2,7 +2,7 @@
 
 A reusable GitHub Action (TypeScript, Node 24) that reviews pull requests in two layers and posts the result as one review:
 
-- **Fast-path (always, free, any language):** diff statistics, sensitive paths, secret patterns (regex + gitleaks), TODO/FIXME markers, lockfile changes without a manifest, and scanners (semgrep, trivy, osv-scanner). Optional L2 native toolchains run only when the repository already has their config.
+- **Fast-path (always, free, any language):** diff statistics, sensitive paths, secret detection (gitleaks), TODO/FIXME markers, lockfile changes without a manifest, and scanners (semgrep, gitleaks, trivy, osv-scanner). Optional L2 native toolchains run only when the repository already has their config.
 - **Slow-path (optional, bring your own key):** an LLM reviews the diff. It runs only when `llm_api_key` is set. Without a key it is skipped with a warning and the fast-path result is posted.
 
 The diff is treated as untrusted data. The LLM has no tools and its output is validated against a schema before anything is posted.
@@ -89,7 +89,7 @@ Budget figures are estimates. Prices change: check your provider's price page, a
 - **Cost of a typical PR:** about 3k input tokens plus 600 output tokens.
 - **Ceiling:** `max_diff_chars` 60000 is about 15k input tokens plus prompt overhead. At frontier-model prices a PR at the ceiling costs roughly $0.15 to $0.30. Compare with the typical figure above (about 3k input and 600 output tokens). Lower `max_diff_chars` to cap spend. Files larger than the per-file cap (8000 characters) are truncated, and files over the total ceiling are skipped with a note.
 - **peak/off-peak pricing:** some models price by time of day. For example, `deepseek-v4.1-flash` has different peak and off-peak prices. Check the current rates before choosing a model for high-volume repositories.
-- **Retries:** one retry with exponential backoff, only on 5xx and 429 (honouring `Retry-After`). Timeouts and output truncation (`finish_reason: length`) are not retried with a smaller diff, because truncating the input does not fix truncated output.
+- **Retries:** one retry after a fixed 500 ms delay, only on 5xx and 429. A `Retry-After` header replaces the delay, capped at 5 s. Timeouts and output truncation (`finish_reason: length`) are not retried with a smaller diff, because truncating the input does not fix truncated output.
 
 ## Gate: `fail_level`
 
@@ -106,6 +106,11 @@ The findings and the gate are separate. The review event and the exit code follo
 - The action step exits non-zero for `1` and `2`, so the template runs it with `continue-on-error: true` and reads `steps.review.outputs.exit-code` in a separate gate step.
 - The template's gate passes on `0` and `2` and fails on `1`. Warning findings never block a merge. A failed run (for example an action error, where no exit code is produced) still fails the gate. To block on high-severity findings, set `fail_level: high`.
 
+## Scanners and their runtimes
+
+- **semgrep** runs from the PyPI package, pinned to `semgrep==1.180.0`. The unprivileged template installs it into a venv. No docker is needed for semgrep.
+- **gitleaks, trivy and osv-scanner** run from docker images pinned by digest. The runner needs docker for them. Without docker, each one reports a `scanner-missing` warning and the run continues.
+
 ## Dry-run: `post_comment: false`
 
 With `post_comment: false` the action runs the whole pipeline, writes the summary and the artifact, and logs the event and the finding counts it would have posted (event, inline, general and high). The review body is not logged. Nothing is posted to the PR. Use it to tune the prompt, the model, or `max_diff_chars` before you enable posting.
@@ -117,17 +122,19 @@ A fork PR gets a read-only `GITHUB_TOKEN`, so the review cannot be posted from t
 To post reviews on fork PRs, use the two-workflow pattern with an App token:
 
 1. **Unprivileged** (`docs/workflow-template.yml`, trigger `pull_request`): checks out the PR head with `persist-credentials: false`, writes the diff against the fetched base SHA, runs the review and uploads the artifact. It holds no App key.
-2. **Privileged** (`docs/workflow-template-privileged.yml`, trigger `workflow_run` on `PR Reviewer` with `types: [completed]`, guarded to successful `pull_request` runs): runs in the base repository context. It only downloads the artifact by `run-id`, verifies the files, and posts the review, using a GitHub App token created with `actions/create-github-app-token` when `PR_REVIEWER_APP_ID` is set. It never checks out PR code, never runs scanners or L2, and never calls the LLM.
+2. **Privileged** (`docs/workflow-template-privileged.yml`, trigger `workflow_run` on `PR Reviewer` with `types: [completed]`, guarded to fork `pull_request` runs that were not cancelled): runs in the base repository context. It only downloads the artifact by `run-id`, verifies the files, and posts the review, using a GitHub App token created with `actions/create-github-app-token` when `PR_REVIEWER_APP_ID` is set. It never checks out PR code, never runs scanners or L2, and never calls the LLM.
 
 The segregation matters: the privileged job reads only the artifact, so PR code never runs with the App key.
 
-**Fork L2 skip:** on fork PRs with secrets in scope (any trigger other than `pull_request`, an App token, or an `llm_api_key`), the action does not run L2 native toolchains, because they execute repository-defined tooling. Semgrep, gitleaks and trivy still run. A warning is logged.
+**Why not `success` only:** the unprivileged job fails on purpose when `fail_level` gates a high-severity finding (exit `1`). The privileged job therefore accepts any conclusion except `cancelled`. Otherwise those high-severity reviews would never reach a fork PR. The artifact checks keep this safe: `pr-meta.json` is required, the PR is derived from the trusted `workflow_run` fields, and the head SHA, repository and branch must match the live PR. Same-repo runs are skipped there, because the unprivileged template already posts them.
+
+**Fork L2 skip:** on fork PRs with secrets in scope (any trigger other than `pull_request`, an App token, or an `llm_api_key`), the action does not run L2 native toolchains, because they execute repository-defined tooling. Semgrep, gitleaks and trivy still run. The skip is logged as a warning and recorded as an info-level `l2-skipped` finding, which appears in the review body and the artifact.
 
 **Known limitation:** every scanner and L2 process gets a scrubbed environment (no `*TOKEN*`, `*KEY*`, `*SECRET*`, `*PASSWORD*`, `*AUTH*`, `GITHUB_TOKEN` or `ACTIONS_*` variables). This is not a sandbox. A residual `/proc` vector remains: a process can read its parent's environment and memory maps. For high-threat repositories, move the review of untrusted code into a workflow with no secrets and no base-repository context, and post results only through the privileged template.
 
 ## Security notes
 
-- Keep `permissions` minimal: `contents: read`, `pull-requests: write`. Add `issues: write` only with the issue-comment fallback (`PR_REVIEWER_ISSUE_FALLBACK: "true"`), and `security-events: write` only for the SARIF upload.
+- Keep `permissions` minimal: `contents: read`, `pull-requests: write`. The templates ship `issues: write` and `security-events: write` commented out. Uncomment `issues: write` only with the issue-comment fallback (`PR_REVIEWER_ISSUE_FALLBACK: "true"`), and `security-events: write` only for the SARIF upload.
 - Pin the action and every third-party action to a commit SHA.
 - Never interpolate PR titles or bodies into `run:` steps. `pull_request_target` is not used.
 - `llm_api_key` is never written to logs. Prompt-injection defences are structural (delimited diff, no tools for the model, output validation, an auditable log of each call). They are not a guarantee.

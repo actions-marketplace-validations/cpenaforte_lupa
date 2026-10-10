@@ -17,9 +17,19 @@ concurrency:
   group: pr-reviewer-priv-${{ github.event.workflow_run.head_repository.full_name }}-${{ github.event.workflow_run.head_branch }}
   cancel-in-progress: true
 
+# Why the guards look like this:
+# - Fork only (head_repository != this repository): same-repo PRs are reviewed and posted by the
+#   unprivileged template. Running here too would post the same review twice.
+# - conclusion != 'cancelled', not == 'success': the unprivileged job FAILS when fail_level gates a
+#   high finding (exit 1). Requiring success would silently drop exactly the high-severity reviews.
+#   The artifact checks keep this safe: pr-meta.json is required, the PR is derived from the
+#   trusted workflow_run fields, and the head SHA, repository and branch must match the live PR.
 jobs:
   post:
-    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'pull_request'
+    if: >-
+      github.event.workflow_run.conclusion != 'cancelled'
+      && github.event.workflow_run.event == 'pull_request'
+      && github.event.workflow_run.head_repository.full_name != github.repository
     runs-on: ubuntu-latest
     steps:
       - name: Create GitHub App token (optional; App tokens may write on fork PRs)

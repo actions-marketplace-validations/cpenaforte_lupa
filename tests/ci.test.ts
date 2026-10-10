@@ -180,6 +180,39 @@ describe("ci workflow", () => {
     expect(job).toContain("runs-on: ubuntu-latest");
   });
 
+  it("build job executes the bundle on a non-triggering event (C1: ESM/CJS interop must load)", () => {
+    const c = fs.readFileSync(CI, "utf8");
+    const job = jobBlock(c, "build");
+    expect(job).toContain("node dist/index.js");
+    expect(job).toContain("GITHUB_EVENT_NAME: push");
+    expect(job).toContain("tests/fixtures/push-event.json");
+    expect(job).toContain('INPUT_POST_COMMENT: "false"');
+    expect(job).toContain('test -s "$GITHUB_STEP_SUMMARY"');
+    expect(fs.existsSync("tests/fixtures/push-event.json")).toBe(true);
+    expect(JSON.parse(fs.readFileSync("tests/fixtures/push-event.json", "utf8")).ref).toBe("refs/heads/main");
+  });
+
+  it("smoke jobs run the action in a non-triggering context (no PR head to review in CI)", () => {
+    const c = fs.readFileSync(CI, "utf8");
+    for (const key of ["smoke", "no-secret-smoke"]) {
+      const job = jobBlock(c, key);
+      expect(job, key).toContain("GITHUB_EVENT_NAME: push");
+      expect(job, key).toContain("GITHUB_EVENT_PATH: ${{ github.workspace }}/tests/fixtures/push-event.json");
+    }
+  });
+
+  it("sarif job uploads the committed plumbing fixture (no findings, no action review)", () => {
+    const c = fs.readFileSync(CI, "utf8");
+    const job = jobBlock(c, "sarif");
+    expect(job).toContain("tests/fixtures/sarif-sample.json");
+    expect(job).toContain("github/codeql-action/upload-sarif@");
+    expect(job).toContain("continue-on-error: true");
+    expect(fs.existsSync("tests/fixtures/sarif-sample.json")).toBe(true);
+    const sample = JSON.parse(fs.readFileSync("tests/fixtures/sarif-sample.json", "utf8")) as { version: string; runs: { results: unknown[] }[] };
+    expect(sample.version).toBe("2.1.0");
+    expect(sample.runs[0].results).toHaveLength(0);
+  });
+
   it("release docs: tag, canary on the tag, substitution, v1 move, marketplace, in that order, no rollback", () => {
     const d = fs.readFileSync("docs/e2e-checklist.md", "utf8");
     expect(d).toContain("git tag -a v0.1.0");

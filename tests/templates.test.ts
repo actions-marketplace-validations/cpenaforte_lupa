@@ -33,7 +33,9 @@ describe("workflow templates", () => {
     const p = fs.readFileSync("docs/workflow-template-privileged.yml", "utf8");
     expect(p).toContain("workflow_run");
     expect(p).toContain("types: [completed]");
-    expect(p).toContain("conclusion == 'success'");
+    expect(p).toContain("conclusion != 'cancelled'");
+    expect(p).not.toContain("conclusion == 'success'");
+    expect(p).toContain("github.event.workflow_run.head_repository.full_name != github.repository");
     expect(p).toContain("github.event.workflow_run.event == 'pull_request'");
     expect(p).toContain("pr-reviewer-priv-");
     expect(p).toContain("head_repository.full_name");
@@ -59,6 +61,28 @@ describe("workflow templates", () => {
     expect(p).toContain("runner.temp");
     expect(p).not.toMatch(/^\s*-\s*uses:\s*actions\/checkout\b/m);
     expect(p).not.toMatch(/run:\s*.*\b(checkout|semgrep|trivy|osv-scanner|ollama pull|chat\/completions)\b/m);
+  });
+
+  it("privileged guards: fork-only (no double post) and not-cancelled (high-severity reviews still post)", () => {
+    const p = fs.readFileSync("docs/workflow-template-privileged.yml", "utf8");
+    const ifLine = p.slice(p.indexOf("    if: >-"), p.indexOf("    runs-on:", p.indexOf("    if: >-")));
+    expect(ifLine).toContain("conclusion != 'cancelled'");
+    expect(ifLine).toContain("github.event.workflow_run.event == 'pull_request'");
+    expect(ifLine).toContain("head_repository.full_name != github.repository");
+    expect(p).toMatch(/Why the guards look like this/);
+  });
+
+  it("unprivileged job gates re-trigger comments and reviews on trusted author associations", () => {
+    const t = fs.readFileSync("docs/workflow-template.yml", "utf8");
+    expect(t).toContain('contains(fromJSON(\'["OWNER","MEMBER","COLLABORATOR"]\'), github.event.comment.author_association)');
+    expect(t).toContain('contains(fromJSON(\'["OWNER","MEMBER","COLLABORATOR"]\'), github.event.review.author_association)');
+  });
+
+  it("semgrep is installed from PyPI at the pinned version (no docker)", () => {
+    const t = fs.readFileSync("docs/workflow-template.yml", "utf8");
+    expect(t).toContain("semgrep==1.180.0");
+    expect(t).toContain("python3 -m venv");
+    expect(t).toContain('echo "$RUNNER_TEMP/semgrep-venv/bin" >> "$GITHUB_PATH"');
   });
 
   it("explicit fetches authenticate in memory via GIT_CONFIG env, anonymous otherwise", () => {

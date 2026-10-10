@@ -205,7 +205,8 @@ export function readPrMeta(dir: string): PrMeta | undefined {
     typeof v.is_fork !== "boolean" ||
     !Number.isInteger(v.pr_number) ||
     v.pr_number < 1 ||
-    !/^[0-9a-f]{40}$/i.test(v.head_sha)
+    !/^[0-9a-f]{40}$/i.test(v.head_sha) ||
+    !/^[0-9a-f]{40}$/i.test(v.base_sha)
   ) {
     throw new Error(`Invalid ${PR_META_FILE} in ${dir}`);
   }

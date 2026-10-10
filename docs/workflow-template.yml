@@ -44,7 +44,11 @@ concurrency:
 
 jobs:
   review:
-    if: github.event_name != 'issue_comment' || github.event.issue.pull_request
+    # Association gate at job level (M11): re-trigger comments and reviews need a trusted author.
+    # The action repeats the check, so a missed gate here still never runs a review.
+    if: >-
+      (github.event_name != 'issue_comment' || (github.event.issue.pull_request && contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)))
+      && (github.event_name != 'pull_request_review' || contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.review.author_association))
     runs-on: ubuntu-latest
     env:
       PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number || inputs.pr_number }}
@@ -89,6 +93,13 @@ jobs:
           git fetch --no-tags origin "pull/${PR_NUMBER}/head:refs/remotes/pr-reviewer/head-${PR_NUMBER}"
           git fetch --no-tags origin "${BASE_SHA}"
           git checkout --detach --force "${HEAD_SHA}"
+
+      - name: Install semgrep (pinned, from PyPI; no docker needed)
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/semgrep-venv"
+          "$RUNNER_TEMP/semgrep-venv/bin/pip" install --disable-pip-version-check semgrep==1.180.0
+          echo "$RUNNER_TEMP/semgrep-venv/bin" >> "$GITHUB_PATH"
 
       - name: Write diff (base...head, never the runner HEAD)
         env:
