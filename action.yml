@@ -42,7 +42,7 @@ inputs:
     required: false
     default: ""
   fail_level:
-    description: "Lowest finding severity that fails the action: warning or error"
+    description: "Lowest finding severity that fails the action: none, warning or high"
     required: false
     default: "warning"
   max_diff_chars:

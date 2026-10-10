@@ -8,9 +8,8 @@
     "node": ">=24"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json && esbuild lib/main.js --bundle --platform=node --target=node24 --format=esm --outfile=dist/index.js",
-    "test": "vitest run",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "build": "tsc -p tsconfig.json && esbuild lib/src/main.js --bundle --platform=node --target=node24 --format=esm --outfile=dist/index.js",
+    "test": "vitest run"
   },
   "dependencies": {
     "@actions/core": "3.0.1",

@@ -18,4 +18,9 @@ describe("scaffolding", () => {
     const gi = fs.readFileSync(".gitignore", "utf8");
     expect(gi).not.toMatch(/^dist\/?$/m);
   });
+  it("entry guard uses pathToFileURL, not a hand-built file:// URL", () => {
+    const src = fs.readFileSync("src/main.ts", "utf8");
+    expect(src).toContain("pathToFileURL");
+    expect(src).not.toContain("`file://${");
+  });
 });
