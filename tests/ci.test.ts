@@ -223,6 +223,9 @@ describe("ci workflow", () => {
     expect(d).toContain("docs/workflow-template.yml docs/workflow-template-privileged.yml");
     expect(d).toMatch(/never copy them from the v0\.1\.0 tag/i);
     expect(d).not.toMatch(/roll ?back/i);
+    expect(d).toContain("security-events: write");
+    expect(d).toContain("actions: read");
+    expect(d).toMatch(/security tab/i);
     const release = d.slice(d.indexOf("## Release procedure")).toLowerCase();
     const order = ["git tag -a v0.1.0", "canary", "rev-parse", "docs/workflow-template-privileged.yml", "git tag -f v1", "marketplace"];
     const idx = order.map((s) => release.indexOf(s));

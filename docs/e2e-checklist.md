@@ -79,6 +79,11 @@ Release order (strict; `v1` moves exactly once, as the last tag move):
    `OWNER/lupa@v0.1.0` and run every case above, including live Ollama. All must pass. Do not
    touch `v0.1.0`. If a case fails, fix on `main`, cut a new tag (`v0.1.1`), and restart from step 2.
    `v1` has not moved yet, so nothing consumes the failed release.
+   - **SARIF check:** to verify the SARIF upload in the canary, enable **both** `security-events: write`
+     and `actions: read` in the workflow, then confirm the findings appear in the repository's
+     Security tab (Code scanning alerts). With either permission missing the upload fails with
+     "Resource not accessible by integration" and `continue-on-error` absorbs it silently; that is
+     expected, but the canary should exercise the enabled path at least once.
 4. **Substitute the tag's commit SHA into BOTH templates**, then commit on `main` (follow-up commit C).
    Get the SHA from the tag, never type it by hand. The first `sed` replaces the placeholder with the
    owner and the SHA; the second drops the stale `# replace with a released SHA` comment. Replace

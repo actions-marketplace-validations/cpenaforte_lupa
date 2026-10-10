@@ -35,8 +35,12 @@ permissions:
   pull-requests: write
   # Uncomment ONLY when PR_REVIEWER_ISSUE_FALLBACK is "true" (issue-comment fallback for refused reviews):
   # issues: write
-  # Uncomment ONLY together with the SARIF upload step below (code scanning, same-repo PRs):
+  # Uncomment BOTH lines below ONLY together with the SARIF upload step (code scanning, same-repo PRs).
+  # Uploading SARIF needs security-events: write AND actions: read: private repos need actions: read for
+  # the workflow-run lookup, and the upload-sarif telemetry also uses it. Missing either permission
+  # makes the upload fail with "Resource not accessible by integration".
   # security-events: write
+  # actions: read
 
 concurrency:
   group: pr-reviewer-${{ github.event.pull_request.number || github.event.issue.number || inputs.pr_number }}
@@ -143,10 +147,11 @@ jobs:
           fail_level: warning
 
       # This step is evaluated on every event. Its guard checks only that the event has a same-repository
-      # PR head. Without security-events: write (commented out above), the upload fails and
+      # PR head. It needs BOTH security-events: write and actions: read (commented out above); without
+      # them the upload fails ("Resource not accessible by integration" on private repos) and
       # continue-on-error absorbs it, so the job still passes. The guard is false on
       # issue_comment and workflow_dispatch (no PR head context), where the step is skipped.
-      - name: "Upload SARIF (same-repo PRs; needs security-events: write above)"
+      - name: "Upload SARIF (same-repo PRs; needs security-events: write + actions: read above)"
         if: always() && github.event.pull_request.head.repo.full_name == github.repository
         continue-on-error: true
         uses: github/codeql-action/upload-sarif@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3

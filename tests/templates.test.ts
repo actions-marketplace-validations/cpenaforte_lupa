@@ -140,7 +140,29 @@ describe("workflow templates", () => {
 
   it("the SARIF step name is quoted (the colon in its name broke the YAML before)", () => {
     const t = fs.readFileSync("docs/workflow-template.yml", "utf8");
-    expect(t).toContain('- name: "Upload SARIF (same-repo PRs; needs security-events: write above)"');
+    expect(t).toContain('- name: "Upload SARIF (same-repo PRs; needs security-events: write + actions: read above)"');
+  });
+
+  it("SARIF enablement documents that BOTH permissions are required and the failure mode", () => {
+    const t = fs.readFileSync("docs/workflow-template.yml", "utf8");
+    // Both lines stay commented by default (least privilege).
+    expect(t).toMatch(/^ {2}# security-events: write$/m);
+    expect(t).toMatch(/^ {2}# actions: read$/m);
+    expect(t).not.toMatch(/^ {2}security-events: write$/m);
+    expect(t).not.toMatch(/^ {2}actions: read$/m);
+    // The permissions comment names both and says why private repos need actions: read.
+    const perms = t.slice(t.indexOf("permissions:"), t.indexOf("concurrency:"));
+    expect(perms).toContain("security-events: write");
+    expect(perms).toContain("actions: read");
+    expect(perms).toContain("Resource not accessible by integration");
+    expect(perms).toMatch(/private repo/i);
+  });
+
+  it("the SARIF step comment names both required permissions", () => {
+    const t = fs.readFileSync("docs/workflow-template.yml", "utf8");
+    const comment = t.slice(t.indexOf("# This step is evaluated on every event"), t.indexOf('- name: "Upload SARIF'));
+    expect(comment).toContain("security-events: write");
+    expect(comment).toContain("actions: read");
   });
 
   it("trust model comment states the precise claim and the /proc-vector limitation", () => {

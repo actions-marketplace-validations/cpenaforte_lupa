@@ -147,7 +147,7 @@ The segregation matters: the privileged job reads only the artifact, so PR code 
 
 ## Security notes
 
-- Keep `permissions` minimal: `contents: read`, `pull-requests: write`. The templates ship `issues: write` and `security-events: write` commented out. Uncomment `issues: write` only with the issue-comment fallback (`PR_REVIEWER_ISSUE_FALLBACK: "true"`), and `security-events: write` only for the SARIF upload.
+- Keep `permissions` minimal: `contents: read`, `pull-requests: write`. The templates ship `issues: write`, `security-events: write` and `actions: read` commented out. Uncomment `issues: write` only with the issue-comment fallback (`PR_REVIEWER_ISSUE_FALLBACK: "true"`). Enabling the code-scanning SARIF upload needs **both** `security-events: write` and `actions: read` (private repos need `actions: read` for the workflow-run lookup, and the `upload-sarif` telemetry also uses it). With either one missing the upload fails with "Resource not accessible by integration" and `continue-on-error` silently absorbs it, so the review still posts.
 - Pin the action and every third-party action to a commit SHA.
 - Never interpolate PR titles or bodies into `run:` steps. `pull_request_target` is not used.
 - `llm_api_key` is never written to logs. Prompt-injection defences are structural (delimited diff, no tools for the model, output validation, an auditable log of each call). They are not a guarantee.

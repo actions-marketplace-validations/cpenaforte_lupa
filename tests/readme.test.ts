@@ -61,4 +61,13 @@ describe("README", () => {
     expect(r).toContain("docs/workflow-template.yml");
     expect(r).toContain("docs/workflow-template-privileged.yml");
   });
+
+  it("readme documents SARIF enablement needing both security-events: write and actions: read", () => {
+    const r = fs.readFileSync("README.md", "utf8");
+    const sec = r.slice(r.indexOf("## Security notes"), r.indexOf("## Why the technical identifiers"));
+    expect(sec).toContain("security-events: write");
+    expect(sec).toContain("actions: read");
+    expect(sec).toContain("continue-on-error");
+    expect(sec).toMatch(/review still posts/i);
+  });
 });
