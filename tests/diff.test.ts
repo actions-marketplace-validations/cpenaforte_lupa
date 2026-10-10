@@ -104,8 +104,9 @@ describe("diff", () => {
     }
   });
 
-  it("readPrMeta throws a clean error when JSON is null or an array", () => {
-    for (const body of ["null", "[]", "42", '"str"']) {
+  it.each(["null", "[]", "42", '"str"'])(
+    "readPrMeta throws a clean error when JSON body is %s",
+    (body) => {
       const dir = mkdtempSync(join(tmpdir(), "prmeta-"));
       try {
         writeFileSync(join(dir, "pr-meta.json"), body, "utf8");
@@ -113,8 +114,8 @@ describe("diff", () => {
       } finally {
         rmSync(dir, { recursive: true, force: true });
       }
-    }
-  });
+    },
+  );
 
   it("readPrMeta returns undefined when no pr-meta file exists", () => {
     const dir = mkdtempSync(join(tmpdir(), "prmeta-"));
