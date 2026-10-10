@@ -28,22 +28,23 @@ describe("mapToComments", () => {
     expect(off.general.map((f) => f.file)).toContain("a.ts");
   });
 
-  it("v1 never emits start_line/start_side, even for a suggestion on a multi-line run", () => {
-    const r = mapToComments(
+  it("v1 never emits start_line/start_side, with or without a suggestion on a multi-line run", () => {
+    const withSuggestion = mapToComments(
       [{ severity: "warning", file: "a.ts", line: 10, rule: "r", message: "m", suggestion: "s" }],
       rangeFixture(),
     );
-    expect(r.inline).toHaveLength(1);
-    expect(r.inline[0].line).toBe(10);
-    expect(r.inline[0].side).toBe("RIGHT");
-    expect("start_line" in r.inline[0]).toBe(false);
-    expect("start_side" in r.inline[0]).toBe(false);
-  });
+    expect(withSuggestion.inline).toHaveLength(1);
+    expect(withSuggestion.inline[0].line).toBe(10);
+    expect(withSuggestion.inline[0].side).toBe("RIGHT");
+    expect("start_line" in withSuggestion.inline[0]).toBe(false);
+    expect("start_side" in withSuggestion.inline[0]).toBe(false);
 
-  it("single-line finding without suggestion carries no start fields", () => {
-    const r = mapToComments([{ severity: "warning", file: "a.ts", line: 10, rule: "r", message: "m" }], rangeFixture());
-    expect(r.inline[0].start_line).toBeUndefined();
-    expect(r.inline[0].start_side).toBeUndefined();
+    const withoutSuggestion = mapToComments(
+      [{ severity: "warning", file: "a.ts", line: 10, rule: "r", message: "m" }],
+      rangeFixture(),
+    );
+    expect("start_line" in withoutSuggestion.inline[0]).toBe(false);
+    expect("start_side" in withoutSuggestion.inline[0]).toBe(false);
   });
 
   it("RIGHT suggestion renders a ```suggestion fence", () => {
@@ -63,6 +64,16 @@ describe("mapToComments", () => {
     expect(r.inline[0].body).not.toContain("```");
     expect(r.inline[0].body).not.toContain("suggestion");
     expect(r.inline[0].body).toContain("Suggested: fixed");
+  });
+
+  it("LEFT multi-line suggestion indents continuation lines", () => {
+    const r = mapToComments(
+      [{ severity: "high", file: "a.ts", line: 3, rule: "r", message: "m", suggestion: "a\nb" }],
+      hunksFixture(),
+    );
+    expect(r.inline[0].side).toBe("LEFT");
+    expect(r.inline[0].body).toContain("Suggested: a\n  b");
+    expect(r.inline[0].body).not.toContain("```");
   });
 
   it("suggestion containing backticks gets a longer fence that cannot be closed early", () => {

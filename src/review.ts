@@ -54,7 +54,7 @@ function formatBody(f: Finding, side: "LEFT" | "RIGHT"): string {
       const fence = fenceFor(f.suggestion);
       body += `\n\n${fence}suggestion\n${f.suggestion}\n${fence}`;
     } else {
-      body += `\n\nSuggested: ${f.suggestion}`;
+      body += `\n\nSuggested: ${f.suggestion.replace(/\n/g, "\n  ")}`;
     }
   }
   return body;
