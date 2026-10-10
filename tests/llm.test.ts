@@ -390,6 +390,21 @@ describe("retry and timeout", () => {
     expect(await p).toEqual({ ok: true, findings: [] });
   });
 
+  it.each([
+    ["an empty Retry-After", ""],
+    ["a whitespace-only Retry-After", "   "],
+    ["a non-numeric Retry-After", "soon"],
+  ])("%s falls back to the 500ms backoff (not 0ms)", async (_label, header) => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    stubFetch((_c, n) => (n === 1 ? json(429, {}, { "retry-after": header }) : json(200, okChat())));
+    const p = callLlm(fakeOpenAiEp(), msgs(), { ...opts(), timeoutSeconds: 30 });
+    await vi.advanceTimersByTimeAsync(499);
+    expect(fetchCallCount()).toBe(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(fetchCallCount()).toBe(2);
+    expect(await p).toEqual({ ok: true, findings: [] });
+  });
+
   it("gives up after one retry on persistent 5xx", async () => {
     stubFetch(() => json(500, {}));
     expect(await callLlm(fakeOpenAiEp(), msgs(), opts())).toMatchObject({ ok: false, reason: "http-error" });
@@ -513,6 +528,42 @@ describe("ensureOllama", () => {
       "Ollama is not reachable at http://localhost:11434: ECONNREFUSED",
     );
     expect(fetchCallCount()).toBe(1);
+  });
+
+  it("pull that never answers times out with the timeout message", async () => {
+    stubFetch((c) =>
+      c.url.endsWith("/api/pull")
+        ? new Promise<Response>((_, rej) => {
+            c.init.signal?.addEventListener("abort", () =>
+              rej(Object.assign(new Error("aborted"), { name: "AbortError" })),
+            );
+          })
+        : new Response("ok", { status: 200 }),
+    );
+    await expect(ensureOllama("http://localhost:11434/v1", "m", { timeoutSeconds: 1 })).rejects.toThrow(
+      'ollama pull "m" timed out after 1s',
+    );
+  }, 15000);
+
+  it("pull network failure is wrapped and never includes the api key", async () => {
+    const key = "sk-secret-xyz";
+    stubFetch((c) =>
+      c.url.endsWith("/api/pull") ? Promise.reject(new Error(`connect failed (token ${key})`)) : new Response("ok", { status: 200 }),
+    );
+    const err = await ensureOllama("http://localhost:11434/v1", "m", { apiKey: key }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(Error);
+    expect((err as Error).message).toBe('ollama pull "m" failed: connect failed (token [REDACTED])');
+    expect(String(err)).not.toContain(key);
+  });
+
+  it("healthcheck network failure is redacted too", async () => {
+    const key = "sk-secret-xyz";
+    stubFetch(() => {
+      throw new Error(`ECONNRESET ${key}`);
+    });
+    const err = await ensureOllama("http://localhost:11434/v1", "m", { apiKey: key }).catch((e: unknown) => e);
+    expect(String(err)).toContain("[REDACTED]");
+    expect(String(err)).not.toContain(key);
   });
 
   it("non-2xx healthcheck throws the pinned message before pulling", async () => {

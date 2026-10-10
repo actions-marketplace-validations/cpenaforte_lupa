@@ -142,12 +142,17 @@ function responseFormatFor(provider: string): ResponseFormat | undefined {
   return { type: "json_object" };
 }
 
+// Callers must pass a non-empty key: callLlm returns no-key before any request,
+// so split("") (which would insert the marker between every character) never runs.
 function redact(text: string, key: string): string {
   return text.split(key).join("[REDACTED]");
 }
 
+/** Missing, empty, whitespace-only, or non-numeric Retry-After falls back to the backoff. */
 function retryDelayMs(raw: string | null): number {
-  const secs = raw === null ? NaN : Number(raw);
+  const trimmed = raw?.trim() ?? "";
+  if (trimmed === "") return RETRY_BACKOFF_MS;
+  const secs = Number(trimmed);
   if (!Number.isFinite(secs)) return RETRY_BACKOFF_MS;
   return Math.min(Math.max(secs, 0) * 1000, MAX_RETRY_AFTER_MS);
 }
@@ -251,15 +256,15 @@ export async function callLlm(
   const msg = choice?.message;
 
   // Refusal is honored everywhere except Anthropic-compat (which never sends it).
-  // Pinned union: a refusal maps to "content-filter".
+  // A refusal is reported as "content-filter" (the fixed set of failure reasons has no refusal entry).
   if (!anthropic && typeof msg?.refusal === "string" && msg.refusal !== "") {
     return { ok: false, reason: "content-filter", detail: "model refused the request" };
   }
-  // Pinned union: provider content filtering maps to "content-filter".
+  // Provider content filtering is reported as "content-filter".
   if (choice?.finish_reason === "content_filter") {
     return { ok: false, reason: "content-filter", detail: "provider content filter stopped the response" };
   }
-  // Pinned union has no "length" member: truncation degrades as "invalid-json" (no diff-shrink retry).
+  // The fixed set of failure reasons has no "length" entry: truncation degrades as "invalid-json" (no diff-shrink retry).
   if (choice?.finish_reason === "length") {
     return { ok: false, reason: "invalid-json", detail: "response truncated (finish_reason=length)" };
   }
@@ -280,39 +285,70 @@ export async function callLlm(
   return { ok: true, findings };
 }
 
+/** Default client timeout for the Ollama pull (pulls can be slow). */
+const PULL_TIMEOUT_DEFAULT_S = 300;
+
 /**
  * Healthchecks the Ollama server at the root (baseUrl minus trailing /v1),
- * then pulls `model` through the REST API. A 404 from pull throws
- * OllamaMissingError.
+ * then pulls `model` through the REST API under `timeoutSeconds`. A 404 from
+ * pull throws OllamaMissingError. Any apiKey given is redacted from error text.
  */
-export async function ensureOllama(baseUrl: string, model: string): Promise<void> {
+export async function ensureOllama(
+  baseUrl: string,
+  model: string,
+  o: { timeoutSeconds?: number; apiKey?: string } = {},
+): Promise<void> {
+  const key = o.apiKey ?? "";
+  const timeoutSeconds = o.timeoutSeconds ?? PULL_TIMEOUT_DEFAULT_S;
+  // Guarded scrub: an empty key must not reach redact (split("") would interleave markers).
+  const scrub = (text: string) => (key === "" ? text : redact(text, key));
   const root = baseUrl.replace(/\/+$/, "").replace(/\/v1$/, "");
+
   let health: Response;
   try {
     health = await fetch(`${root}/`, { signal: AbortSignal.timeout(REQUEST_TIMEOUT_HEALTH_MS) });
   } catch (e) {
-    throw new Error(`Ollama is not reachable at ${root}: ${errMessage(e)}`);
+    throw new Error(scrub(`Ollama is not reachable at ${root}: ${errMessage(e)}`));
   }
   await health.text().catch(() => "");
   if (!health.ok) {
     throw new Error(`Ollama is not reachable at ${root} (HTTP ${health.status})`);
   }
 
-  const pull = await fetch(`${root}/api/pull`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ model, stream: false }),
-  });
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutSeconds * 1000);
+  let pull: Response;
+  let text: string;
+  try {
+    pull = await fetch(`${root}/api/pull`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model, stream: false }),
+      signal: controller.signal,
+    });
+    text = await pull.text();
+  } catch (e) {
+    if (controller.signal.aborted) {
+      throw new Error(`ollama pull "${model}" timed out after ${timeoutSeconds}s`);
+    }
+    throw new Error(scrub(`ollama pull "${model}" failed: ${errMessage(e)}`));
+  } finally {
+    clearTimeout(timer);
+  }
+
   if (pull.status === 404) {
-    await pull.text().catch(() => "");
     throw new OllamaMissingError(`Ollama model "${model}" is not installed and could not be pulled`);
   }
   if (!pull.ok) {
-    await pull.text().catch(() => "");
     throw new Error(`ollama pull "${model}" failed with HTTP ${pull.status}`);
   }
-  const body = (await pull.json().catch(() => undefined)) as { error?: unknown } | undefined;
+  let body: { error?: unknown } | undefined;
+  try {
+    body = JSON.parse(text) as { error?: unknown };
+  } catch {
+    body = undefined;
+  }
   if (body?.error) {
-    throw new Error(`ollama pull "${model}" failed: ${String(body.error)}`);
+    throw new Error(scrub(`ollama pull "${model}" failed: ${String(body.error)}`));
   }
 }
