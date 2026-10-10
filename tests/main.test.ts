@@ -710,6 +710,44 @@ describe("findings from binaries, renames and skip paths", () => {
     expect(readFileSync(r.summaryPath, "utf8")).toContain("does not trigger a review");
   });
 
+  it("an unwritable summary path on the skip path still exits 0 without throwing", async () => {
+    const root = scratch();
+    const artifactDir = join(root, "out");
+    mkdirSync(artifactDir);
+    writeFileSync(join(artifactDir, "diff.patch"), DIFF);
+    const rec = newRec();
+    const env: RunEnv = {
+      eventName: "pull_request",
+      payload: { action: "closed", pull_request: { number: 7 } },
+      inputs: inputsFor({ llmApiKey: "" }),
+      workDir: root,
+      artifactDir,
+      baseSha: SHA_BASE,
+      headSha: SHA_HEAD,
+      tokenIsApp: false,
+      issueFallback: false,
+      // A directory: appendFileSync throws EISDIR. The skip path must absorb that.
+      summaryPath: root,
+    };
+    const fail = (name: string) => () => {
+      throw new Error(`${name} must not run on a non-triggering event`);
+    };
+    const deps: Deps = {
+      gh: gatewayFor(rec, {}),
+      analysis: {
+        runScanners: fail("scanners"),
+        runL2: fail("l2"),
+        ensureOllama: fail("ollama"),
+        validateModelExists: fail("models"),
+        callLlm: fail("llm"),
+      },
+    };
+    const out = await run(env, deps);
+    expect(out.posted).toBe(false);
+    expect(out.exitCode).toBe(0);
+    expect(rec.getPrCalls).toBe(0);
+  });
+
   it("main() on a non-triggering event exits 0 with an EMPTY token (Octokit is built lazily)", async () => {
     const root = scratch();
     const eventPath = join(root, "event.json");

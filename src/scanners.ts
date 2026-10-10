@@ -211,10 +211,11 @@ function warning(rule: string, message: string): Finding {
 /**
  * Interpret a scanner whose SARIF arrives on stdout. Fail-open: a non-zero exit (or
  * any exit) with empty/unparseable stdout is a `scanner-failed` warning, never a clean pass.
+ * The timeout message names the actual `timeoutMs` budget the tool ran under.
  */
-export function fromStdout(tool: string, label: string, r: Exec): Finding[] {
+export function fromStdout(tool: string, label: string, r: Exec, timeoutMs: number = TOOL_TIMEOUT_MS): Finding[] {
   if (r.missing) return [warning("scanner-missing", `${label} unavailable: ${tool} not found`)];
-  if (r.timedOut) return [warning("scanner-failed", `${label} timed out after ${TOOL_TIMEOUT_MS / 1000}s`)];
+  if (r.timedOut) return [warning("scanner-failed", `${label} timed out after ${timeoutMs / 1000}s`)];
   const parsed = r.stdout.trim() ? parseSarif(r.stdout) : undefined;
   if (!parsed) {
     return [warning("scanner-failed", `${label} exited ${r.code ?? "abnormally"} without parseable SARIF`)];
@@ -248,7 +249,9 @@ export interface ScannerResult {
  * Runs the L1 scanners. Never throws: a missing binary becomes `scanner-missing`,
  * an unusable scanner result becomes `scanner-failed` (fail-open warning).
  * Optional: `hasSemgrepToken`, `jobs`, `sbom` (default false), `lockfiles` (OSV targets),
- * `outDir` (parent for the SBOM's mkdtemp dir; defaults to `os.tmpdir()`).
+ * `outDir` (parent for the SBOM's mkdtemp dir; defaults to `os.tmpdir()`),
+ * `timeoutMs` (per-tool wall-clock budget; defaults to `TOOL_TIMEOUT_MS`, threaded to every
+ * tool invocation and to its timeout message).
  * Lifecycle: `sbomPath` is returned for upload; the caller (Task 12) owns the file and its
  * temp dir. runScanners does NOT delete the SBOM.
  * Semgrep runs the PyPI binary; trivy/osv/gitleaks run from digest-pinned docker images.
@@ -261,32 +264,34 @@ export async function runScanners(o: {
   sbom?: boolean;
   lockfiles?: string[];
   outDir?: string;
+  timeoutMs?: number;
 }): Promise<ScannerResult> {
   const findings: Finding[] = [];
   const jobs = o.jobs ?? resolveJobs();
   const dir = resolvePath(o.dir);
+  const timeoutMs = o.timeoutMs ?? TOOL_TIMEOUT_MS;
 
   // semgrep (binary, not docker)
   const sg = semgrepArgv({ baselineSha: o.baselineSha, jobs, hasToken: !!o.hasSemgrepToken });
-  findings.push(...fromStdout("semgrep", "semgrep", await runExec("semgrep", sg.argv, dir, sg.env)));
+  findings.push(...fromStdout("semgrep", "semgrep", await runExec("semgrep", sg.argv, dir, sg.env, timeoutMs), timeoutMs));
 
   // trivy (docker image pinned by digest)
-  const tv = await runExec("docker", dockerArgs(dir, TRIVY_IMAGE, TRIVY_DIGEST, trivyArgv(".")), dir);
-  findings.push(...fromStdout("docker", "trivy", tv));
+  const tv = await runExec("docker", dockerArgs(dir, TRIVY_IMAGE, TRIVY_DIGEST, trivyArgv(".")), dir, undefined, timeoutMs);
+  findings.push(...fromStdout("docker", "trivy", tv, timeoutMs));
 
   // gitleaks (docker image pinned by digest; SARIF goes to a report file in a temp dir)
-  findings.push(...(await runGitleaks(dir)));
+  findings.push(...(await runGitleaks(dir, timeoutMs)));
 
   // osv-scanner (docker image pinned by digest), one run per lockfile
   for (const lock of o.lockfiles ?? []) {
-    const osv = await runExec("docker", dockerArgs(dir, OSV_IMAGE, OSV_DIGEST, osvArgv(lock)), dir);
-    findings.push(...fromStdout("docker", `osv-scanner (${lock})`, osv));
+    const osv = await runExec("docker", dockerArgs(dir, OSV_IMAGE, OSV_DIGEST, osvArgv(lock)), dir, undefined, timeoutMs);
+    findings.push(...fromStdout("docker", `osv-scanner (${lock})`, osv, timeoutMs));
   }
 
   // SBOM (trivy fs --format cyclonedx). Written under a unique mkdtemp dir inside outDir.
   let sbomPath: string | undefined;
   if (o.sbom) {
-    const sb = await runExec("docker", dockerArgs(dir, TRIVY_IMAGE, TRIVY_DIGEST, sbomArgv(".")), dir);
+    const sb = await runExec("docker", dockerArgs(dir, TRIVY_IMAGE, TRIVY_DIGEST, sbomArgv(".")), dir, undefined, timeoutMs);
     if (sb.missing) {
       findings.push(warning("scanner-missing", "sbom unavailable: docker not found"));
     } else if (!isCycloneDx(sb.stdout)) {
@@ -327,7 +332,7 @@ function isCycloneDx(text: string): boolean {
  * when clean and may not create the report; exit 0 with no report is therefore clean.
  * A temp-dir failure is a `scanner-failed` warning, never a throw.
  */
-async function runGitleaks(dir: string): Promise<Finding[]> {
+async function runGitleaks(dir: string, timeoutMs: number = TOOL_TIMEOUT_MS): Promise<Finding[]> {
   let reportDir: string;
   try {
     reportDir = await mkdtemp(join(os.tmpdir(), "gitleaks-"));
@@ -342,9 +347,11 @@ async function runGitleaks(dir: string): Promise<Finding[]> {
         `${reportDir}:/out`,
       ]),
       dir,
+      undefined,
+      timeoutMs,
     );
     if (gl.missing) return [warning("scanner-missing", "gitleaks unavailable: docker not found")];
-    if (gl.timedOut) return [warning("scanner-failed", `gitleaks timed out after ${TOOL_TIMEOUT_MS / 1000}s`)];
+    if (gl.timedOut) return [warning("scanner-failed", `gitleaks timed out after ${timeoutMs / 1000}s`)];
     let text: string | undefined;
     try {
       text = await readFile(hostReport, "utf8");

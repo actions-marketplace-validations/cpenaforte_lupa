@@ -399,12 +399,18 @@ function prNumberFor(env: RunEnv): number | null {
   return resolvePrNumber(env.eventName, env.payload as Parameters<typeof resolvePrNumber>[1]);
 }
 
-/** Logs a line and, when a summary file exists, appends it there (skip paths must leave evidence). */
+/** Logs a line and, when a summary file exists, appends it there (skip paths must leave evidence).
+ * The append is best-effort: an unwritable summary path warns but never throws, so a skip path
+ * still exits 0. */
 function note(env: RunEnv, out: Outcome, text: string): void {
   core.info(text);
   if (env.summaryPath !== undefined) {
-    appendFileSync(env.summaryPath, text + "\n", "utf8");
-    out.summaryWritten = true;
+    try {
+      appendFileSync(env.summaryPath, text + "\n", "utf8");
+      out.summaryWritten = true;
+    } catch (e) {
+      core.warning(`could not write summary: ${(e as Error).message}`);
+    }
   }
 }
 

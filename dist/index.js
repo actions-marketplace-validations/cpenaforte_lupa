@@ -24724,6 +24724,7 @@ function todoMarkers(hunks) {
 import { execFile } from "node:child_process";
 import { readdirSync, readFileSync as readFileSync3, statSync } from "node:fs";
 import { join as join2 } from "node:path";
+var L2_TIMEOUT_MS = 6e5;
 var MAX_BUFFER = 16 * 1024 * 1024;
 function listFiles(dir) {
   let names;
@@ -24784,8 +24785,8 @@ function l2Argv(name) {
       throw new Error(`unknown L2 tool: ${name}`);
   }
 }
-var execTool = (cmd, args, cwd) => new Promise((resolve) => {
-  execFile(cmd, args, { cwd, maxBuffer: MAX_BUFFER }, (err, stdout, stderr) => {
+var execTool = (cmd, args, cwd, timeoutMs = L2_TIMEOUT_MS) => new Promise((resolve) => {
+  execFile(cmd, args, { cwd, maxBuffer: MAX_BUFFER, timeout: timeoutMs }, (err, stdout, stderr) => {
     if (!err)
       return resolve(void 0);
     const e = err;
@@ -24793,11 +24794,14 @@ var execTool = (cmd, args, cwd) => new Promise((resolve) => {
     resolve({
       code,
       signal: e.signal ?? null,
-      output: `${String(stdout)}${String(stderr)}`
+      output: `${String(stdout)}${String(stderr)}`,
+      timedOut: e.killed === true
     });
   });
 });
-function describeFailure(name, f) {
+function describeFailure(name, f, timeoutMs) {
+  if (f.timedOut)
+    return `${name} timed out after ${timeoutMs / 1e3}s`;
   if (f.signal)
     return `${name} killed by signal ${f.signal}`;
   if (typeof f.code === "string")
@@ -24806,9 +24810,9 @@ function describeFailure(name, f) {
     return `${name} reported issues (exit ${f.code})`;
   return `${name} exited abnormally`;
 }
-async function runOne(name, dir, spawn) {
+async function runOne(name, dir, spawn, timeoutMs) {
   const { cmd, args } = l2Argv(name);
-  const failure = await spawn(cmd, args, dir);
+  const failure = await spawn(cmd, args, dir, timeoutMs);
   if (!failure)
     return void 0;
   if (failure.code === "ENOENT")
@@ -24818,14 +24822,14 @@ async function runOne(name, dir, spawn) {
     severity: "warning",
     file: "",
     rule: name,
-    message: `${describeFailure(name, failure)}${detail ? `:
+    message: `${describeFailure(name, failure, timeoutMs)}${detail ? `:
 ${detail}` : ""}`
   };
 }
-async function runL2(dir, spawn = execTool) {
+async function runL2(dir, spawn = execTool, timeoutMs = L2_TIMEOUT_MS) {
   const findings = [];
   for (const name of detectL2Tools(dir)) {
-    const f = await runOne(name, dir, spawn);
+    const f = await runOne(name, dir, spawn, timeoutMs);
     if (f)
       findings.push(f);
   }
@@ -25791,11 +25795,11 @@ function runExec(file, args, cwd, env, timeoutMs = TOOL_TIMEOUT_MS) {
 function warning2(rule, message) {
   return { severity: "warning", file: "", rule, message };
 }
-function fromStdout(tool, label, r) {
+function fromStdout(tool, label, r, timeoutMs = TOOL_TIMEOUT_MS) {
   if (r.missing)
     return [warning2("scanner-missing", `${label} unavailable: ${tool} not found`)];
   if (r.timedOut)
-    return [warning2("scanner-failed", `${label} timed out after ${TOOL_TIMEOUT_MS / 1e3}s`)];
+    return [warning2("scanner-failed", `${label} timed out after ${timeoutMs / 1e3}s`)];
   const parsed = r.stdout.trim() ? parseSarif(r.stdout) : void 0;
   if (!parsed) {
     return [warning2("scanner-failed", `${label} exited ${r.code ?? "abnormally"} without parseable SARIF`)];
@@ -25810,18 +25814,19 @@ async function runScanners(o) {
   const findings = [];
   const jobs = o.jobs ?? resolveJobs();
   const dir = resolvePath(o.dir);
+  const timeoutMs = o.timeoutMs ?? TOOL_TIMEOUT_MS;
   const sg = semgrepArgv({ baselineSha: o.baselineSha, jobs, hasToken: !!o.hasSemgrepToken });
-  findings.push(...fromStdout("semgrep", "semgrep", await runExec("semgrep", sg.argv, dir, sg.env)));
-  const tv = await runExec("docker", dockerArgs(dir, TRIVY_IMAGE, TRIVY_DIGEST, trivyArgv(".")), dir);
-  findings.push(...fromStdout("docker", "trivy", tv));
-  findings.push(...await runGitleaks(dir));
+  findings.push(...fromStdout("semgrep", "semgrep", await runExec("semgrep", sg.argv, dir, sg.env, timeoutMs), timeoutMs));
+  const tv = await runExec("docker", dockerArgs(dir, TRIVY_IMAGE, TRIVY_DIGEST, trivyArgv(".")), dir, void 0, timeoutMs);
+  findings.push(...fromStdout("docker", "trivy", tv, timeoutMs));
+  findings.push(...await runGitleaks(dir, timeoutMs));
   for (const lock of o.lockfiles ?? []) {
-    const osv = await runExec("docker", dockerArgs(dir, OSV_IMAGE, OSV_DIGEST, osvArgv(lock)), dir);
-    findings.push(...fromStdout("docker", `osv-scanner (${lock})`, osv));
+    const osv = await runExec("docker", dockerArgs(dir, OSV_IMAGE, OSV_DIGEST, osvArgv(lock)), dir, void 0, timeoutMs);
+    findings.push(...fromStdout("docker", `osv-scanner (${lock})`, osv, timeoutMs));
   }
   let sbomPath;
   if (o.sbom) {
-    const sb = await runExec("docker", dockerArgs(dir, TRIVY_IMAGE, TRIVY_DIGEST, sbomArgv(".")), dir);
+    const sb = await runExec("docker", dockerArgs(dir, TRIVY_IMAGE, TRIVY_DIGEST, sbomArgv(".")), dir, void 0, timeoutMs);
     if (sb.missing) {
       findings.push(warning2("scanner-missing", "sbom unavailable: docker not found"));
     } else if (!isCycloneDx(sb.stdout)) {
@@ -25850,7 +25855,7 @@ function isCycloneDx(text) {
     return false;
   }
 }
-async function runGitleaks(dir) {
+async function runGitleaks(dir, timeoutMs = TOOL_TIMEOUT_MS) {
   let reportDir;
   try {
     reportDir = await mkdtemp(join3(os5.tmpdir(), "gitleaks-"));
@@ -25861,11 +25866,11 @@ async function runGitleaks(dir) {
   try {
     const gl = await runExec("docker", dockerArgs(dir, GITLEAKS_IMAGE, GITLEAKS_DIGEST, gitleaksArgv("/src", "/out/report.sarif"), [
       `${reportDir}:/out`
-    ]), dir);
+    ]), dir, void 0, timeoutMs);
     if (gl.missing)
       return [warning2("scanner-missing", "gitleaks unavailable: docker not found")];
     if (gl.timedOut)
-      return [warning2("scanner-failed", `gitleaks timed out after ${TOOL_TIMEOUT_MS / 1e3}s`)];
+      return [warning2("scanner-failed", `gitleaks timed out after ${timeoutMs / 1e3}s`)];
     let text;
     try {
       text = await readFile(hostReport, "utf8");
@@ -26116,8 +26121,12 @@ function prNumberFor(env) {
 function note(env, out, text) {
   info(text);
   if (env.summaryPath !== void 0) {
-    appendFileSync2(env.summaryPath, text + "\n", "utf8");
-    out.summaryWritten = true;
+    try {
+      appendFileSync2(env.summaryPath, text + "\n", "utf8");
+      out.summaryWritten = true;
+    } catch (e) {
+      warning(`could not write summary: ${e.message}`);
+    }
   }
 }
 function summaryFor(findings) {

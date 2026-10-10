@@ -430,6 +430,29 @@ describe("runScanners", () => {
     });
   });
 
+  it("gitleaks timeout removes its temp report dir (no leak) and names the actual budget", async () => {
+    process.env.PATH = makeBin({
+      semgrep: FAKE_SEMGREP_CLEAN,
+      docker: `#!/bin/sh
+echo "$*" >> "$SCAN_LOG"
+for a in "$@"; do case "$a" in *:/out) host="\${a%:/out}";; esac; done
+if [ -n "$host" ]; then echo "$host" >> "$SCAN_LOG.reportdirs"; fi
+/bin/sleep 3
+exit 0
+`,
+    });
+    const r = await runScanners({ dir: tmp, baselineSha: "abc", timeoutMs: 300 });
+    expect(r.findings).toContainEqual({
+      severity: "warning",
+      file: "",
+      rule: "scanner-failed",
+      message: "gitleaks timed out after 0.3s",
+    });
+    const reportDir = readFileSync(`${log}.reportdirs`, "utf8").trim();
+    expect(reportDir).not.toBe("");
+    expect(existsSync(reportDir)).toBe(false);
+  }, 30_000);
+
   it("uncreatable TMPDIR: gitleaks temp dir failure is a warning, never a throw", async () => {
     process.env.PATH = makeBin({ semgrep: FAKE_SEMGREP_CLEAN, docker: FAKE_DOCKER });
     process.env.TMPDIR = join(tmp, "does-not-exist");
@@ -472,5 +495,17 @@ describe("per-tool timeout (M8)", () => {
     expect(f[0].severity).toBe("warning");
     expect(f[0].rule).toBe("scanner-failed");
     expect(f[0].message).toContain("timed out after 600s");
+  });
+
+  it("timeout message uses the actual timeoutMs, not the 10-minute default", () => {
+    const f = fromStdout(
+      "semgrep",
+      "semgrep",
+      { missing: false, code: null, stdout: "", timedOut: true },
+      300,
+    );
+    expect(f).toEqual([
+      { severity: "warning", file: "", rule: "scanner-failed", message: "semgrep timed out after 0.3s" },
+    ]);
   });
 });
