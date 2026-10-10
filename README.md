@@ -119,8 +119,10 @@ The findings and the gate are separate. The review event and the exit code follo
 
 ## Scanners and their runtimes
 
-- **semgrep** runs from the PyPI package, pinned to `semgrep==1.180.0`. The unprivileged template installs it into a venv. No docker is needed for semgrep.
+- **semgrep** runs from the PyPI package, pinned to `semgrep==1.180.0`. The unprivileged template installs it into a venv. No docker is needed for semgrep. Without `SEMGREP_APP_TOKEN` it runs `semgrep scan --config p/default --metrics=off` (`--config auto` is rejected when `--metrics=off` is set: "Cannot create auto config when metrics are off"); with a token it runs `semgrep ci` (diff-aware via `SEMGREP_BASELINE_COMMIT`).
 - **gitleaks, trivy and osv-scanner** run from docker images pinned by digest. The runner needs docker for them. Without docker, each one reports a `scanner-missing` warning and the run continues.
+- Docker scanners mount the checkout at `/src`, so SARIF reports absolute `/src/<path>` (or `file:///src/<path>`) artifact URIs. These are normalized back to repo-relative paths before findings are mapped, so inline comments still land on the right file.
+- **Known limitation:** trivy and gitleaks can report the same secret or dependency once each, and there is no cross-scanner dedupe. The same location may appear twice in the review. This is deliberate in v1: the scanners use different rule ids and severities, so a blind merge could drop a real finding.
 
 ## Dry-run: `post_comment: false`
 

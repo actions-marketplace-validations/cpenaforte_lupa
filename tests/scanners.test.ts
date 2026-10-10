@@ -40,7 +40,7 @@ describe("argv builders and gates", () => {
     expect(r.argv).toEqual([
       "scan",
       "--config",
-      "auto",
+      "p/default",
       "--sarif",
       "--metrics=off",
       "--jobs",
@@ -49,6 +49,12 @@ describe("argv builders and gates", () => {
       "abc",
     ]);
     expect(r.env.SEMGREP_BASELINE_COMMIT).toBeUndefined();
+  });
+
+  it("semgrep no-token argv uses --config p/default (auto+metrics=off is invalid)", () => {
+    const r = semgrepArgv({ baselineSha: "abc", jobs: 4, hasToken: false });
+    expect(r.argv).toContain("p/default");
+    expect(r.argv).not.toContain("auto");
   });
 
   it("token argv uses ci+sarif with baseline env, exact shape", () => {
@@ -140,6 +146,75 @@ describe("parseSarif", () => {
 
   it("empty but valid SARIF is a clean result, not a failure", () => {
     expect(parseSarif('{"runs":[]}')).toEqual([]);
+  });
+
+  it("parseSarif normalizes /src/ container paths to repo-relative", () => {
+    const sarif = JSON.stringify({
+      runs: [
+        {
+          results: [
+            {
+              ruleId: "G1",
+              level: "error",
+              message: { text: "secret" },
+              locations: [{ physicalLocation: { artifactLocation: { uri: "/src/config.py" }, region: { startLine: 5 } } }],
+            },
+          ],
+        },
+      ],
+    });
+    expect(parseSarif(sarif)).toEqual([
+      { severity: "high", file: "config.py", line: 5, rule: "G1", message: "secret" },
+    ]);
+  });
+
+  it("parseSarif normalizes file:///src/ URIs", () => {
+    const sarif = JSON.stringify({
+      runs: [
+        {
+          results: [
+            {
+              ruleId: "G2",
+              level: "error",
+              message: { text: "secret" },
+              locations: [
+                { physicalLocation: { artifactLocation: { uri: "file:///src/config.py" }, region: { startLine: 9 } } },
+              ],
+            },
+          ],
+        },
+      ],
+    });
+    expect(parseSarif(sarif)).toEqual([
+      { severity: "high", file: "config.py", line: 9, rule: "G2", message: "secret" },
+    ]);
+  });
+
+  it("parseSarif leaves repo-relative and non-/src absolute paths untouched", () => {
+    const sarif = JSON.stringify({
+      runs: [
+        {
+          results: [
+            {
+              ruleId: "R1",
+              level: "error",
+              message: { text: "relative" },
+              locations: [{ physicalLocation: { artifactLocation: { uri: "a.ts" }, region: { startLine: 1 } } }],
+            },
+            {
+              ruleId: "R2",
+              level: "error",
+              message: { text: "absolute" },
+              locations: [{ physicalLocation: { artifactLocation: { uri: "/usr/lib/x.py" }, region: { startLine: 2 } } }],
+            },
+          ],
+        },
+      ],
+    });
+    expect(parseSarif(sarif)).toEqual([
+      { severity: "high", file: "a.ts", line: 1, rule: "R1", message: "relative" },
+      { severity: "high", file: "/usr/lib/x.py", line: 2, rule: "R2", message: "absolute" },
+    ]);
   });
 
   it("null-guards runs/results/locations without throwing", () => {

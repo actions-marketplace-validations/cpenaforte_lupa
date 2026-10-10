@@ -26135,7 +26135,7 @@ function semgrepArgv(o) {
     argv: [
       "scan",
       "--config",
-      "auto",
+      "p/default",
       "--sarif",
       "--metrics=off",
       "--jobs",
@@ -26161,6 +26161,12 @@ function osvArgv(lockfile) {
 function isObj(v) {
   return typeof v === "object" && v !== null && !Array.isArray(v);
 }
+function normalizeArtifactUri(uri) {
+  const path = uri.startsWith("file://") ? uri.slice("file://".length) : uri;
+  if (path.startsWith("/src/"))
+    return path.slice("/src/".length);
+  return uri;
+}
 function firstPhysicalLocation(locations) {
   if (!Array.isArray(locations) || !isObj(locations[0]))
     return { file: "" };
@@ -26169,7 +26175,7 @@ function firstPhysicalLocation(locations) {
     return { file: "" };
   const art = isObj(phys.artifactLocation) ? phys.artifactLocation : void 0;
   const region = isObj(phys.region) ? phys.region : void 0;
-  const file = typeof art?.uri === "string" ? art.uri : "";
+  const file = typeof art?.uri === "string" ? normalizeArtifactUri(art.uri) : "";
   const line = typeof region?.startLine === "number" ? region.startLine : void 0;
   return { file, line };
 }

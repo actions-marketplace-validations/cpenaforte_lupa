@@ -32,6 +32,9 @@ export function resolveJobs(): number {
  * Token → `ci` (diff-aware via SEMGREP_BASELINE_COMMIT env, which must be the merge-base).
  * No token → `scan` with `--baseline-commit`; `ci` is never claimed diff-aware without a token.
  * Both branches pass `--sarif` so stdout is SARIF.
+ * No token uses `--config p/default`: `--config auto` is rejected with `--metrics=off`
+ * ("Cannot create auto config when metrics are off"); `p/default` is the curated registry
+ * pack that respects `--metrics=off`.
  */
 export function semgrepArgv(o: { baselineSha: string; jobs: number; hasToken: boolean }): {
   argv: string[];
@@ -47,7 +50,7 @@ export function semgrepArgv(o: { baselineSha: string; jobs: number; hasToken: bo
     argv: [
       "scan",
       "--config",
-      "auto",
+      "p/default",
       "--sarif",
       "--metrics=off",
       "--jobs",
@@ -113,13 +116,26 @@ function isObj(v: unknown): v is Obj {
   return typeof v === "object" && v !== null && !Array.isArray(v);
 }
 
+/**
+ * Normalize a SARIF artifactLocation URI to a repo-relative path. Docker scanners mount the
+ * repo at `/src`, so their SARIF reports absolute `/src/<rel>` paths (or `file:///src/<rel>`);
+ * `unsafePath()` rejects absolute paths and the finding degrades to a repository-level note.
+ * Only the known container mount (`/src/`, optionally behind a `file://` scheme) is stripped;
+ * repo-relative paths and other absolute paths are returned untouched.
+ */
+function normalizeArtifactUri(uri: string): string {
+  const path = uri.startsWith("file://") ? uri.slice("file://".length) : uri;
+  if (path.startsWith("/src/")) return path.slice("/src/".length);
+  return uri;
+}
+
 function firstPhysicalLocation(locations: unknown): { file: string; line?: number } {
   if (!Array.isArray(locations) || !isObj(locations[0])) return { file: "" };
   const phys = locations[0].physicalLocation;
   if (!isObj(phys)) return { file: "" };
   const art = isObj(phys.artifactLocation) ? phys.artifactLocation : undefined;
   const region = isObj(phys.region) ? phys.region : undefined;
-  const file = typeof art?.uri === "string" ? art.uri : "";
+  const file = typeof art?.uri === "string" ? normalizeArtifactUri(art.uri) : "";
   const line = typeof region?.startLine === "number" ? region.startLine : undefined;
   return { file, line };
 }
