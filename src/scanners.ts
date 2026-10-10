@@ -229,7 +229,9 @@ export interface ScannerResult {
  * Runs the L1 scanners. Never throws: a missing binary becomes `scanner-missing`,
  * an unusable scanner result becomes `scanner-failed` (fail-open warning).
  * Optional: `hasSemgrepToken`, `jobs`, `sbom` (default false), `lockfiles` (OSV targets),
- * `outDir` (where the SBOM is written; defaults to `os.tmpdir()`).
+ * `outDir` (parent for the SBOM's mkdtemp dir; defaults to `os.tmpdir()`).
+ * Lifecycle: `sbomPath` is returned for upload; the caller (Task 12) owns the file and its
+ * temp dir. runScanners does NOT delete the SBOM.
  * Semgrep runs the PyPI binary; trivy/osv/gitleaks run from digest-pinned docker images.
  */
 export async function runScanners(o: {
@@ -262,7 +264,7 @@ export async function runScanners(o: {
     findings.push(...fromStdout("docker", `osv-scanner (${lock})`, osv));
   }
 
-  // SBOM (trivy fs --format cyclonedx), written to outDir
+  // SBOM (trivy fs --format cyclonedx). Written under a unique mkdtemp dir inside outDir.
   let sbomPath: string | undefined;
   if (o.sbom) {
     const sb = await run("docker", dockerArgs(dir, TRIVY_IMAGE, TRIVY_DIGEST, sbomArgv(".")), dir);
@@ -271,8 +273,9 @@ export async function runScanners(o: {
     } else if (sb.code !== 0 || !isJson(sb.stdout)) {
       findings.push(warning("scanner-failed", `sbom exited ${sb.code ?? "abnormally"} without a CycloneDX document`));
     } else {
-      const out = join(o.outDir ?? os.tmpdir(), "sbom.cdx.json");
       try {
+        const sbomDir = await mkdtemp(join(o.outDir ?? os.tmpdir(), "sbom-"));
+        const out = join(sbomDir, "sbom.cdx.json");
         await writeFile(out, sb.stdout, "utf8");
         sbomPath = out;
       } catch (e) {
@@ -297,9 +300,15 @@ function isJson(text: string): boolean {
  * gitleaks writes its SARIF report to a file. The report lives in a temp dir mounted at
  * /out inside the container and is removed afterwards (best-effort). gitleaks exits 0
  * when clean and may not create the report; exit 0 with no report is therefore clean.
+ * A temp-dir failure is a `scanner-failed` warning, never a throw.
  */
 async function runGitleaks(dir: string): Promise<Finding[]> {
-  const reportDir = await mkdtemp(join(os.tmpdir(), "gitleaks-"));
+  let reportDir: string;
+  try {
+    reportDir = await mkdtemp(join(os.tmpdir(), "gitleaks-"));
+  } catch (e) {
+    return [warning("scanner-failed", `gitleaks temp dir unavailable: ${(e as Error).message}`)];
+  }
   const hostReport = join(reportDir, "report.sarif");
   try {
     const gl = await run(

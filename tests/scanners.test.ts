@@ -146,13 +146,22 @@ const FAKE_SEMGREP_CLEAN = `#!/bin/sh\nprintf '%s' '{"runs":[]}'\nexit 0\n`;
 
 /**
  * Fake docker. Records every invocation in $SCAN_LOG; answers the CycloneDX request with
- * a JSON document; for gitleaks (the only call mounting `:/out`) writes a SARIF report
- * unless $NO_REPORT is set; exits with $FAKE_EXIT (default 0).
+ * a JSON document (or, with $SBOM_MODE=fail|garbage, a failure / non-JSON output); with
+ * $EMPTY_TRIVY / $EMPTY_OSV the trivy / osv calls exit 5 / 6 with no stdout; for gitleaks
+ * (the only call mounting `:/out`) writes a SARIF report unless $NO_REPORT is set; all
+ * other calls exit with $FAKE_EXIT (default 0).
  */
 const FAKE_DOCKER = `#!/bin/sh
 echo "$*" >> "$SCAN_LOG"
 case "$*" in
-  *cyclonedx*) printf '%s' '{"bomFormat":"CycloneDX"}'; exit 0;;
+  *cyclonedx*)
+    case "$SBOM_MODE" in
+      fail) exit 4;;
+      garbage) printf '%s' 'nope'; exit 0;;
+    esac
+    printf '%s' '{"bomFormat":"CycloneDX"}'; exit 0;;
+  *--severity*) if [ -n "$EMPTY_TRIVY" ]; then exit 5; fi;;
+  *" -L "*) if [ -n "$EMPTY_OSV" ]; then exit 6; fi;;
 esac
 for a in "$@"; do case "$a" in *:/out) host="\${a%:/out}";; esac; done
 if [ -n "$host" ]; then
@@ -165,8 +174,12 @@ printf '%s' '{"runs":[]}'
 exit "\${FAKE_EXIT:-0}"
 `;
 
+/** Temp dirs created during a test; removed in afterEach (R12 hygiene). */
+let created: string[] = [];
+
 function makeBin(scripts: Record<string, string>): string {
   const d = mkdtempSync(join(tmpdir(), "scan-bin-"));
+  created.push(d);
   for (const [name, body] of Object.entries(scripts)) {
     const p = join(d, name);
     writeFileSync(p, body);
@@ -177,12 +190,15 @@ function makeBin(scripts: Record<string, string>): string {
 
 describe("runScanners", () => {
   let savedPath: string | undefined;
+  let savedTmpdir: string | undefined;
   let tmp: string;
   let log: string;
 
   beforeEach(() => {
     savedPath = process.env.PATH;
+    savedTmpdir = process.env.TMPDIR;
     tmp = mkdtempSync(join(tmpdir(), "scan-test-"));
+    created = [tmp];
     log = join(tmp, "calls.log");
     process.env.SCAN_LOG = log;
   });
@@ -190,10 +206,13 @@ describe("runScanners", () => {
   afterEach(() => {
     if (savedPath === undefined) delete process.env.PATH;
     else process.env.PATH = savedPath;
-    delete process.env.SCAN_LOG;
-    delete process.env.NO_REPORT;
-    delete process.env.FAKE_EXIT;
-    rmSync(tmp, { recursive: true, force: true });
+    if (savedTmpdir === undefined) delete process.env.TMPDIR;
+    else process.env.TMPDIR = savedTmpdir;
+    for (const k of ["SCAN_LOG", "NO_REPORT", "FAKE_EXIT", "SBOM_MODE", "EMPTY_TRIVY", "EMPTY_OSV"]) {
+      delete process.env[k];
+    }
+    for (const d of created) rmSync(d, { recursive: true, force: true });
+    created = [];
   });
 
   it("missing binaries yield scanner-missing warnings and never throw", async () => {
@@ -280,16 +299,93 @@ describe("runScanners", () => {
     });
   });
 
-  it("sbom is written to outDir and its path is returned", async () => {
+  it("sbom is written inside a unique mkdtemp dir under outDir and its path is returned", async () => {
     process.env.PATH = makeBin({ semgrep: FAKE_SEMGREP_CLEAN, docker: FAKE_DOCKER });
-    const outDir = mkdtempSync(join(tmpdir(), "sbom-out-"));
-    try {
-      const r = await runScanners({ dir: tmp, baselineSha: "abc", sbom: true, outDir });
-      expect(r.sbomPath).toBe(join(outDir, "sbom.cdx.json"));
-      expect(readFileSync(r.sbomPath as string, "utf8")).toBe('{"bomFormat":"CycloneDX"}');
-      expect(r.findings.some((f) => f.rule === "sbom")).toBe(false);
-    } finally {
-      rmSync(outDir, { recursive: true, force: true });
-    }
+    const r1 = await runScanners({ dir: tmp, baselineSha: "abc", sbom: true, outDir: tmp });
+    const r2 = await runScanners({ dir: tmp, baselineSha: "abc", sbom: true, outDir: tmp });
+    expect(r1.sbomPath).toBeDefined();
+    expect(r2.sbomPath).toBeDefined();
+    const p1 = r1.sbomPath as string;
+    expect(p1.startsWith(tmp + "/sbom-")).toBe(true);
+    expect(p1.endsWith("/sbom.cdx.json")).toBe(true);
+    expect(p1).not.toBe(r2.sbomPath);
+    expect(readFileSync(p1, "utf8")).toBe('{"bomFormat":"CycloneDX"}');
+    expect(r1.findings.some((f) => f.rule === "sbom")).toBe(false);
+  });
+
+  it("sbom non-zero exit is a scanner-failed warning and no sbomPath", async () => {
+    process.env.PATH = makeBin({ semgrep: FAKE_SEMGREP_CLEAN, docker: FAKE_DOCKER });
+    process.env.SBOM_MODE = "fail";
+    const r = await runScanners({ dir: tmp, baselineSha: "abc", sbom: true, outDir: tmp });
+    expect(r.sbomPath).toBeUndefined();
+    expect(r.findings).toContainEqual({
+      severity: "warning",
+      file: "",
+      rule: "scanner-failed",
+      message: "sbom exited 4 without a CycloneDX document",
+    });
+  });
+
+  it("sbom exit 0 with non-JSON stdout is a scanner-failed warning", async () => {
+    process.env.PATH = makeBin({ semgrep: FAKE_SEMGREP_CLEAN, docker: FAKE_DOCKER });
+    process.env.SBOM_MODE = "garbage";
+    const r = await runScanners({ dir: tmp, baselineSha: "abc", sbom: true, outDir: tmp });
+    expect(r.sbomPath).toBeUndefined();
+    expect(r.findings).toContainEqual({
+      severity: "warning",
+      file: "",
+      rule: "scanner-failed",
+      message: "sbom exited 0 without a CycloneDX document",
+    });
+  });
+
+  it("sbom write failure (outDir missing) is an sbom-write warning, not a throw", async () => {
+    process.env.PATH = makeBin({ semgrep: FAKE_SEMGREP_CLEAN, docker: FAKE_DOCKER });
+    const r = await runScanners({ dir: tmp, baselineSha: "abc", sbom: true, outDir: join(tmp, "missing") });
+    expect(r.sbomPath).toBeUndefined();
+    expect(r.findings.some((f) => f.rule === "sbom-write" && f.severity === "warning")).toBe(true);
+  });
+
+  it("trivy non-zero exit with empty stdout is a warning", async () => {
+    process.env.PATH = makeBin({ semgrep: FAKE_SEMGREP_CLEAN, docker: FAKE_DOCKER });
+    process.env.EMPTY_TRIVY = "1";
+    const { findings } = await runScanners({ dir: tmp, baselineSha: "abc" });
+    expect(findings).toContainEqual({
+      severity: "warning",
+      file: "",
+      rule: "scanner-failed",
+      message: "trivy exited 5 without parseable SARIF",
+    });
+  });
+
+  it("osv non-zero exit with empty stdout is a warning naming the lockfile", async () => {
+    process.env.PATH = makeBin({ semgrep: FAKE_SEMGREP_CLEAN, docker: FAKE_DOCKER });
+    process.env.EMPTY_OSV = "1";
+    const { findings } = await runScanners({ dir: tmp, baselineSha: "abc", lockfiles: ["a/package-lock.json"] });
+    expect(findings).toContainEqual({
+      severity: "warning",
+      file: "",
+      rule: "scanner-failed",
+      message: "osv-scanner (a/package-lock.json) exited 6 without parseable SARIF",
+    });
+  });
+
+  it("gitleaks with docker missing (direct) is a scanner-missing warning", async () => {
+    process.env.PATH = makeBin({ semgrep: FAKE_SEMGREP_CLEAN }); // no docker
+    const { findings } = await runScanners({ dir: tmp, baselineSha: "abc" });
+    expect(findings).toContainEqual({
+      severity: "warning",
+      file: "",
+      rule: "scanner-missing",
+      message: "gitleaks unavailable: docker not found",
+    });
+  });
+
+  it("uncreatable TMPDIR: gitleaks temp dir failure is a warning, never a throw", async () => {
+    process.env.PATH = makeBin({ semgrep: FAKE_SEMGREP_CLEAN, docker: FAKE_DOCKER });
+    process.env.TMPDIR = join(tmp, "does-not-exist");
+    const r = await runScanners({ dir: tmp, baselineSha: "abc", sbom: true, outDir: tmp });
+    const gl = r.findings.find((f) => f.message.startsWith("gitleaks temp dir unavailable"));
+    expect(gl).toMatchObject({ severity: "warning", rule: "scanner-failed" });
   });
 });
