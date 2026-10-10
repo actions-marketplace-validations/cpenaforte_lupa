@@ -42,7 +42,7 @@ export function buildMessages(
     parts.push(
       "## Diff budget note\nThe following files were omitted from the diff below to fit the review budget and were not reviewed:",
     );
-    parts.push(skipped.map((f) => `- ${neutralise(f)}`).join("\n"));
+    parts.push(skipped.map((f) => `- ${neutralise(f).replace(/[\r\n]/g, "?")}`).join("\n"));
   }
   if (issueBody !== undefined && issueBody.trim() !== "") {
     parts.push("## Linked issue (context from the PR's closing reference)");
