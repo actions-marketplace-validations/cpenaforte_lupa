@@ -25172,6 +25172,370 @@ function linkedIssueNumber(prBody) {
   return m ? Number(m[1]) : null;
 }
 
+// lib/src/adapters/google.js
+function firstCandidate(json) {
+  const candidates = json?.candidates;
+  if (!Array.isArray(candidates))
+    return void 0;
+  const c = candidates[0];
+  return typeof c === "object" && c !== null ? c : void 0;
+}
+function promptBlockReason(json) {
+  const feedback = json?.promptFeedback;
+  if (typeof feedback !== "object" || feedback === null)
+    return void 0;
+  const r = feedback.blockReason;
+  return typeof r === "string" && r !== "" ? r : void 0;
+}
+function joinCandidateText(json) {
+  const candidate = firstCandidate(json);
+  const content = candidate?.content;
+  if (typeof content !== "object" || content === null)
+    return void 0;
+  const parts = content.parts;
+  if (!Array.isArray(parts))
+    return void 0;
+  const texts = [];
+  for (const part of parts) {
+    if (typeof part !== "object" || part === null)
+      continue;
+    const t = part.text;
+    if (typeof t === "string")
+      texts.push(t);
+  }
+  return texts.length > 0 ? texts.join("") : void 0;
+}
+function googleSchema(schema) {
+  const out = {};
+  for (const [k, v] of Object.entries(schema)) {
+    if (k === "additionalProperties")
+      continue;
+    if (k === "type" && Array.isArray(v)) {
+      const types = v.filter((t) => typeof t === "string" && t !== "null");
+      if (v.includes("null"))
+        out.nullable = true;
+      if (types.length > 0)
+        out.type = types[0];
+      continue;
+    }
+    if (k === "properties" && typeof v === "object" && v !== null && !Array.isArray(v)) {
+      const props = {};
+      for (const [name, sub] of Object.entries(v)) {
+        props[name] = typeof sub === "object" && sub !== null && !Array.isArray(sub) ? googleSchema(sub) : sub;
+      }
+      out.properties = props;
+      continue;
+    }
+    if (k === "items" && typeof v === "object" && v !== null && !Array.isArray(v)) {
+      out.items = googleSchema(v);
+      continue;
+    }
+    out[k] = v;
+  }
+  if (Array.isArray(out.required) && typeof out.properties === "object" && out.properties !== null) {
+    const props = out.properties;
+    const required = out.required.filter((n) => typeof n === "string" && n in props);
+    if (required.length > 0)
+      out.required = required;
+    else
+      delete out.required;
+  }
+  return out;
+}
+async function callGoogle(ep, modelId, messages, o) {
+  const key = o.apiKey;
+  if (key === "")
+    return { ok: false, reason: "no-key", detail: "no API key configured" };
+  try {
+    validateSampling({ model: modelId, temperature: o.temperature, topP: o.topP, provider: "google" });
+  } catch (e) {
+    return { ok: false, reason: "unsupported", detail: redact(errMessage(e), key) };
+  }
+  const buildBody2 = (withSchema) => {
+    const generationConfig = { maxOutputTokens: o.maxTokens };
+    if (withSchema) {
+      generationConfig.responseMimeType = "application/json";
+      generationConfig.responseSchema = googleSchema(PR_REVIEW_SCHEMA.schema);
+    }
+    if (o.temperature !== void 0)
+      generationConfig.temperature = o.temperature;
+    if (o.topP !== void 0)
+      generationConfig.topP = o.topP;
+    return {
+      contents: [{ role: "user", parts: [{ text: messages.user }] }],
+      systemInstruction: { parts: [{ text: messages.system }] },
+      generationConfig
+    };
+  };
+  let payload = JSON.stringify(buildBody2(true));
+  const headers = {
+    ...ep.headers,
+    "x-goog-api-key": key
+  };
+  for (const k of Object.keys(headers)) {
+    if (/^authorization$/i.test(k))
+      delete headers[k];
+  }
+  const authEp = { baseUrl: ep.baseUrl, path: ep.path, headers, apiStyle: ep.apiStyle };
+  let a = await attempt(authEp, payload, o);
+  if (a.kind === "fail")
+    return a.result;
+  if (!a.ok && a.status === 400) {
+    payload = JSON.stringify(buildBody2(false));
+    a = await attempt(authEp, payload, o);
+    if (a.kind === "fail")
+      return a.result;
+  }
+  if (a.status === 429 || a.status >= 500) {
+    await sleep(retryDelayMs(a.retryAfter));
+    a = await attempt(authEp, payload, o);
+    if (a.kind === "fail")
+      return a.result;
+  }
+  if (!a.ok) {
+    const snippet = redact(a.text, key).slice(0, SNIPPET_CHARS);
+    return { ok: false, reason: "http-error", detail: `HTTP ${a.status}${snippet ? `: ${snippet}` : ""}` };
+  }
+  let json;
+  try {
+    json = JSON.parse(a.text);
+  } catch {
+    return { ok: false, reason: "invalid-json", detail: "response body is not JSON" };
+  }
+  const blockReason = promptBlockReason(json);
+  if (blockReason !== void 0) {
+    return {
+      ok: false,
+      reason: "content-filter",
+      detail: `provider blocked the prompt (blockReason=${blockReason})`
+    };
+  }
+  const finishReason = firstCandidate(json)?.finishReason;
+  if (finishReason === "MAX_TOKENS") {
+    return { ok: false, reason: "invalid-json", detail: "response truncated (finishReason=MAX_TOKENS)" };
+  }
+  if (finishReason !== void 0 && finishReason !== "STOP") {
+    return {
+      ok: false,
+      reason: "content-filter",
+      detail: `provider stopped the response (finishReason=${String(finishReason)})`
+    };
+  }
+  const text = joinCandidateText(json);
+  if (text === void 0) {
+    return { ok: false, reason: "invalid-json", detail: "response has no content" };
+  }
+  let parsed;
+  try {
+    parsed = parseContent(text);
+  } catch (e) {
+    return { ok: false, reason: "invalid-json", detail: errMessage(e) };
+  }
+  const findings = toFindings(parsed);
+  if (findings === void 0) {
+    return { ok: false, reason: "invalid-json", detail: "response does not match the review schema" };
+  }
+  return { ok: true, findings };
+}
+
+// lib/src/adapters/messages.js
+function joinContentText(json) {
+  const content = json?.content;
+  if (!Array.isArray(content))
+    return void 0;
+  const texts = [];
+  for (const part of content) {
+    if (typeof part !== "object" || part === null)
+      continue;
+    const p = part;
+    if (p.type === "text" && typeof p.text === "string")
+      texts.push(p.text);
+  }
+  return texts.length > 0 ? texts.join("") : void 0;
+}
+async function callMessages(ep, messages, o) {
+  const key = o.apiKey;
+  if (key === "")
+    return { ok: false, reason: "no-key", detail: "no API key configured" };
+  try {
+    validateSampling({ model: o.model, temperature: o.temperature, topP: o.topP, provider: "anthropic" });
+  } catch (e) {
+    return { ok: false, reason: "unsupported", detail: redact(errMessage(e), key) };
+  }
+  const body = {
+    model: o.model,
+    // max_tokens is REQUIRED on every /messages call, including reasoning models.
+    max_tokens: o.maxTokens,
+    system: messages.system,
+    messages: [{ role: "user", content: messages.user }]
+  };
+  if (o.temperature !== void 0)
+    body.temperature = o.temperature;
+  if (o.topP !== void 0)
+    body.top_p = o.topP;
+  const payload = JSON.stringify(body);
+  const headers = {
+    ...ep.headers,
+    "x-api-key": key,
+    "anthropic-version": "2023-06-01"
+  };
+  for (const k of Object.keys(headers)) {
+    if (/^authorization$/i.test(k))
+      delete headers[k];
+  }
+  const authEp = { baseUrl: ep.baseUrl, path: ep.path, headers, apiStyle: ep.apiStyle };
+  let a = await attempt(authEp, payload, o);
+  if (a.kind === "fail")
+    return a.result;
+  if (a.status === 429 || a.status >= 500) {
+    await sleep(retryDelayMs(a.retryAfter));
+    a = await attempt(authEp, payload, o);
+    if (a.kind === "fail")
+      return a.result;
+  }
+  if (!a.ok) {
+    const snippet = redact(a.text, key).slice(0, SNIPPET_CHARS);
+    return { ok: false, reason: "http-error", detail: `HTTP ${a.status}${snippet ? `: ${snippet}` : ""}` };
+  }
+  let json;
+  try {
+    json = JSON.parse(a.text);
+  } catch {
+    return { ok: false, reason: "invalid-json", detail: "response body is not JSON" };
+  }
+  const stopReason = json?.stop_reason;
+  if (stopReason === "refusal") {
+    return { ok: false, reason: "content-filter", detail: "model refused the request" };
+  }
+  if (stopReason === "max_tokens") {
+    return { ok: false, reason: "invalid-json", detail: "response truncated (stop_reason=max_tokens)" };
+  }
+  const text = joinContentText(json);
+  if (text === void 0) {
+    return { ok: false, reason: "invalid-json", detail: "response has no content" };
+  }
+  let parsed;
+  try {
+    parsed = parseContent(text);
+  } catch (e) {
+    return { ok: false, reason: "invalid-json", detail: errMessage(e) };
+  }
+  const findings = toFindings(parsed);
+  if (findings === void 0) {
+    return { ok: false, reason: "invalid-json", detail: "response does not match the review schema" };
+  }
+  return { ok: true, findings };
+}
+
+// lib/src/adapters/responses.js
+function outputParts(json) {
+  const output = json?.output;
+  if (!Array.isArray(output))
+    return [];
+  const parts = [];
+  for (const item of output) {
+    const content = item?.content;
+    if (!Array.isArray(content))
+      continue;
+    for (const part of content) {
+      if (typeof part === "object" && part !== null)
+        parts.push(part);
+    }
+  }
+  return parts;
+}
+function hasRefusal(json) {
+  return outputParts(json).some((p) => p.type === "refusal" && typeof p.refusal === "string" && p.refusal !== "");
+}
+function joinOutputText(json) {
+  const texts = outputParts(json).filter((p) => (p.type === "output_text" || p.type === "text") && typeof p.text === "string").map((p) => p.text);
+  return texts.length > 0 ? texts.join("") : void 0;
+}
+async function callResponses(ep, messages, o) {
+  const key = o.apiKey;
+  if (key === "")
+    return { ok: false, reason: "no-key", detail: "no API key configured" };
+  try {
+    validateSampling({ model: o.model, temperature: o.temperature, topP: o.topP, provider: "openai" });
+  } catch (e) {
+    return { ok: false, reason: "unsupported", detail: redact(errMessage(e), key) };
+  }
+  const buildBody2 = (withFormat) => {
+    const body = {
+      model: o.model,
+      input: [
+        { role: "system", content: messages.system },
+        { role: "user", content: messages.user }
+      ],
+      // The Responses API always budgets output via max_output_tokens,
+      // including reasoning models (no max_completion_tokens here).
+      max_output_tokens: o.maxTokens
+    };
+    if (withFormat) {
+      body.text = {
+        format: {
+          type: "json_schema",
+          name: PR_REVIEW_SCHEMA.name,
+          schema: PR_REVIEW_SCHEMA.schema,
+          strict: PR_REVIEW_SCHEMA.strict
+        }
+      };
+    }
+    if (o.temperature !== void 0)
+      body.temperature = o.temperature;
+    if (o.topP !== void 0)
+      body.top_p = o.topP;
+    return body;
+  };
+  let payload = JSON.stringify(buildBody2(true));
+  let a = await attempt(ep, payload, o);
+  if (a.kind === "fail")
+    return a.result;
+  if (!a.ok && a.status === 400) {
+    payload = JSON.stringify(buildBody2(false));
+    a = await attempt(ep, payload, o);
+    if (a.kind === "fail")
+      return a.result;
+  }
+  if (a.status === 429 || a.status >= 500) {
+    await sleep(retryDelayMs(a.retryAfter));
+    a = await attempt(ep, payload, o);
+    if (a.kind === "fail")
+      return a.result;
+  }
+  if (!a.ok) {
+    const snippet = redact(a.text, key).slice(0, SNIPPET_CHARS);
+    return { ok: false, reason: "http-error", detail: `HTTP ${a.status}${snippet ? `: ${snippet}` : ""}` };
+  }
+  let json;
+  try {
+    json = JSON.parse(a.text);
+  } catch {
+    return { ok: false, reason: "invalid-json", detail: "response body is not JSON" };
+  }
+  if (hasRefusal(json)) {
+    return { ok: false, reason: "content-filter", detail: "model refused the request" };
+  }
+  if (json?.status === "incomplete") {
+    return { ok: false, reason: "invalid-json", detail: "response truncated (status=incomplete)" };
+  }
+  const text = joinOutputText(json);
+  if (text === void 0) {
+    return { ok: false, reason: "invalid-json", detail: "response has no content" };
+  }
+  let parsed;
+  try {
+    parsed = parseContent(text);
+  } catch (e) {
+    return { ok: false, reason: "invalid-json", detail: errMessage(e) };
+  }
+  const findings = toFindings(parsed);
+  if (findings === void 0) {
+    return { ok: false, reason: "invalid-json", detail: "response does not match the review schema" };
+  }
+  return { ok: true, findings };
+}
+
 // lib/src/llm.js
 var InvalidJsonError = class extends Error {
 };
@@ -25385,6 +25749,19 @@ async function callLlm(ep, messages, o) {
   return { ok: true, findings };
 }
 var PULL_TIMEOUT_DEFAULT_S = 300;
+async function callByStyle(ep, messages, o) {
+  const style = ep.apiStyle ?? "openai-chat";
+  switch (style) {
+    case "openai-responses":
+      return callResponses(ep, messages, o);
+    case "anthropic-messages":
+      return callMessages(ep, messages, o);
+    case "google-models":
+      return callGoogle(ep, o.model, messages, o);
+    case "openai-chat":
+      return callLlm(ep, messages, o);
+  }
+}
 async function ensureOllama(baseUrl2, model, o = {}) {
   const key = o.apiKey ?? "";
   const timeoutSeconds = o.timeoutSeconds ?? PULL_TIMEOUT_DEFAULT_S;
@@ -25488,16 +25865,23 @@ var NON_CHAT = /* @__PURE__ */ new Map([
   ["opencode-zen:gemini-3.8-flash", "google-models"],
   ["opencode-zen:gemini-3.5-flash-lite", "google-models"]
 ]);
-var V2_STYLES = /* @__PURE__ */ new Set([
-  "openai-responses",
-  "anthropic-messages",
-  "google-models"
-]);
 var NON_CHAT_PATH_SEGMENTS = /* @__PURE__ */ new Set(["messages", "responses", "models"]);
 function isPathOnlyNonChat(path) {
   const pathname = path.replace(/\/+$/, "");
   const last = pathname.slice(pathname.lastIndexOf("/") + 1);
   return NON_CHAT_PATH_SEGMENTS.has(last);
+}
+function defaultPathFor(apiStyle, model) {
+  switch (apiStyle) {
+    case "openai-responses":
+      return "/responses";
+    case "anthropic-messages":
+      return "/messages";
+    case "google-models":
+      return `/models/${model}:generateContent`;
+    case "openai-chat":
+      return CHAT_PATH;
+  }
 }
 function resolveEndpoint(o) {
   const rawBase = o.llmBaseUrl || PRESET_BASE_URLS[o.llmProvider] || "";
@@ -25505,19 +25889,25 @@ function resolveEndpoint(o) {
     throw new Error(`llm_provider "${o.llmProvider}" requires llm_base_url`);
   }
   const baseUrl2 = rawBase.replace(/\/+$/, "");
-  if (V2_STYLES.has(o.llmApiStyle)) {
-    throw new UnsupportedModelError(`llm_api_style "${o.llmApiStyle}" is not supported in v1; only openai-chat is available`);
-  }
-  if (o.llmApiStyle === "auto" || o.llmApiStyle === "openai-chat") {
-    const nonChat = NON_CHAT.get(`${o.llmProvider}:${o.llmModel}`);
-    if (nonChat !== void 0) {
-      throw new UnsupportedModelError(`Model "${o.llmModel}" on "${o.llmProvider}" requires "${nonChat}", which is not supported in v1. Supported API styles: openai-chat (chat-capable models only).`);
-    }
-  }
   if (o.llmApiStyle === "custom-path" && o.llmPath === "") {
     throw new Error(`llm_api_style "custom-path" requires llm_path`);
   }
-  const rawPath = o.llmPath !== "" ? o.llmPath : CHAT_PATH;
+  let apiStyle;
+  if (o.llmApiStyle === "openai-responses" || o.llmApiStyle === "anthropic-messages" || o.llmApiStyle === "google-models") {
+    apiStyle = o.llmApiStyle;
+  } else if (o.llmApiStyle === "auto") {
+    apiStyle = NON_CHAT.get(`${o.llmProvider}:${o.llmModel}`) ?? "openai-chat";
+  } else {
+    apiStyle = "openai-chat";
+    if (o.llmApiStyle === "openai-chat") {
+      const nonChat = NON_CHAT.get(`${o.llmProvider}:${o.llmModel}`);
+      if (nonChat !== void 0) {
+        throw new UnsupportedModelError(`Model "${o.llmModel}" on "${o.llmProvider}" is served by "${nonChat}", which openai-chat cannot reach. Set llm_api_style to auto (resolves it automatically) or "${nonChat}". Supported API styles: auto, openai-chat, openai-responses, anthropic-messages, google-models, custom-path.`);
+      }
+    }
+  }
+  const effectiveBase = apiStyle === "google-models" && baseUrl2.endsWith("/openai") ? baseUrl2.slice(0, -"/openai".length) : baseUrl2;
+  const rawPath = o.llmPath !== "" ? o.llmPath : defaultPathFor(apiStyle, o.llmModel);
   const normalized = rawPath.startsWith("/") ? rawPath : `/${rawPath}`;
   const path = normalized.split(/[?#]/)[0];
   const strippedParts = [];
@@ -25528,9 +25918,9 @@ function resolveEndpoint(o) {
   if (strippedParts.length > 0) {
     warning(`llm_path ${strippedParts.join(" and ")} ignored; only the path is used`);
   }
-  if (isPathOnlyNonChat(path)) {
+  if (apiStyle === "openai-chat" && isPathOnlyNonChat(path)) {
     const rawClean = rawPath.split(/[?#]/)[0];
-    throw new UnsupportedModelError(`llm_path "${rawClean}" normalizes to "${path}", which is path-only: it names a non-chat endpoint. llm_path only overrides the path; a non-chat body adapter requires a v2 llm_api_style, which is not supported in v1.`);
+    throw new UnsupportedModelError(`llm_path "${rawClean}" normalizes to "${path}", which is path-only: it names a non-chat endpoint. llm_path only overrides the path; a non-chat body adapter requires a v2 llm_api_style (openai-responses, anthropic-messages or google-models).`);
   }
   const headers = {
     Authorization: `Bearer ${o.llmApiKey}`,
@@ -25539,7 +25929,7 @@ function resolveEndpoint(o) {
   if (o.llmProvider === "opencode-go" && o.prNumber !== null) {
     headers["x-opencode-session"] = `pr-${o.prNumber}`;
   }
-  return { baseUrl: baseUrl2, path, headers };
+  return { baseUrl: effectiveBase, path, headers, apiStyle };
 }
 async function validateModelExists(baseUrl2, model, apiKey) {
   const url = `${baseUrl2.replace(/\/+$/, "")}/models`;
@@ -26434,7 +26824,10 @@ function realAnalysis() {
     runL2: (dir) => runL2(dir),
     ensureOllama,
     validateModelExists,
-    callLlm
+    // The slow path invokes this seam; it dispatches by the endpoint's resolved
+    // API style (openai-chat keeps callLlm; v2 styles use their adapter), so
+    // every provider/model pair works end-to-end.
+    callLlm: callByStyle
   };
 }
 function readRunEnv() {
