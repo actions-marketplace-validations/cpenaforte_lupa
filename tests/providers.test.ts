@@ -156,6 +156,20 @@ describe("resolveEndpoint", () => {
     expect(r.baseUrl + r.path).toBe("https://x/chat/completions");
   });
 
+  it("returned path strips #fragment and ?query", () => {
+    expect(resolveEndpoint({ ...base, llmProvider: "custom", llmBaseUrl: "https://x", llmModel: "m", llmPath: "/chat/completions#x" }).path).toBe("/chat/completions");
+    expect(resolveEndpoint({ ...base, llmProvider: "custom", llmBaseUrl: "https://x", llmModel: "m", llmPath: "/chat/completions?a=1" }).path).toBe("/chat/completions");
+  });
+
+  it("bare query-bearing messages?x=1 throws path-only", () => {
+    expect(() => resolveEndpoint({ ...base, llmProvider: "custom", llmBaseUrl: "https://x", llmModel: "m", llmPath: "messages?x=1" })).toThrow(/path-only/);
+  });
+
+  it("path-only message quotes both raw llm_path and normalized path", () => {
+    expect(() => resolveEndpoint({ ...base, llmProvider: "custom", llmBaseUrl: "https://x", llmModel: "m", llmPath: "messages?x=1" }))
+      .toThrow(/llm_path "messages\?x=1" normalizes to "\/messages\?x=1"/);
+  });
+
   it('"/messages#x" throws path-only (fragment stripped)', () => {
     expect(() => resolveEndpoint({ ...base, llmProvider: "custom", llmBaseUrl: "https://x", llmModel: "m", llmPath: "/messages#x" })).toThrow(/path-only/);
   });
