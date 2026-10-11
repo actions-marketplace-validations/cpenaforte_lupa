@@ -26038,47 +26038,105 @@ function buildEndpointForStyle(provider, model, baseUrl2, apiKey, style, prNumbe
     userBase
   });
 }
-function authHeaderFor(provider, apiStyle) {
-  const googleNative = apiStyle === "google-models" && (provider === "google" || provider === "custom");
-  return { header: googleNative ? "x-goog-api-key" : "Authorization" };
+function catalogProtocolFor(provider, apiStyle) {
+  if (apiStyle === "google-models" && (provider === "google" || provider === "custom"))
+    return "google";
+  if (provider === "anthropic" || provider === "custom" && apiStyle === "anthropic-messages")
+    return "anthropic";
+  return "openai";
 }
-async function validateModelExists(baseUrl2, model, apiKey, auth2 = {}) {
-  const url = `${baseUrl2.replace(/\/+$/, "")}/models`;
+function catalogHeaders(protocol, apiKey) {
   const headers = { "User-Agent": USER_AGENT };
-  if (auth2.header === "x-goog-api-key") {
+  if (protocol === "google")
     headers["x-goog-api-key"] = apiKey;
-  } else {
+  else if (protocol === "anthropic") {
+    headers["x-api-key"] = apiKey;
+    headers["anthropic-version"] = "2023-06-01";
+  } else
     headers.Authorization = `Bearer ${apiKey}`;
-  }
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), VALIDATE_TIMEOUT_MS);
-  try {
-    const res = await fetch(url, {
-      headers,
-      signal: controller.signal
-    });
-    if (res.status === 404) {
-      await res.body?.cancel().catch(() => void 0);
-      return false;
-    }
-    if (!res.ok) {
-      await res.body?.cancel().catch(() => void 0);
-      throw new Error(`GET ${url} failed with HTTP ${res.status}`);
-    }
+  return headers;
+}
+async function checkModelListed(baseUrl2, model, apiKey, protocol) {
+  const root = `${baseUrl2.replace(/\/+$/, "")}/models`;
+  const headers = catalogHeaders(protocol, apiKey);
+  let url = protocol === "google" ? `${root}?pageSize=1000` : protocol === "anthropic" ? `${root}?limit=1000` : root;
+  let sawModels = false;
+  let unreadableRows = false;
+  let completed = false;
+  for (let page = 0; page < 5; page++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), VALIDATE_TIMEOUT_MS);
     let body;
     try {
-      body = await res.json();
+      const res = await fetch(url, { headers, signal: controller.signal });
+      if (!res.ok) {
+        try {
+          void res.body?.cancel().catch(() => void 0);
+        } catch {
+        }
+        controller.abort();
+        return { status: "unknown", detail: `catalog HTTP ${res.status}` };
+      }
+      try {
+        body = await res.json();
+      } catch {
+        return { status: "unknown", detail: "catalog returned invalid JSON" };
+      }
     } catch {
-      throw new Error(`GET ${url} returned invalid JSON`);
+      return { status: "unknown", detail: controller.signal.aborted ? "catalog request timed out" : "catalog request failed" };
+    } finally {
+      clearTimeout(timer);
     }
-    const data = body?.data;
-    if (!Array.isArray(data)) {
-      throw new Error(`GET ${url} returned no "data" array`);
+    const catalog = body;
+    const entries = protocol === "google" ? catalog?.models : catalog?.data;
+    if (!Array.isArray(entries))
+      return { status: "unknown", detail: "catalog has no models array" };
+    if (entries.length > 0)
+      sawModels = true;
+    const found = entries.some((entry) => {
+      const item = entry;
+      const id = protocol === "google" ? item?.name : item?.id;
+      const name = protocol === "google" && typeof id === "string" ? id.replace(/^models\//, "") : id;
+      if (typeof name !== "string" || name === "") {
+        unreadableRows = true;
+        return false;
+      }
+      return name === model;
+    });
+    if (found)
+      return { status: "listed" };
+    try {
+      if (protocol === "google") {
+        const token = catalog?.nextPageToken;
+        if (token === void 0 || token === "") {
+          completed = true;
+          break;
+        }
+        if (typeof token !== "string")
+          return { status: "unknown", detail: "catalog returned an invalid page cursor" };
+        url = `${root}?pageToken=${encodeURIComponent(token)}&pageSize=1000`;
+      } else if (protocol === "anthropic") {
+        if (catalog?.has_more === false) {
+          completed = true;
+          break;
+        }
+        if (catalog?.has_more !== true || typeof catalog.last_id !== "string" || catalog.last_id === "") {
+          return { status: "unknown", detail: "catalog returned an invalid page cursor" };
+        }
+        url = `${root}?after_id=${encodeURIComponent(catalog.last_id)}&limit=1000`;
+      } else {
+        completed = true;
+        break;
+      }
+    } catch {
+      return { status: "unknown", detail: "catalog returned an invalid page cursor" };
     }
-    return data.some((m) => m?.id === model);
-  } finally {
-    clearTimeout(timer);
   }
+  if (!completed)
+    return { status: "unknown", detail: "catalog pagination limit reached" };
+  if (unreadableRows)
+    return { status: "unknown", detail: "catalog has unreadable model rows" };
+  return sawModels ? { status: "absent" } : { status: "unknown", detail: "catalog was empty" };
 }
 
 // lib/src/adapters/google.js
@@ -26156,15 +26214,31 @@ function buildGoogleBody(conv, modelId, o, flags) {
     { role: "user", parts: [{ text: conv.user }] }
   ];
   let pendingResults = [];
+  const nativeCallIds = /* @__PURE__ */ new Set();
   const flushResults = () => {
     if (pendingResults.length > 0) {
-      contents.push({ role: "function", parts: pendingResults });
+      contents.push({ role: "user", parts: pendingResults });
       pendingResults = [];
     }
   };
   for (const turn of conv.turns ?? []) {
     if (turn.role === "assistant") {
       flushResults();
+      nativeCallIds.clear();
+      if (turn.rawItems !== void 0) {
+        for (const item of turn.rawItems) {
+          if (typeof item !== "object" || item === null)
+            continue;
+          const functionCall = item.functionCall;
+          if (typeof functionCall !== "object" || functionCall === null)
+            continue;
+          const id = functionCall.id;
+          if (typeof id === "string" && id !== "")
+            nativeCallIds.add(id);
+        }
+        contents.push({ role: "model", parts: turn.rawItems });
+        continue;
+      }
       const parts = [];
       if (turn.text)
         parts.push({ text: turn.text });
@@ -26173,11 +26247,14 @@ function buildGoogleBody(conv, modelId, o, flags) {
       }
       contents.push({ role: "model", parts });
     } else if (turn.role === "tool") {
+      const functionResponse = {
+        name: turn.name,
+        response: turn.isError ? { error: turn.output } : { output: turn.output }
+      };
+      if (nativeCallIds.has(turn.id))
+        functionResponse.id = turn.id;
       pendingResults.push({
-        functionResponse: {
-          name: turn.name,
-          response: turn.isError ? { error: turn.output } : { output: turn.output }
-        }
+        functionResponse
       });
     } else {
       flushResults();
@@ -26237,6 +26314,18 @@ function parseGoogleReply(json, flags) {
   if (flags.allowTools && typeof content === "object" && content !== null) {
     const parts = content.parts;
     if (Array.isArray(parts)) {
+      const reservedIds = /* @__PURE__ */ new Set();
+      for (const part of parts) {
+        if (typeof part !== "object" || part === null)
+          continue;
+        const fc = part.functionCall;
+        if (typeof fc !== "object" || fc === null)
+          continue;
+        const id = fc.id;
+        if (typeof id === "string" && id !== "")
+          reservedIds.add(id);
+      }
+      let syntheticIndex = 0;
       for (const part of parts) {
         if (typeof part !== "object" || part === null)
           continue;
@@ -26245,8 +26334,17 @@ function parseGoogleReply(json, flags) {
           continue;
         const call = fc;
         const args = call.args;
+        let id;
+        if (typeof call.id === "string" && call.id !== "") {
+          id = call.id;
+        } else {
+          do {
+            id = `fc_${syntheticIndex++}`;
+          } while (reservedIds.has(id));
+          reservedIds.add(id);
+        }
         toolCalls.push({
-          id: `fc_${toolCalls.length}`,
+          id,
           name: typeof call.name === "string" ? call.name : "",
           args,
           // Gemini's FunctionCall.args is optional; rawArgs is typed string, so
@@ -26256,7 +26354,13 @@ function parseGoogleReply(json, flags) {
       }
     }
   }
-  return { ok: true, text: joinCandidateText(json), toolCalls };
+  const contentParts = firstCandidate(json)?.content?.parts;
+  return {
+    ok: true,
+    text: joinCandidateText(json),
+    toolCalls,
+    rawItems: Array.isArray(contentParts) ? contentParts : []
+  };
 }
 async function callGoogle(ep, modelId, messages, o) {
   const key = o.apiKey;
@@ -26375,7 +26479,7 @@ async function callGoogleTurn(ep, modelId, conv, o, flags) {
   const reply = parseGoogleReply(json, gFlags);
   if (!reply.ok)
     return { ok: false, result: reply.result };
-  return { ok: true, text: reply.text ?? "", toolCalls: reply.toolCalls };
+  return { ok: true, text: reply.text ?? "", toolCalls: reply.toolCalls, rawItems: reply.rawItems };
 }
 
 // lib/src/adapters/messages.js
@@ -26405,6 +26509,10 @@ function buildMessagesBody(conv, o, flags) {
   for (const turn of conv.turns ?? []) {
     if (turn.role === "assistant") {
       flushResults();
+      if (turn.rawItems !== void 0) {
+        messages.push({ role: "assistant", content: turn.rawItems });
+        continue;
+      }
       const content = [];
       if (turn.text)
         content.push({ type: "text", text: turn.text });
@@ -26474,7 +26582,7 @@ function parseMessagesReply(json, flags) {
       });
     }
   }
-  return { ok: true, text: joinContentText(json), toolCalls };
+  return { ok: true, text: joinContentText(json), toolCalls, rawItems: Array.isArray(content) ? content : [] };
 }
 async function callMessages(ep, messages, o) {
   const key = o.apiKey;
@@ -26581,7 +26689,7 @@ async function callMessagesTurn(ep, conv, o, flags) {
   const reply = parseMessagesReply(json, mFlags);
   if (!reply.ok)
     return { ok: false, result: reply.result };
-  return { ok: true, text: reply.text ?? "", toolCalls: reply.toolCalls };
+  return { ok: true, text: reply.text ?? "", toolCalls: reply.toolCalls, rawItems: reply.rawItems };
 }
 
 // lib/src/adapters/responses.js
@@ -28189,15 +28297,13 @@ async function slowPath(env, deps, pr, fast, promptText, issueBody, skipped, prB
       return void 0;
     }
   }
-  try {
-    const listed = await deps.analysis.validateModelExists(ep.baseUrl, i.llmModel, i.llmApiKey, authHeaderFor(i.llmProvider, ep.apiStyle));
-    if (!listed) {
-      warning(`slow path skipped: model "${i.llmModel}" is not listed by the provider`);
-      return void 0;
-    }
-  } catch (e) {
-    warning(`slow path skipped: model check failed: ${e.message}`);
+  const check = await deps.analysis.checkModelListed(ep.baseUrl, i.llmModel, i.llmApiKey, catalogProtocolFor(i.llmProvider, ep.apiStyle));
+  if (check.status === "absent") {
+    warning(`slow path skipped: model "${i.llmModel}" is not listed by the provider`);
     return void 0;
+  }
+  if (check.status === "unknown") {
+    warning(`model check inconclusive (${check.detail ?? "unknown error"}); continuing`);
   }
   const messages = buildMessages(fast, promptText, issueBody, skipped);
   const llmOpts = {
@@ -28520,7 +28626,7 @@ function realAnalysis() {
     runScanners,
     runL2: (dir) => runL2(dir),
     ensureOllama,
-    validateModelExists,
+    checkModelListed,
     // Explicit styles (and llm_path overrides) dispatch straight to the resolved
     // endpoint's adapter; plain `auto` goes through the error-driven probe
     // (spec §9.5), which logs the style that won.

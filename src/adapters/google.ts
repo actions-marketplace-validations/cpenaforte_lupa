@@ -109,7 +109,7 @@ interface GoogleFlags {
 /** A parsed google reply: the failure union, or the extracted text + tool calls. */
 type GoogleReply =
   | { ok: false; result: LlmResult }
-  | { ok: true; text: string | undefined; toolCalls: ToolCall[] };
+  | { ok: true; text: string | undefined; toolCalls: ToolCall[]; rawItems: unknown[] };
 
 /**
  * Builds the Google generateContent request body from a neutral conversation.
@@ -118,8 +118,8 @@ type GoogleReply =
  * with `googleSchema` parameters); `responseMimeType`+`responseSchema` only when
  * `allowFormat`. `systemInstruction` rides in BOTH modes — the agent addendum
  * carries the untrusted-tool-output rule, so it must never be dropped. Assistant
- * turns become `role:"model"` parts (text then `functionCall`); consecutive
- * tool-result turns collapse into ONE `role:"function"` part set (the API wants
+ * turns become `role:"model"` parts (raw parts when available, otherwise text
+ * then `functionCall`); consecutive tool-result turns collapse into ONE `role:"user"` part set (the API wants
  * every `functionResponse` for a parallel call set together). `modelId` is part
  * of the shared signature for parity with the call sites; the model id rides the
  * endpoint path (`:generateContent`), not the body, so it is not emitted here.
@@ -134,15 +134,28 @@ function buildGoogleBody(
     { role: "user", parts: [{ text: conv.user }] },
   ];
   let pendingResults: Array<Record<string, unknown>> = [];
+  const nativeCallIds = new Set<string>();
   const flushResults = (): void => {
     if (pendingResults.length > 0) {
-      contents.push({ role: "function", parts: pendingResults });
+      contents.push({ role: "user", parts: pendingResults });
       pendingResults = [];
     }
   };
   for (const turn of conv.turns ?? []) {
     if (turn.role === "assistant") {
       flushResults();
+      nativeCallIds.clear();
+      if (turn.rawItems !== undefined) {
+        for (const item of turn.rawItems) {
+          if (typeof item !== "object" || item === null) continue;
+          const functionCall = (item as { functionCall?: unknown }).functionCall;
+          if (typeof functionCall !== "object" || functionCall === null) continue;
+          const id = (functionCall as { id?: unknown }).id;
+          if (typeof id === "string" && id !== "") nativeCallIds.add(id);
+        }
+        contents.push({ role: "model", parts: turn.rawItems });
+        continue;
+      }
       const parts: Array<Record<string, unknown>> = [];
       if (turn.text) parts.push({ text: turn.text });
       for (const tc of turn.toolCalls) {
@@ -150,11 +163,13 @@ function buildGoogleBody(
       }
       contents.push({ role: "model", parts });
     } else if (turn.role === "tool") {
+      const functionResponse: Record<string, unknown> = {
+        name: turn.name,
+        response: turn.isError ? { error: turn.output } : { output: turn.output },
+      };
+      if (nativeCallIds.has(turn.id)) functionResponse.id = turn.id;
       pendingResults.push({
-        functionResponse: {
-          name: turn.name,
-          response: turn.isError ? { error: turn.output } : { output: turn.output },
-        },
+        functionResponse,
       });
     } else {
       flushResults();
@@ -189,8 +204,8 @@ function buildGoogleBody(
  * raw text and tool calls. Prompt-level blocks (`promptFeedback.blockReason`) and
  * `finishReason` SAFETY/any other non-STOP value map to a content-filter skip
  * without retry; MAX_TOKENS degrades as "invalid-json". Tool calls
- * (`content.parts[].functionCall`) are parsed only when `allowTools`; the
- * provider id is ignored and each call is given a synthesized `fc_<index>` id.
+ * (`content.parts[].functionCall`) are parsed only when `allowTools`; provider
+ * ids are preserved and calls without them receive a synthesized `fc_<index>` id.
  */
 function parseGoogleReply(json: unknown, flags: GoogleFlags): GoogleReply {
   // A prompt-level block (e.g. SAFETY) is a provider-side skip, never retried —
@@ -231,14 +246,33 @@ function parseGoogleReply(json: unknown, flags: GoogleFlags): GoogleReply {
   if (flags.allowTools && typeof content === "object" && content !== null) {
     const parts = (content as { parts?: unknown }).parts;
     if (Array.isArray(parts)) {
+      const reservedIds = new Set<string>();
       for (const part of parts) {
         if (typeof part !== "object" || part === null) continue;
         const fc = (part as { functionCall?: unknown }).functionCall;
         if (typeof fc !== "object" || fc === null) continue;
-        const call = fc as { name?: unknown; args?: unknown };
+        const id = (fc as { id?: unknown }).id;
+        if (typeof id === "string" && id !== "") reservedIds.add(id);
+      }
+
+      let syntheticIndex = 0;
+      for (const part of parts) {
+        if (typeof part !== "object" || part === null) continue;
+        const fc = (part as { functionCall?: unknown }).functionCall;
+        if (typeof fc !== "object" || fc === null) continue;
+        const call = fc as { id?: unknown; name?: unknown; args?: unknown };
         const args = call.args;
+        let id: string;
+        if (typeof call.id === "string" && call.id !== "") {
+          id = call.id;
+        } else {
+          do {
+            id = `fc_${syntheticIndex++}`;
+          } while (reservedIds.has(id));
+          reservedIds.add(id);
+        }
         toolCalls.push({
-          id: `fc_${toolCalls.length}`,
+          id,
           name: typeof call.name === "string" ? call.name : "",
           args,
           // Gemini's FunctionCall.args is optional; rawArgs is typed string, so
@@ -249,7 +283,13 @@ function parseGoogleReply(json: unknown, flags: GoogleFlags): GoogleReply {
     }
   }
 
-  return { ok: true, text: joinCandidateText(json), toolCalls };
+  const contentParts = (firstCandidate(json)?.content as { parts?: unknown } | undefined)?.parts;
+  return {
+    ok: true,
+    text: joinCandidateText(json),
+    toolCalls,
+    rawItems: Array.isArray(contentParts) ? contentParts : [],
+  };
 }
 
 /**
@@ -429,5 +469,5 @@ export async function callGoogleTurn(
   }
   const reply = parseGoogleReply(json, gFlags);
   if (!reply.ok) return { ok: false, result: reply.result };
-  return { ok: true, text: reply.text ?? "", toolCalls: reply.toolCalls };
+  return { ok: true, text: reply.text ?? "", toolCalls: reply.toolCalls, rawItems: reply.rawItems };
 }

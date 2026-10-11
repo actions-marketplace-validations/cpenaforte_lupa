@@ -304,7 +304,7 @@ describe("callGoogleTurn", () => {
     expect((body.systemInstruction as { parts: Array<{ text: string }> }).parts[0]!.text).toBe(c.system);
   });
 
-  it("echoes model functionCall parts and role=function functionResponse parts", async () => {
+  it("echoes model functionCall parts and role=user functionResponse parts", async () => {
     const c: Conversation = {
       system: "s",
       user: "u",
@@ -334,12 +334,105 @@ describe("callGoogleTurn", () => {
         ],
       },
       {
-        role: "function",
+        role: "user",
         parts: [
           { functionResponse: { name: "read_file", response: { output: "ok" } } },
           { functionResponse: { name: "read_file", response: { error: "boom" } } },
         ],
       },
+    ]);
+  });
+
+  it("replays assistant rawItems (thoughtSignature + native ids) verbatim", async () => {
+    const c: Conversation = {
+      system: "s", user: "u",
+      turns: [{
+        role: "assistant", text: "t",
+        toolCalls: [{ id: "fc_0", name: "read_file", args: { path: "a.ts" }, rawArgs: '{"path":"a.ts"}' }],
+        rawItems: [{ text: "t", thoughtSignature: "sig-123" }, { functionCall: { id: "native-1", name: "read_file", args: { path: "a.ts" } } }],
+      }],
+      tools: [toolDef],
+    };
+    await callGoogleTurn(fakeGoogleEp(), MODEL, c, opts(), turnFlags);
+    expect(lastBody().contents).toEqual([
+      { role: "user", parts: [{ text: "u" }] },
+      { role: "model", parts: [{ text: "t", thoughtSignature: "sig-123" }, { functionCall: { id: "native-1", name: "read_file", args: { path: "a.ts" } } }] },
+    ]);
+  });
+
+  it("matches a native function call ID on the next functionResponse", async () => {
+    stubFetch((_c, n) => n === 1
+      ? json(200, {
+          candidates: [{
+            content: { parts: [
+              { text: "checking", thoughtSignature: "sig-native" },
+              { functionCall: { id: "native-call-7", name: "read_file", args: { path: "a.ts" } } },
+            ] },
+            finishReason: "STOP",
+          }],
+        })
+      : json(200, okGoogle("done")));
+
+    const first = await callGoogleTurn(fakeGoogleEp(), MODEL, conv(), opts(), turnFlags);
+    expect(first.ok).toBe(true);
+    if (!first.ok) return;
+    const call = first.toolCalls[0]!;
+    await callGoogleTurn(fakeGoogleEp(), MODEL, {
+      system: "s",
+      user: "u",
+      tools: [toolDef],
+      turns: [
+        { role: "assistant", text: first.text, toolCalls: first.toolCalls, rawItems: first.rawItems },
+        { role: "tool", id: call.id, name: call.name, output: "file contents" },
+      ],
+    }, opts(), turnFlags);
+
+    expect(lastBody().contents).toEqual([
+      { role: "user", parts: [{ text: "u" }] },
+      { role: "model", parts: [
+        { text: "checking", thoughtSignature: "sig-native" },
+        { functionCall: { id: "native-call-7", name: "read_file", args: { path: "a.ts" } } },
+      ] },
+      { role: "user", parts: [
+        { functionResponse: { id: "native-call-7", name: "read_file", response: { output: "file contents" } } },
+      ] },
+    ]);
+  });
+
+  it("reserves native IDs when synthesizing IDs for mixed function calls", async () => {
+    stubFetch((_c, n) => n === 1
+      ? json(200, {
+          candidates: [{
+            content: { parts: [
+              { functionCall: { id: "fc_1", name: "read_file", args: { path: "native.ts" } } },
+              { functionCall: { name: "read_file", args: { path: "synthetic.ts" } } },
+            ] },
+            finishReason: "STOP",
+          }],
+        })
+      : json(200, okGoogle("done")));
+
+    const first = await callGoogleTurn(fakeGoogleEp(), MODEL, conv(), opts(), turnFlags);
+    expect(first.ok).toBe(true);
+    if (!first.ok) return;
+    expect(first.toolCalls.map((call) => call.id)).toEqual(["fc_1", "fc_0"]);
+    expect(new Set(first.toolCalls.map((call) => call.id)).size).toBe(2);
+
+    await callGoogleTurn(fakeGoogleEp(), MODEL, {
+      system: "s",
+      user: "u",
+      tools: [toolDef],
+      turns: [
+        { role: "assistant", text: first.text, toolCalls: first.toolCalls, rawItems: first.rawItems },
+        { role: "tool", id: first.toolCalls[0]!.id, name: "read_file", output: "native result" },
+        { role: "tool", id: first.toolCalls[1]!.id, name: "read_file", output: "synthetic result" },
+      ],
+    }, opts(), turnFlags);
+
+    const contents = lastBody().contents as Array<{ role: string; parts: unknown[] }>;
+    expect(contents[2]!.parts).toEqual([
+      { functionResponse: { id: "fc_1", name: "read_file", response: { output: "native result" } } },
+      { functionResponse: { name: "read_file", response: { output: "synthetic result" } } },
     ]);
   });
 
@@ -366,6 +459,10 @@ describe("callGoogleTurn", () => {
       toolCalls: [
         { id: "fc_0", name: "read_file", args: { path: "a.ts" }, rawArgs: '{"path":"a.ts"}' },
         { id: "fc_1", name: "read_file", args: { path: "b.ts" }, rawArgs: '{"path":"b.ts"}' },
+      ],
+      rawItems: [
+        { functionCall: { name: "read_file", args: { path: "a.ts" } } },
+        { functionCall: { name: "read_file", args: { path: "b.ts" } } },
       ],
     });
   });
