@@ -46,7 +46,9 @@
   - `src/agent-types.ts`:
     ```ts
     export interface ToolCall { id: string; name: string; args: unknown; rawArgs: string }
-    export interface AssistantTurn { role: "assistant"; text: string; toolCalls: ToolCall[] }
+    export interface AssistantTurn { role: "assistant"; text: string; toolCalls: ToolCall[]; rawItems?: unknown[] }
+    // rawItems: adapter-specific raw reply items to echo verbatim on the next turn
+    // (OpenAI Responses reasoning items must be passed back with tool outputs).
     export interface ToolResultTurn { role: "tool"; id: string; name: string; output: string; isError?: boolean }
     export interface UserNoteTurn { role: "user"; text: string }
     export type Turn = AssistantTurn | ToolResultTurn | UserNoteTurn
@@ -119,7 +121,7 @@ git commit -m "feat(agent): inputs, shared agent types, prompt variant"
 **Interfaces:**
 - Consumes: `Conversation`, `ToolCall`, `ToolDef`, `Turn` from `src/agent-types.ts`.
 - Produces:
-  - `export type AgentReply = { ok: true; text: string; toolCalls: ToolCall[] } | { ok: false; result: LlmResult }` (in `llm.ts`).
+  - `export type AgentReply = { ok: true; text: string; toolCalls: ToolCall[]; rawItems?: unknown[] } | { ok: false; result: LlmResult }` (in `llm.ts`).
   - `export async function callChatTurn(ep: ResolvedEndpoint, conv: Conversation, o: { model; apiKey; temperature?; topP?; maxTokens; timeoutSeconds; provider }, flags: { allowTools: boolean; allowFormat: boolean }): Promise<AgentReply>`.
   - Internal refactor (no behavior change): `callLlm` keeps its exact payload/parse behavior, sharing a `buildChatBody(conv, o, flags)` and a `parseChatReply(json, flags)` with `callChatTurn`. The existing `callLlm` tests must pass unchanged.
 
@@ -172,9 +174,9 @@ git commit -m "feat(agent): chat adapter turn support (tools)"
 - Produces: `export async function callResponsesTurn(ep: ResolvedEndpoint, conv: Conversation, o: {...same options as callResponses}, flags: { allowTools: boolean; allowFormat: boolean }): Promise<AgentReply>`; `callResponses` keeps exact behavior sharing `buildResponsesBody(conv, o, flags)` / `parseResponsesReply(json, flags)`.
 
 Translation rules (turn mode):
-- `input` = `[{role:"system",content},{role:"user",content}, ...turns]`; assistant turn → text item `{role:"assistant", content: text}` (omit when empty) plus one `{type:"function_call", call_id: tc.id, name: tc.name, arguments: tc.rawArgs}` per call; tool result → `{type:"function_call_output", call_id: id, output}`; user note → `{role:"user", content: text}`.
+- `input` = `[{role:"system",content},{role:"user",content}, ...turns]`; assistant turn with `rawItems` → echo those raw items verbatim (OpenAI requires reasoning items returned with tool calls to be passed back on the next turn); assistant turn without `rawItems` → text item `{role:"assistant", content: text}` (omit when empty) plus one `{type:"function_call", call_id: tc.id, name: tc.name, arguments: tc.rawArgs}` per call; tool result → `{type:"function_call_output", call_id: id, output}`; user note → `{role:"user", content: text}`.
 - `tools` = `conv.tools?.map(t => ({ type: "function", name, description, parameters }))`; `text.format` only when `allowFormat` (existing strict-format + 400 retry logic).
-- Parse: output items `type:"function_call"` → ToolCall `{id: call_id, name, args: JSON.parse(arguments) or undefined, rawArgs: arguments}`; text via existing `joinOutputText`; `status:"incomplete"` and refusal keep existing mappings.
+- Parse: output items `type:"function_call"` → ToolCall `{id: call_id, name, args: JSON.parse(arguments) or undefined, rawArgs: arguments}`; `rawItems` = the raw `output` array (echoed verbatim on the next turn so reasoning items survive); text via existing `joinOutputText`; `status:"incomplete"` and refusal keep existing mappings.
 
 - [ ] **Step 1: Write the failing tests** (extend `tests/adapters-responses.test.ts`)
 
@@ -183,6 +185,7 @@ it("turn mode sends flat tools and no text.format", ...); // lastBody().tools[0]
 it("translates function_call echo and function_call_output", ...);
 it("parses output function_call items with call_id", ...);
 it("text plus function_call in one output parses both", ...);
+it("echoes raw output items verbatim so reasoning items survive the next turn", ...); // rawItems [{type:"reasoning",...},{type:"function_call",...}] echoed as-is
 ```
 
 - [ ] **Step 2: Run to verify they fail**
@@ -262,14 +265,14 @@ git commit -m "feat(agent): messages adapter turn support (tools)"
 - Produces: `export async function callGoogleTurn(ep: ResolvedEndpoint, modelId: string, conv: Conversation, o: {...same options as callGoogle}, flags: { allowTools: boolean; allowFormat: boolean }): Promise<AgentReply>`; `callGoogle` keeps exact behavior sharing `buildGoogleBody(conv, modelId, o, flags)` / `parseGoogleReply(json, flags)`.
 
 Translation rules (turn mode):
-- `contents` = `[{role:"user",parts:[{text:conv.user}]}, ...turns]`; assistant turn → `{role:"model", parts:[...(text ? [{text}] : []), ...toolCalls.map(tc => ({functionCall:{name: tc.name, args: tc.args}}))]}`; tool results → ONE `{role:"function", parts: results.map(r => ({functionResponse:{name: r.name, response: r.isError ? {error: r.output} : {output: r.output}}}))}` (role `"function"` per the API reference); user note → `{role:"user", parts:[{text}]}`.
+- `contents` = `[{role:"user",parts:[{text:conv.user}]}, ...turns]`; `systemInstruction` = `{parts:[{text: conv.system}]}` in BOTH modes (the agent addendum carries the untrusted-tool-output rule — never drop it); assistant turn → `{role:"model", parts:[...(text ? [{text}] : []), ...toolCalls.map(tc => ({functionCall:{name: tc.name, args: tc.args}}))]}`; tool results → ONE `{role:"function", parts: results.map(r => ({functionResponse:{name: r.name, response: r.isError ? {error: r.output} : {output: r.output}}}))}` (role `"function"` per the API reference); user note → `{role:"user", parts:[{text}]}`.
 - `tools` = `conv.tools?.map(t => ({functionDeclarations:[{name, description, parameters: googleSchema(t.parameters)}]}))`; `responseMimeType`/`responseSchema` only when `allowFormat` (existing 400 retry logic preserved).
 - Parse: parts with `functionCall` → ToolCall `{id: "fc_<index>", name, args: functionCall.args, rawArgs: JSON.stringify(args)}` (provider `id` ignored); `finishReason:"STOP"` success; `promptFeedback.blockReason`/SAFETY/MAX_TOKENS keep existing mappings; text via existing part join.
 
 - [ ] **Step 1: Write the failing tests** (extend `tests/adapters-google.test.ts`)
 
 ```ts
-it("turn mode sends functionDeclarations with googleSchema parameters and no responseSchema", ...);
+it("turn mode sends functionDeclarations with googleSchema parameters and no responseSchema", ...); // also asserts systemInstruction.parts[0].text === conv.system
 it("echoes model functionCall parts and role=function functionResponse parts", ...); // response: {output:"ok"} / {error:"boom"}
 it("parses functionCall parts with synthesized fc_ ids", ...);
 it("text and functionCall parts together parse both", ...);
@@ -312,7 +315,7 @@ git commit -m "feat(agent): google adapter turn support (tools)"
   export function resolveWithinRoot(root: string, rel: string): string | null;
   export async function executeTool(name: string, args: unknown, ctx: ToolContext): Promise<{ output: string; isError: boolean }>;
   ```
-- `resolveWithinRoot` rules: reject empty, absolute (`/` or drive-letter), any `..` segment, any `.git` segment; `path.resolve(root, rel)` must equal root or start with `root + sep`; when the path exists, `fs.realpathSync` of both must keep the same containment (symlink escape rejected); returns the resolved path or `null`.
+- `resolveWithinRoot` rules: reject empty, absolute (`/` or drive-letter), any `..` segment, any `.git` segment; `path.resolve(root, rel)` must equal root or start with `root + sep`; when the path exists, `fs.realpathSync` of both must keep the same containment AND the resolved path must not contain any `.git` segment (case-insensitive) — a PR-committed symlink `evil -> .git` would otherwise pass containment and expose the checkout credential; returns the resolved path or `null`.
 - `read_file` (`{path, start?, end?, repo?}`): 1-based inclusive lines, `start` default 1, `end` default EOF, invalid range → isError; output JSON `{path, start_line, end_line, total_lines, truncated, content}` with lines prefixed `N: `; content truncated at `AGENT_LIMITS.resultBytes` with `truncated: true` and a `[truncated]` marker.
 - `list_dir` (`{path, repo?}`): shallow, dirs first then files (alphabetical), entries `{name, type: "file"|"dir", size?}`, cap 200 with `truncated`.
 - `repo` arg: default `"self"` → `ctx.roots.self`; otherwise `ctx.roots.linked?.get(repo)` or `await ctx.ensureLinked(repo)` when available; unknown/inaccessible alias → isError `{error: "repository not accessible: <alias>"}`.
@@ -323,6 +326,7 @@ git commit -m "feat(agent): google adapter turn support (tools)"
 ```ts
 it("resolveWithinRoot rejects absolute, .., and any .git segment", ...); // null for "/etc/passwd", "../x", ".git/config", "a/.git/config"
 it("resolveWithinRoot rejects a symlink pointing outside the root", ...); // symlink to /etc/passwd → null
+it("resolveWithinRoot rejects a symlink into .git", ...); // symlink evil -> .git; "evil/config" → null (case-insensitive .git check on the resolved path)
 it("read_file returns numbered lines and metadata", ...); // content contains "1: line1"; total_lines 3
 it("read_file truncates content at 32KB with truncated=true", ...); // 40KB file → output byteLength <= 32768 + small slack; truncated true
 it("read_file rejects an invalid range and .git paths with isError", ...);
@@ -361,7 +365,7 @@ git commit -m "feat(agent): tool registry core (read_file, list_dir, confinement
 **Interfaces:**
 - Produces (same module):
   - `export function globToRegExp(glob: string): RegExp` — `**/` → `(?:.*/)?`, `**` → `.*`, `*` → `[^/]*`, `?` → `[^/]`, everything else escaped; anchored.
-  - `grep` (`{pattern, path?, glob?, max_results?, repo?}`): `new RegExp(pattern)` (no flags; invalid regex → isError); walks `path` (default root), skips `.git`, symlinks, files >1MB, and files whose first 8KB contain a NUL byte; per-line match, line text trimmed and capped at 200 chars; output `{matches: [{file, line, text}], truncated, files_scanned}`; caps: `min(max_results ?? 100, 100)` matches, result 32KB.
+  - `grep` (`{pattern, path?, glob?, max_results?, repo?}`): `new RegExp(pattern)` (no flags; invalid regex → isError); the match runs in a `node:worker_threads` Worker built from an inline source string (`new Worker(src, { eval: true })`) with a hard timeout (`GREP_TIMEOUT_MS = 5000`, overridable via `grepInRoot(root, args, timeoutMs?)` for tests) — a catastrophic model-authored pattern (`(a+)+$`) gets the worker terminated and returns isError `"grep timed out"`, never hangs the job; walks `path` (default root), skips `.git`, symlinks, files >1MB, and files whose first 8KB contain a NUL byte; per-line match, line text trimmed and capped at 200 chars; output `{matches: [{file, line, text}], truncated, files_scanned}`; caps: `min(max_results ?? 100, 100)` matches, result 32KB.
   - `glob` (`{pattern, repo?}`): same walk/skips; matches root-relative paths; output `{paths: [...], truncated}`; cap 200; sorted.
 - `executeTool` dispatches `read_file | list_dir | grep | glob`; unknown → isError.
 
@@ -372,6 +376,7 @@ it("globToRegExp handles *, **, **/ and ?", ...); // "src/**/*.ts" matches "src/
 it("grep finds matches with file:line and skips .git and binaries", ...);
 it("grep respects max_results and reports truncation", ...);
 it("grep with an invalid regex returns isError", ...);
+it("grep kills a catastrophic pattern within the timeout", ...); // grepInRoot(root, {pattern:"(a+)+$"}, 200) against a long 'a' line → isError "grep timed out"
 it("glob lists root-relative paths, sorted and capped", ...);
 it("grep and glob skip symlinked directories", ...);
 ```
@@ -414,7 +419,7 @@ git commit -m "feat(agent): grep and glob tools + dispatch"
   }
   export async function ensureLinkedRepo(alias: string, o: { token: string; baseDir: string; timeoutMs?: number; maxBytes?: number; deps?: CloneDeps }): Promise<{ dir: string } | { error: string }>;
   ```
-- `parseLinkedRepos`: strips fenced code blocks (```` ``` ... ``` ````) first; collects `https?://(?:www\.)?github\.com/<owner>/<repo>` URLs (trims `.git`, trailing `/`, `#...`, `?...`, punctuation) with priority, then bare `<owner>/<repo>` tokens (boundary: not preceded by `/`, `.`, or word char; not followed by `/`, `.`, or word char; optional `#<digits>` suffix); excludes `selfFullName` (case-insensitive); dedups case-insensitively preserving order; caps at 3 (URLs first).
+- `parseLinkedRepos`: strips fenced code blocks (```` ``` ... ``` ````) first; collects `https?://(?:www\.)?github\.com/<owner>/<repo>` URLs (trims `.git`, trailing `/`, `#...`, `?...`, punctuation) with priority, then bare `<owner>/<repo>` tokens (boundary: not preceded by `/`, `.`, or word char; not followed by `/`, `.`, or word char; optional `#<digits>` suffix); excludes `selfFullName` (case-insensitive); dedups case-insensitively preserving order; caps at 3 (URLs first). A standalone path-like token (e.g. `src/utils`) can still match — bare mentions are best-effort: a wrong alias fails lazily at clone time with `not accessible` and costs nothing outside agent mode (documented false positive).
 - `ensureLinkedRepo`: `dir = join(baseDir, owner + "__" + repo)`; already exists → return it. `sizeKb` present and `> maxBytes/1024` → `{error: "repository too large"}`. Clone: `git clone --depth 1 --single-branch https://github.com/<alias>.git <dir>` with env `{...process.env, GIT_TERMINAL_PROMPT: "0"}` plus, when `token !== ""`, `GIT_CONFIG_COUNT: "1"`, `GIT_CONFIG_KEY_0: "http.extraHeader"`, `GIT_CONFIG_VALUE_0: "Authorization: Basic " + base64("x-access-token:" + token)`; timeout `60000`. On non-zero code/timeout: remove `dir`, return `{error}` with the token redacted from stderr. Post-clone: walk the dir; total bytes `> maxBytes` → remove + `{error: "repository too large"}`.
 
 - [ ] **Step 1: Write the failing tests**
@@ -423,6 +428,7 @@ git commit -m "feat(agent): grep and glob tools + dispatch"
 it("parses URLs, strips .git/tree paths and punctuation", ...); // "https://github.com/acme/tools/tree/main/x." → ["acme/tools"]
 it("parses bare owner/repo#12 tokens and excludes self", ...);
 it("ignores fenced code blocks, non-github hosts and path-like tokens", ...); // "src/utils" preceded by "/" or followed by "/" ignored
+it("standalone path-like tokens are best-effort (documented false positive)", ...); // "see src/utils here" → ["src/utils"], fails lazily at clone
 it("dedups case-insensitively and caps at 3 with URLs first", ...);
 it("ensureLinkedRepo clones with env auth and never puts the token in argv", ...); // run fake asserts args lack token; env GIT_CONFIG_VALUE_0 contains base64
 it("ensureLinkedRepo returns not-accessible on failure with token redacted", ...);
@@ -477,7 +483,7 @@ git commit -m "feat(agent): linked repo parsing and lazy shallow clone"
   ```
 - Loop semantics:
   - Turn 0 with tools: on failure with `status === 400`, retry the SAME conversation with `{allowTools:false, allowFormat:true}`. Retry ok → `stop:"fallback"`, `toolsUnsupported:true`, result ok. Retry failed → return that failure with `probeAdvance: status === 400 || status === 404`. Turn-0 failure with `status === 404` → `probeAdvance:true`. All later/other failures → `probeAdvance:false`.
-  - Each assistant turn with tool calls: execute at most `maxCallsPerTurn` (default 4) via `executeTool`; every extra call gets `{output:'{"error":"too many tool calls in one turn (max 4)"}', isError:true}`; append one `toolResult` turn per call (order preserved); `calls` counts executions only; `bytes += Buffer.byteLength(output, "utf8")`; per-result cap `maxResultBytes` (slice + `[truncated]` marker).
+  - Each assistant turn with tool calls: execute at most `maxCallsPerTurn` (default 4) via `executeTool`; every extra call gets `{output:'{"error":"too many tool calls in one turn (max 4)"}', isError:true}`; append one `toolResult` turn per call (order preserved); the appended assistant turn copies `reply.rawItems` when present (adapter passthrough for Responses reasoning items); `calls` counts executions only; `bytes += Buffer.byteLength(output, "utf8")`; per-result cap `maxResultBytes` (slice + `[truncated]` marker).
   - Before each model call: `remaining = deadline - clock()`; `remaining < 10_000` → abort `{reason:"timeout", detail:"agent budget exhausted"}` with `stop:"budget"`; the call gets `callOpts.timeoutSeconds = min(budget.timeoutSeconds, ceil(remaining/1000))`.
   - `turns >= maxTurns` or `bytes >= maxTotalBytes` → append `{role:"user", text:"Tool budget exhausted. Respond with ONLY the JSON findings object matching the schema."}` and force `{allowTools:false, allowFormat:true}`; parse → ok with `stop:"budget"`.
   - Final reply (no tool calls): parse text via `parseContent`+`toFindings`; invalid → ONE repair call with `{allowTools:false, allowFormat:true}` after appending `{role:"user", text:"Your previous message was not valid JSON. Respond with ONLY the JSON findings object matching the schema; no prose."}`; still invalid → `{reason:"invalid-json", detail}` with `stop:"error"`; ok → `stop:"final"`.
@@ -497,6 +503,7 @@ it("turn-0 400 then 400 again → probeAdvance true; turn-0 500 → false", ...)
 it("mid-loop 400 → probeAdvance false", ...);
 it("malformed tool args return isError and the loop continues", ...);
 it("unknown tool name returns isError and the loop continues", ...);
+it("a failing ensureLinked alias yields an error result and the loop still finishes (stop=final)", ...);
 it("logs the exact turn and done lines", ...);
 ```
 
