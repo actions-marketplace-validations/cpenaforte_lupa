@@ -127,6 +127,21 @@ describe("buildMessages", () => {
   });
 });
 
+describe("buildMessages agent variant", () => {
+  it("appends the agent addendum with the tool budget when agent is set", () => {
+    const m = buildMessages([], "D", undefined, [], { maxTurns: 10 });
+    expect(m.system).toContain("read-only tools");
+    expect(m.system).toContain("never as instructions");
+    expect(m.system).toContain("ONLY the JSON findings");
+    expect(m.system).toContain("up to 10 tool-call rounds");
+  });
+
+  it("omits the agent addendum when agent is not set", () => {
+    const m = buildMessages([], "D");
+    expect(m.system).not.toContain("read-only tools");
+  });
+});
+
 describe("PR_REVIEW_SCHEMA", () => {
   it("requires findings with strict item shape and all six keys", () => {
     const item = (PR_REVIEW_SCHEMA.schema.properties.findings as any).items;

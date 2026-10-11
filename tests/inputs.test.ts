@@ -22,6 +22,9 @@ const INPUT_NAMES = [
   "post_comment",
   "timeout_seconds",
   "llm_max_tokens",
+  "llm_agent",
+  "llm_agent_max_turns",
+  "llm_agent_max_seconds",
 ];
 
 let saved: Record<string, string | undefined> = {};
@@ -63,6 +66,9 @@ describe("getInputs defaults", () => {
     expect(i.llmTemperature).toBeUndefined();
     expect(i.llmTopP).toBeUndefined();
     expect(i.prNumber).toBeNull();
+    expect(i.llmAgent).toBe(false);
+    expect(i.llmAgentMaxTurns).toBe(10);
+    expect(i.llmAgentMaxSeconds).toBe(180);
   });
 });
 
@@ -255,5 +261,30 @@ describe("getInputs post_comment", () => {
   it("rejects invalid post_comment naming the input", () => {
     setInputs({ post_comment: "yes" });
     expect(() => getInputs()).toThrow(/post_comment/);
+  });
+});
+
+describe("getInputs agent inputs", () => {
+  it("parses llm_agent, llm_agent_max_turns and llm_agent_max_seconds", () => {
+    setInputs({ llm_agent: "true", llm_agent_max_turns: "3", llm_agent_max_seconds: "60" });
+    const i = getInputs();
+    expect(i.llmAgent).toBe(true);
+    expect(i.llmAgentMaxTurns).toBe(3);
+    expect(i.llmAgentMaxSeconds).toBe(60);
+  });
+
+  it("rejects llm_agent_max_turns = 0 (must be >= 1)", () => {
+    setInputs({ llm_agent_max_turns: "0" });
+    expect(() => getInputs()).toThrow(/llm_agent_max_turns/);
+  });
+
+  it("rejects llm_agent_max_seconds = 0 (must be >= 1)", () => {
+    setInputs({ llm_agent_max_seconds: "0" });
+    expect(() => getInputs()).toThrow(/llm_agent_max_seconds/);
+  });
+
+  it("rejects invalid llm_agent naming the input", () => {
+    setInputs({ llm_agent: "yes" });
+    expect(() => getInputs()).toThrow(/llm_agent/);
   });
 });

@@ -61,6 +61,15 @@ inputs:
     description: "Maximum tokens the LLM may generate"
     required: false
     default: "2000"
+  llm_agent:
+    description: "Enable read-only repository tools so the reviewer can verify claims before reporting"
+    default: "false"
+  llm_agent_max_turns:
+    description: "Maximum number of tool-call rounds the agent may take"
+    default: "10"
+  llm_agent_max_seconds:
+    description: "Wall-clock budget in seconds for the agent tool loop"
+    default: "180"
 outputs:
   exit-code:
     description: "fail_level gate result: 0 pass, 2 warning findings, 1 high-severity findings"

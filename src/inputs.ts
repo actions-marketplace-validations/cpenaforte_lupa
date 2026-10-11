@@ -43,6 +43,9 @@ export interface ActionInputs {
   postComment: boolean;
   timeoutSeconds: number;
   prNumber: number | null;
+  llmAgent: boolean;
+  llmAgentMaxTurns: number;
+  llmAgentMaxSeconds: number;
 }
 
 export function parseFailLevel(v: string): FailLevel {
@@ -116,6 +119,9 @@ export function getInputs(): ActionInputs {
     postComment: readBool("post_comment", true),
     timeoutSeconds: readInt("timeout_seconds", 90, 1),
     prNumber,
+    llmAgent: readBool("llm_agent", false),
+    llmAgentMaxTurns: readInt("llm_agent_max_turns", 10, 1),
+    llmAgentMaxSeconds: readInt("llm_agent_max_seconds", 180, 1),
   };
 }
 

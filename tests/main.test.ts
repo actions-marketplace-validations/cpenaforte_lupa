@@ -144,6 +144,9 @@ function inputsFor(o: MockOpts): ActionInputs {
     postComment: o.postComment ?? true,
     timeoutSeconds: 90,
     prNumber: o.prNumber === undefined ? 7 : o.prNumber,
+    llmAgent: false,
+    llmAgentMaxTurns: 10,
+    llmAgentMaxSeconds: 180,
   };
 }
 
