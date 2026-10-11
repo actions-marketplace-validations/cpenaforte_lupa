@@ -63,12 +63,15 @@ inputs:
     default: "2000"
   llm_agent:
     description: "Enable read-only repository tools so the reviewer can verify claims before reporting"
+    required: false
     default: "false"
   llm_agent_max_turns:
     description: "Maximum number of tool-call rounds the agent may take"
+    required: false
     default: "10"
   llm_agent_max_seconds:
     description: "Wall-clock budget in seconds for the agent tool loop"
+    required: false
     default: "180"
 outputs:
   exit-code:
