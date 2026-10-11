@@ -185,7 +185,7 @@ it("turn mode sends flat tools and no text.format", ...); // lastBody().tools[0]
 it("translates function_call echo and function_call_output", ...);
 it("parses output function_call items with call_id", ...);
 it("text plus function_call in one output parses both", ...);
-it("echoes raw output items verbatim so reasoning items survive the next turn", ...); // rawItems [{type:"reasoning",...},{type:"function_call",...}] echoed as-is
+it("echoes raw output items verbatim so reasoning items survive the next turn", ...); // fixture has a reasoning item with id/status + function_call; echo follows the docs pattern input += response.output; canary validates — if a Responses model 400s on the extra id/status fields, strip them (error-driven adjustment)
 ```
 
 - [ ] **Step 2: Run to verify they fail**
@@ -365,7 +365,8 @@ git commit -m "feat(agent): tool registry core (read_file, list_dir, confinement
 **Interfaces:**
 - Produces (same module):
   - `export function globToRegExp(glob: string): RegExp` — `**/` → `(?:.*/)?`, `**` → `.*`, `*` → `[^/]*`, `?` → `[^/]`, everything else escaped; anchored.
-  - `grep` (`{pattern, path?, glob?, max_results?, repo?}`): `new RegExp(pattern)` (no flags; invalid regex → isError); the match runs in a `node:worker_threads` Worker built from an inline source string (`new Worker(src, { eval: true })`) with a hard timeout (`GREP_TIMEOUT_MS = 5000`, overridable via `grepInRoot(root, args, timeoutMs?)` for tests) — a catastrophic model-authored pattern (`(a+)+$`) gets the worker terminated and returns isError `"grep timed out"`, never hangs the job; walks `path` (default root), skips `.git`, symlinks, files >1MB, and files whose first 8KB contain a NUL byte; per-line match, line text trimmed and capped at 200 chars; output `{matches: [{file, line, text}], truncated, files_scanned}`; caps: `min(max_results ?? 100, 100)` matches, result 32KB.
+  - `export async function grepInRoot(root: string, args: { pattern: string; path?: string; glob?: string; max_results?: number }, timeoutMs?: number): Promise<{ output: string; isError: boolean }>` — test seam; `executeTool` delegates to it with the default timeout.
+  - `grep` (`{pattern, path?, glob?, max_results?, repo?}`): `new RegExp(pattern)` (no flags; invalid regex → isError); the match runs in a `node:worker_threads` Worker with a hard timeout (`GREP_TIMEOUT_MS = 5000`, overridable via `grepInRoot(root, args, timeoutMs?)` for tests) — a catastrophic model-authored pattern gets the worker terminated and returns isError `"grep timed out"`, never hangs the job. The worker `src` is a CONSTANT string and the pattern/inputs travel via `workerData` — the untrusted pattern is never interpolated into the eval source (that would be RCE). Walks `path` (default root), skips `.git`, symlinks, files >1MB, and files whose first 8KB contain a NUL byte; per-line match, line text trimmed and capped at 200 chars; output `{matches: [{file, line, text}], truncated, files_scanned}`; caps: `min(max_results ?? 100, 100)` matches, result 32KB.
   - `glob` (`{pattern, repo?}`): same walk/skips; matches root-relative paths; output `{paths: [...], truncated}`; cap 200; sorted.
 - `executeTool` dispatches `read_file | list_dir | grep | glob`; unknown → isError.
 
@@ -376,7 +377,8 @@ it("globToRegExp handles *, **, **/ and ?", ...); // "src/**/*.ts" matches "src/
 it("grep finds matches with file:line and skips .git and binaries", ...);
 it("grep respects max_results and reports truncation", ...);
 it("grep with an invalid regex returns isError", ...);
-it("grep kills a catastrophic pattern within the timeout", ...); // grepInRoot(root, {pattern:"(a+)+$"}, 200) against a long 'a' line → isError "grep timed out"
+it("grep kills a catastrophic pattern within the timeout", ...); // non-matching input triggers backtracking: line "a".repeat(40000)+"b" with pattern "(a+)+$" → grepInRoot(root, {pattern:"(a+)+$"}, 200) → isError "grep timed out"
+it("a pattern containing ');require(' is treated as a literal regex, not code", ...); // no execution, isError or no-match only
 it("glob lists root-relative paths, sorted and capped", ...);
 it("grep and glob skip symlinked directories", ...);
 ```

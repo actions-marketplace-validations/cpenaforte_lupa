@@ -139,7 +139,7 @@ Objetivo: com `llm_agent: true`, o slow-path explora o repositório do PR (check
 - Fallback error-driven: request com tools levando 400 no mesmo estilo → retry sem tools; sucesso = modelo/endpoint sem tool-calling → single-shot memoizado em processo (`TOOLS_MEMO[provider:model]=false`, warning no log). 400 de novo → avança o probe de estilo.
 
 ### 10.2 Arquitetura
-- `src/agent.ts` — loop, estado neutro, orçamento, logs. `Conversation {system, user, turns: Turn[]}`; `Turn = assistant {text, toolCalls:[{id,name,args}]} | toolResult {id, name, output, isError?}`. `turns: []` = single-shot atual.
+- `src/agent.ts` — loop, estado neutro, orçamento, logs. `Conversation {system, user, turns: Turn[]}`; `Turn = assistant {text, toolCalls:[{id,name,args,rawArgs}], rawItems?} | toolResult {id, name, output, isError?} | user note {text}` (rawItems: itens crus da reply ecoados verbatim no próximo turno — reasoning items do Responses). `turns: []` = single-shot atual.
 - `src/agent-tools.ts` — registry `read_file`/`list_dir`/`grep`/`glob`, confinamento por root, caps, execução; roots = workspace (`GITHUB_WORKSPACE`) + aliases de repos linkados (clone lazy).
 - Adapters: tradução aditiva do estado neutro + `tools` para o dialeto nativo; payloads single-shot inalterados (turns vazio; testes existentes pinam).
 - `callWithProbe` reusa a máquina de probe existente no caminho com tools; `llm_api_style` explícito = sem probe (igual hoje).
