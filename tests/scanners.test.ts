@@ -584,3 +584,97 @@ describe("per-tool timeout (M8)", () => {
     ]);
   });
 });
+
+describe("failed scanner invocations (F08)", () => {
+  function sarifWith(o: { results: unknown[]; invocations?: unknown[] }): string {
+    const run: Record<string, unknown> = { results: o.results };
+    if (o.invocations !== undefined) run.invocations = o.invocations;
+    return JSON.stringify({ runs: [run] });
+  }
+
+  function mkResult(ruleId = "R1"): unknown {
+    return {
+      ruleId,
+      level: "error",
+      message: { text: "bad" },
+      locations: [
+        { physicalLocation: { artifactLocation: { uri: "a.ts" }, region: { startLine: 1 } } },
+      ],
+    };
+  }
+
+  it("exit-2 SARIF with executionSuccessful:false and an error notification yields exactly one scanner-failed warning", () => {
+    const stdout = sarifWith({
+      results: [],
+      invocations: [
+        {
+          executionSuccessful: false,
+          toolExecutionNotifications: [{ level: "error", message: { text: "boom" } }],
+        },
+      ],
+    });
+    const result = fromStdout("semgrep", "semgrep", { missing: false, code: 2, stdout, timedOut: false });
+    expect(result).toHaveLength(1);
+    expect(result[0]).toMatchObject({ rule: "scanner-failed" });
+  });
+
+  it("unsuccessful run WITH results keeps the findings and appends the warning", () => {
+    const stdout = sarifWith({
+      results: [mkResult()],
+      invocations: [{ executionSuccessful: false }],
+    });
+    const findings = fromStdout("semgrep", "semgrep", { missing: false, code: 2, stdout, timedOut: false });
+    expect(findings).toHaveLength(2);
+    expect(findings[0]).toMatchObject({ rule: "R1" });
+    expect(findings[findings.length - 1]).toMatchObject({
+      rule: "scanner-failed",
+      message: "semgrep reported an unsuccessful run",
+    });
+  });
+
+  it("exit-1 with no invocation info stays quiet via the findings-exit-code table (semgrep findings exit is 1)", () => {
+    const stdout = sarifWith({ results: [mkResult()] });
+    const findings = fromStdout("semgrep", "semgrep", { missing: false, code: 1, stdout, timedOut: false });
+    expect(findings).toHaveLength(1);
+    expect(findings.some((f) => f.rule === "scanner-failed")).toBe(false);
+  });
+
+  it("trivy exit-1 with parseable SARIF warns (trivy findings exit is 0)", () => {
+    const stdout = sarifWith({ results: [mkResult()] });
+    const findings = fromStdout("docker", "trivy", { missing: false, code: 1, stdout, timedOut: false });
+    expect(findings).toHaveLength(2);
+    expect(findings[findings.length - 1]).toMatchObject({
+      rule: "scanner-failed",
+      message: "trivy reported an unsuccessful run",
+    });
+  });
+
+  it("fatal exit without invocation info still warns", () => {
+    const stdout = sarifWith({ results: [mkResult()] });
+    const findings = fromStdout("semgrep", "semgrep", { missing: false, code: 2, stdout, timedOut: false });
+    expect(findings).toHaveLength(2);
+    expect(findings[findings.length - 1]).toMatchObject({ rule: "scanner-failed" });
+  });
+
+  it("osv-scanner exit-1 with parseable SARIF stays quiet (label prefix matches the findings-exit-code table)", () => {
+    const stdout = sarifWith({ results: [mkResult()] });
+    const findings = fromStdout("docker", "osv-scanner (package-lock.json)", {
+      missing: false,
+      code: 1,
+      stdout,
+      timedOut: false,
+    });
+    expect(findings).toHaveLength(1);
+    expect(findings.some((f) => f.rule === "scanner-failed")).toBe(false);
+  });
+
+  it("explicit invocation success wins over a contradictory exit code", () => {
+    const stdout = sarifWith({
+      results: [mkResult()],
+      invocations: [{ executionSuccessful: true }],
+    });
+    const findings = fromStdout("semgrep", "semgrep", { missing: false, code: 2, stdout, timedOut: false });
+    expect(findings).toHaveLength(1);
+    expect(findings.some((f) => f.rule === "scanner-failed")).toBe(false);
+  });
+});

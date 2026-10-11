@@ -26,6 +26,7 @@ import {
   ReadonlyTokenError,
   resolvePrNumber,
   shouldTrigger,
+  StaleHeadError,
 } from "./github.js";
 import { getInputs, type ActionInputs } from "./inputs.js";
 import { ensureLinkedRepo, parseLinkedRepos } from "./linked-repos.js";
@@ -129,6 +130,7 @@ export interface Outcome {
   findingsFrom: "llm" | "fastpath";
   slowPathSkipped: boolean;
   issueBodyFetched?: number;
+  staleSkipped?: boolean;
 }
 
 interface EventFields {
@@ -569,7 +571,10 @@ async function slowPath(
             return deps.gh.getRepoSize(o!, n!);
           },
         });
-        if ("dir" in r) toolCtx.roots.linked!.set(alias, r.dir);
+        if ("dir" in r) {
+          toolCtx.roots.linked!.set(alias, r.dir);
+          if ("sha" in r && r.sha !== "") core.info(`agent linked repo ${alias} at ${r.sha}`);
+        }
         return r;
       },
     };
@@ -617,6 +622,13 @@ async function slowPath(
   return res.findings;
 }
 
+// Artifact redaction is runtime-key masking only: the run's own github_token and
+// llm_api_key values are masked from findings.json and sarif.json. Secrets
+// committed in the diff are a separate scanner concern and are not covered.
+function runtimeSecrets(env: RunEnv): string[] {
+  return [env.inputs.githubToken, env.inputs.llmApiKey].filter(s => s !== "");
+}
+
 interface PublishArgs {
   env: RunEnv;
   deps: Deps;
@@ -634,7 +646,7 @@ interface PublishArgs {
  * A failed issue fallback is a warning; it never changes the exit code.
  */
 async function publishReview(a: PublishArgs): Promise<void> {
-  const findings = redactFindings(a.findings, [a.env.inputs.githubToken, a.env.inputs.llmApiKey].filter(s => s !== ""));
+  const findings = redactFindings(a.findings, runtimeSecrets(a.env));
   const { inline, general } = mapToComments(findings, parseHunks(a.hunks));
   const body = buildBody(general, summaryFor(findings));
   const payload: ReviewPayload = {
@@ -669,6 +681,16 @@ async function publishReview(a: PublishArgs): Promise<void> {
     await a.deps.gh.createReview(a.pr, payload, { canWrite: true });
     a.out.posted = true;
   } catch (e) {
+    if (e instanceof StaleHeadError) {
+      note(
+        a.env,
+        a.out,
+        `pr-reviewer: PR head moved during posting; analyzed ${e.analyzedSha}, live ${e.liveSha}; skipping review for the stale head — a fresh run will cover the new head.`,
+      );
+      a.out.staleSkipped = true;
+      a.out.exitCode = 0;
+      return;
+    }
     if (!(e instanceof ReadonlyTokenError)) throw e;
     core.error(`review post refused by GitHub: ${e.detail !== "" ? e.detail : e.message}`);
     // issuesWrite is derived from the environment: the template grants issues: write explicitly.
@@ -785,7 +807,7 @@ async function runFlowA(env: RunEnv, deps: Deps, out: Outcome): Promise<void> {
   }
   const fast = [...l0, ...scan.findings, ...l2];
   // Written before the LLM call so a later failure still leaves the fast results uploadable.
-  writeFindings(env.artifactDir, fast);
+  writeFindings(env.artifactDir, redactFindings(fast, runtimeSecrets(env)));
 
   const prompt = truncateDiff(filterForPrompt(files), env.inputs.maxDiffChars, PER_FILE_CAP);
   let issueBody: string | undefined;
@@ -803,11 +825,12 @@ async function runFlowA(env: RunEnv, deps: Deps, out: Outcome): Promise<void> {
   out.slowPathSkipped = llm === undefined;
   out.findingsFrom = llm === undefined ? "fastpath" : "llm";
   const all = [...fast, ...(llm ?? [])].map(sanitizeFinding);
-  writeFindings(env.artifactDir, all);
-  writeFileSync(join(env.artifactDir, "sarif.json"), JSON.stringify(toSarif(all), null, 2) + "\n", "utf8");
+  const redacted = redactFindings(all, runtimeSecrets(env));
+  writeFindings(env.artifactDir, redacted);
+  writeFileSync(join(env.artifactDir, "sarif.json"), JSON.stringify(toSarif(redacted), null, 2) + "\n", "utf8");
 
   await publishReview({ env, deps, out, pr, isFork: pull.isFork, findings: all, hunks: files, headSha: env.headSha });
-  out.exitCode = exitFor(env.inputs.failLevel, all);
+  if (!out.staleSkipped) out.exitCode = exitFor(env.inputs.failLevel, all);
 }
 
 /**
@@ -860,7 +883,7 @@ async function runFlowB(env: RunEnv, deps: Deps, out: Outcome): Promise<void> {
   const findings = readFindings(env.artifactDir).map(sanitizeFinding);
   const hunks = parseDiffFiles(readDiff(env.artifactDir));
   await publishReview({ env, deps, out, pr, isFork: live.isFork, findings, hunks, headSha });
-  out.exitCode = exitFor(env.inputs.failLevel, findings);
+  if (!out.staleSkipped) out.exitCode = exitFor(env.inputs.failLevel, findings);
 }
 
 /** Runs one review. Returns the outcome; main() maps exitCode to the process. */

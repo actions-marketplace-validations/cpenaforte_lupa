@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { existsSync, mkdirSync, readdirSync, renameSync, rmSync, statSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 export interface CloneRunResult {
@@ -140,10 +140,17 @@ function removeDir(dir: string): void {
 
 /**
  * Lazily shallow-clone `alias` (`owner/repo`) into `baseDir` and return its
- * directory. Auth uses env git config so the token never appears in
+ * directory plus the checked-out SHA. Auth uses env git config so the token never appears in
  * argv, the clone URL, or logs. Failures return `{ error }` with the token
  * redacted; oversized repos (pre-check via `sizeKb` or post-clone walk)
  * return `{ error: "repository too large" }`.
+ *
+ * A successful fresh clone records `<cloneDir>/.lupa-clone.json`
+ * (`{repo, branch, sha}`); an existing dir is validated before reuse (`.git`
+ * present, marker repo match, `remote.origin.url` match, checked-out branch
+ * match, size within `maxBytes`). Any mismatch or git error wipes the dir
+ * (marker included) and runs the full fresh-clone path. The returned sha is
+ * always re-derived from git, never trusted from the marker.
  */
 export async function ensureLinkedRepo(
   alias: string,
@@ -155,11 +162,15 @@ export async function ensureLinkedRepo(
     deps?: CloneDeps;
     sizeKb?: (alias: string) => Promise<number | undefined>;
   },
-): Promise<{ dir: string } | { error: string }> {
+): Promise<{ dir: string; sha: string } | { error: string }> {
   const dir = join(o.baseDir, alias.split("/").join("__"));
-  if (existsSync(dir)) return { dir };
-
   const deps: CloneDeps = o.deps ?? { run: defaultRun, ...(o.sizeKb !== undefined ? { sizeKb: o.sizeKb } : {}) };
+
+  if (existsSync(dir)) {
+    const sha = await validateCache(deps, alias, dir, o);
+    if (sha !== null) return { dir, sha };
+    removeDir(dir);
+  }
 
   if (o.maxBytes !== undefined && deps.sizeKb) {
     let kb: number | undefined;
@@ -210,5 +221,128 @@ export async function ensureLinkedRepo(
     }
   }
 
-  return { dir };
+  const head = await cloneHead(deps, dir, o.timeoutMs ?? CLONE_TIMEOUT_MS);
+  writeMarker(dir, { repo: alias, branch: head.branch, sha: head.sha });
+  return { dir, sha: head.sha };
+}
+
+/** Name of the clone marker written inside every fresh clone dir. */
+const MARKER_NAME = ".lupa-clone.json";
+
+interface CloneMarker {
+  repo: string;
+  branch: string;
+  sha: string;
+}
+
+/**
+ * Records the fresh-clone marker. The marker path is untrusted clone content:
+ * it may arrive as a directory (which would make `writeFileSync` throw), as a
+ * symlink (which would redirect the write outside the clone dir), or as a
+ * fifo/socket (where `open(O_WRONLY)` would block or fail). `lstatSync`
+ * detects any of these without following links; removing the path first
+ * (`rmSync` unlinks the node itself without opening it) guarantees the write
+ * creates a fresh regular file. The whole write is best-effort: a missing
+ * marker simply fails closed on the next validation (re-clone), so a hostile
+ * marker path can never throw or hang on the success path.
+ */
+function writeMarker(dir: string, marker: CloneMarker): void {
+  try {
+    mkdirSync(dir, { recursive: true });
+    const path = join(dir, MARKER_NAME);
+    try {
+      const st = lstatSync(path);
+      if (st.isSymbolicLink() || st.isDirectory() || st.isFile() || st.isFIFO() || st.isSocket()) {
+        rmSync(path, { recursive: true, force: true });
+      }
+    } catch {
+      // No pre-existing marker path: nothing to clear.
+    }
+    writeFileSync(path, JSON.stringify(marker), "utf8");
+  } catch {
+    // Degrade to "no marker": the next call re-validates and re-clones.
+  }
+}
+
+function readMarker(dir: string): CloneMarker | null {
+  let raw: string;
+  try {
+    raw = readFileSync(join(dir, MARKER_NAME), "utf8");
+  } catch {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(raw) as Partial<CloneMarker>;
+    if (typeof parsed.repo !== "string" || typeof parsed.branch !== "string" || typeof parsed.sha !== "string") {
+      return null;
+    }
+    return { repo: parsed.repo, branch: parsed.branch, sha: parsed.sha };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Re-derives the checked-out `{branch, sha}` of a fresh clone for the marker.
+ * Introspection failures never throw: an empty branch simply fails closed on
+ * the next validation (a fresh clone is still usable without its marker data).
+ */
+async function cloneHead(
+  deps: CloneDeps,
+  dir: string,
+  timeoutMs: number,
+): Promise<{ branch: string; sha: string }> {
+  const env: NodeJS.ProcessEnv = { ...process.env, GIT_TERMINAL_PROMPT: "0" };
+  let branch = "";
+  let sha = "";
+  try {
+    const b = await deps.run("git", ["rev-parse", "--abbrev-ref", "HEAD"], { cwd: dir, env, timeoutMs });
+    if (b.code === 0) branch = b.stdout.trim();
+    const h = await deps.run("git", ["rev-parse", "HEAD"], { cwd: dir, env, timeoutMs });
+    if (h.code === 0) sha = h.stdout.trim();
+  } catch {
+    // Ignore: the clone itself succeeded, so return what was derived so far.
+  }
+  return { branch, sha };
+}
+
+/**
+ * Validates an existing clone dir for reuse. Returns the re-derived HEAD sha,
+ * or null when the cache must be wiped and re-cloned. Every mismatch and every
+ * git error fails closed to null (a safe re-clone), never to trust. The size
+ * check is skipped when `maxBytes` is undefined. Introspection runs without
+ * token vars so no secret reaches the cached repo's git.
+ */
+async function validateCache(
+  deps: CloneDeps,
+  alias: string,
+  dir: string,
+  o: { maxBytes?: number; timeoutMs?: number },
+): Promise<string | null> {
+  if (!existsSync(join(dir, ".git"))) return null;
+  const marker = readMarker(dir);
+  if (marker === null || marker.repo !== alias) return null;
+  const env: NodeJS.ProcessEnv = { ...process.env, GIT_TERMINAL_PROMPT: "0" };
+  const timeoutMs = o.timeoutMs ?? CLONE_TIMEOUT_MS;
+  try {
+    const origin = await deps.run("git", ["config", "--get", "remote.origin.url"], { cwd: dir, env, timeoutMs });
+    if (origin.code !== 0 || origin.stdout.trim() !== `https://github.com/${alias}.git`) return null;
+    const branch = await deps.run("git", ["rev-parse", "--abbrev-ref", "HEAD"], { cwd: dir, env, timeoutMs });
+    const resolvedBranch = branch.code === 0 ? branch.stdout.trim() : "";
+    if (resolvedBranch === "" || resolvedBranch !== marker.branch) return null;
+    if (o.maxBytes !== undefined) {
+      let total: number;
+      try {
+        total = dirBytes(dir);
+      } catch {
+        return null;
+      }
+      if (total > o.maxBytes) return null;
+    }
+    const head = await deps.run("git", ["rev-parse", "HEAD"], { cwd: dir, env, timeoutMs });
+    if (head.code !== 0) return null;
+    return head.stdout.trim();
+  } catch {
+    return null;
+  }
 }

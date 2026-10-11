@@ -1,4 +1,5 @@
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { join } from "node:path";
 import * as core from "@actions/core";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -12,7 +13,7 @@ import { cleanEnvForExec, main, run, sanitizeFinding, unquoteGitPath, type Deps,
 import { readPrMeta } from "../src/diff.js";
 import type { ActionInputs, LlmApiStyle, LlmProvider } from "../src/inputs.js";
 import { callWithProbe } from "../src/llm.js";
-import { ReadonlyTokenError } from "../src/github.js";
+import { ReadonlyTokenError, StaleHeadError } from "../src/github.js";
 import type { ReviewPayload } from "../src/review.js";
 import { TOOL_DEFS, executeTool } from "../src/agent-tools.js";
 import type { ToolContext } from "../src/agent-tools.js";
@@ -91,6 +92,8 @@ interface Rec {
   agentToolCtx?: ToolContext;
   toolOutput?: string;
   toolError?: boolean;
+  /** findings.json payload observed by the slow-path seam: the early (fast-only) write, before the merged overwrite. */
+  earlyFindingsRaw?: string;
   repoSizeCalls: Array<[string, string]>;
 }
 
@@ -101,6 +104,7 @@ function newRec(): Rec {
 interface GwOpts {
   prsByHead?: number[];
   write403?: boolean;
+  staleDuringPost?: boolean;
   issue403?: boolean;
   body?: string;
   /** Size in KB reported by the getRepoSize fake (default 1024). */
@@ -141,6 +145,9 @@ function gatewayFor(rec: Rec, o: GwOpts): Gateway {
       rec.reviewAttempts += 1;
       if (o.write403) {
         throw new ReadonlyTokenError("review post refused", 403, "Resource not accessible by integration");
+      }
+      if (o.staleDuringPost) {
+        throw new StaleHeadError(SHA_HEAD, SHA_OTHER);
       }
       rec.reviews.push(payload);
     },
@@ -187,6 +194,7 @@ interface MockOpts {
   prNumber?: number | null;
   validateModel?: boolean | "reject";
   write403?: boolean;
+  staleDuringPost?: boolean;
   issueFallback?: boolean;
   issue403?: boolean;
   failLevel?: "none" | "warning" | "high";
@@ -201,6 +209,8 @@ interface MockOpts {
   comment?: boolean;
   /** Files created under the work dir (real on-disk sizes for L0's large-file rule). */
   workFiles?: Record<string, number>;
+  /** Findings returned by the runScanners fake (default []). */
+  scan?: Finding[];
   tokenIsApp?: boolean;
   llmProvider?: LlmProvider;
   llmModel?: string;
@@ -248,6 +258,7 @@ async function runWithMocks(o: MockOpts = {}) {
   const deps: Deps = {
     gh: gatewayFor(rec, {
       write403: o.write403,
+      staleDuringPost: o.staleDuringPost,
       issue403: o.issue403,
       headMoves: o.headMoves,
       failGetPrAfter: o.failGetPrAfter,
@@ -258,7 +269,7 @@ async function runWithMocks(o: MockOpts = {}) {
     analysis: {
       runScanners: async () => {
         rec.scanEnv = { ...process.env };
-        return o.sbomMissing ? { findings: [], sbomPath: join(sbomDir, "sbom.cdx.json") } : { findings: [] };
+        return o.sbomMissing ? { findings: [], sbomPath: join(sbomDir, "sbom.cdx.json") } : { findings: o.scan ?? [] };
       },
       runL2: async () => {
         rec.l2Env = { ...process.env };
@@ -284,6 +295,14 @@ async function runWithMocks(o: MockOpts = {}) {
           : async () => {
               rec.llmCalled += 1;
               rec.llmVia = "probe";
+              // The slow path runs after the early findings.json write, so snapshot the
+              // file here: this is the first (fast-findings-only) payload, before the
+              // merged write below overwrites it.
+              try {
+                rec.earlyFindingsRaw = readFileSync(join(artifactDir, "findings.json"), "utf8");
+              } catch {
+                // No early payload on disk; leave earlyFindingsRaw unset.
+              }
               return { ok: true, findings: o.llm ?? [LLM_FINDING] };
             },
       callByStyleAgent: async (_ep, conv, opts, toolCtx) => {
@@ -338,6 +357,7 @@ async function runWithMocks(o: MockOpts = {}) {
     repoSizeCalls: rec.repoSizeCalls,
     scanEnv: rec.scanEnv,
     l2Env: rec.l2Env,
+    earlyFindingsRaw: rec.earlyFindingsRaw,
     artifactDir,
     summaryPath,
     sbomDir,
@@ -348,6 +368,7 @@ interface PrivOpts {
   metaPr?: number;
   prsByHead?: number[];
   findings?: unknown[];
+  staleDuringPost?: boolean;
   metaHead?: string;
   wrHead?: string;
   wrRepo?: string | null;
@@ -375,6 +396,8 @@ async function runPrivileged(o: PrivOpts = {}) {
   );
   writeFileSync(join(artifactDir, "findings.json"), JSON.stringify(o.findings ?? [LLM_FINDING]));
   writeFileSync(join(artifactDir, "diff.patch"), o.diff ?? DIFF);
+  const summaryPath = join(root, "summary.md");
+  writeFileSync(summaryPath, "");
   const env: RunEnv = {
     eventName: "workflow_run",
     payload: {
@@ -394,6 +417,7 @@ async function runPrivileged(o: PrivOpts = {}) {
     headSha: SHA_HEAD,
     tokenIsApp: false,
     issueFallback: false,
+    summaryPath,
   };
   const rec = newRec();
   const spyFail = (name: string) => () => {
@@ -402,6 +426,7 @@ async function runPrivileged(o: PrivOpts = {}) {
   const deps: Deps = {
     gh: gatewayFor(rec, {
       prsByHead: o.prsByHead,
+      staleDuringPost: o.staleDuringPost,
       info: { headRepo: o.liveRepo ?? "o/r", headRef: o.liveRef ?? "feature", headSha: o.liveSha ?? SHA_HEAD },
     }),
     analysis: {
@@ -416,7 +441,7 @@ async function runPrivileged(o: PrivOpts = {}) {
     },
   };
   const out = await run(env, deps);
-  return { ...out, reviews: rec.reviews, payloads: rec.reviews, reviewAttempts: rec.reviewAttempts };
+  return { ...out, reviews: rec.reviews, payloads: rec.reviews, reviewAttempts: rec.reviewAttempts, summaryPath };
 }
 
 describe("run() orchestration", () => {
@@ -551,6 +576,31 @@ describe("run() orchestration", () => {
     expect(r.getPrCalls).toBe(2);
   });
 
+  it("stale head during posting skips the review with a note and exit 0", async () => {
+    const r = await runWithMocks({ staleDuringPost: true });
+    expect(r.reviews).toHaveLength(0);
+    expect(r.posted).toBe(false);
+    expect(r.staleSkipped).toBe(true);
+    const summary = readFileSync(r.summaryPath, "utf8");
+    expect(summary).toContain("skipping review for the stale head");
+    expect(summary).toContain(
+      `pr-reviewer: PR head moved during posting; analyzed ${SHA_HEAD}, live ${SHA_OTHER}; skipping review for the stale head — a fresh run will cover the new head.`,
+    );
+    expect(r.exitCode).toBe(0);
+  });
+
+  it("stale head on the Flow B path skips with the same note", async () => {
+    const r = await runPrivileged({ staleDuringPost: true });
+    expect(r.reviews).toHaveLength(0);
+    expect(r.posted).toBe(false);
+    expect(r.staleSkipped).toBe(true);
+    const summary = readFileSync(r.summaryPath, "utf8");
+    expect(summary).toContain(
+      `pr-reviewer: PR head moved during posting; analyzed ${SHA_HEAD}, live ${SHA_OTHER}; skipping review for the stale head — a fresh run will cover the new head.`,
+    );
+    expect(r.exitCode).toBe(0);
+  });
+
   it("ReadonlyTokenError on a writable token (real 403 path) posts nothing and is not a crash", async () => {
     const r = await runWithMocks({ write403: true });
     expect(r.reviewAttempts).toBe(1);
@@ -681,6 +731,48 @@ describe("run() orchestration", () => {
     expect(dumped).toContain("[REDACTED]");
   });
 
+  it("fast findings echoing the token are masked in the early findings.json", async () => {
+    const fast: Finding = {
+      severity: "warning",
+      file: "src/a.ts",
+      line: 2,
+      rule: "tok-rule",
+      message: "saw tok-live-123 in scanner output",
+    };
+    // Slow path runs (default llm key): the merged write below would mask a raw early
+    // write, so the early site is pinned via the payload the slow-path seam observed —
+    // the first, fast-findings-only write, before the merge overwrote it.
+    const r = await runWithMocks({ githubToken: "tok-live-123", scan: [fast] });
+    expect(r.llmCalled).toBe(1);
+    const early = r.earlyFindingsRaw;
+    expect(early).toBeDefined();
+    const parsed = JSON.parse(early!) as Finding[];
+    expect(parsed).toHaveLength(1);
+    expect(parsed[0]!.rule).toBe("tok-rule");
+    expect(early!).not.toContain("tok-live-123");
+    expect(early!).toContain("[REDACTED]");
+    const raw = readFileSync(join(r.artifactDir, "findings.json"), "utf8");
+    expect(raw).not.toContain("tok-live-123");
+    expect(raw).toContain("[REDACTED]");
+  });
+
+  it("merged findings and sarif.json are masked and sarif stays valid", async () => {
+    const leaked: Finding = {
+      severity: "warning",
+      file: "src/a.ts",
+      line: 2,
+      rule: "llm-rule",
+      message: "key key-live-456 echoed by the model",
+    };
+    const r = await runWithMocks({ llmApiKey: "key-live-456", llm: [leaked] });
+    const merged = readFileSync(join(r.artifactDir, "findings.json"), "utf8");
+    expect(merged).not.toContain("key-live-456");
+    expect(merged).toContain("[REDACTED]");
+    const sarif = JSON.parse(readFileSync(join(r.artifactDir, "sarif.json"), "utf8"));
+    expect(sarif.version).toBe("2.1.0");
+    expect(JSON.stringify(sarif)).not.toContain("key-live-456");
+  });
+
   it("linked alias clone failure still posts the review (tool error only)", async () => {
     const r = await runWithMocks({
       llmAgent: true,
@@ -753,6 +845,36 @@ describe("run() orchestration", () => {
     // Mixed-case linked alias passes the gate: the size pre-check sees the alias as passed through.
     await gate("Someone/Else");
     expect(r.repoSizeCalls).toContainEqual(["Someone", "Else"]);
+  });
+
+  it("logs the linked repo SHA on reuse", async () => {
+    const prevRunnerTemp = process.env.RUNNER_TEMP;
+    const scratchDir = scratch();
+    process.env.RUNNER_TEMP = scratchDir;
+    try {
+      const dir = join(scratchDir, "lupa-linked", "someone__else");
+      mkdirSync(dir, { recursive: true });
+      execFileSync("git", ["init", "-b", "main"], { cwd: dir });
+      execFileSync("git", ["remote", "add", "origin", "https://github.com/someone/else.git"], { cwd: dir });
+      execFileSync("git", ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "--allow-empty", "-m", "init"], {
+        cwd: dir,
+      });
+      const sha = execFileSync("git", ["rev-parse", "HEAD"], { cwd: dir, encoding: "utf8" }).trim();
+      writeFileSync(join(dir, ".lupa-clone.json"), JSON.stringify({ repo: "someone/else", branch: "main", sha }));
+      const info = vi.mocked(core.info);
+      info.mockClear();
+      const r = await runWithMocks({
+        llmAgent: true,
+        agentToolProbe: true,
+        prBody: "See https://github.com/someone/else for context",
+      });
+      expect(r.posted).toBe(true);
+      const lines = info.mock.calls.map((c) => String(c[0]));
+      expect(lines).toContain(`agent linked repo someone/else at ${sha}`);
+    } finally {
+      if (prevRunnerTemp === undefined) delete process.env.RUNNER_TEMP;
+      else process.env.RUNNER_TEMP = prevRunnerTemp;
+    }
   });
 
   // Task 19 wiring: with plain `auto` the slow path probes (error-driven, spec §9.5) —
