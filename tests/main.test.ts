@@ -9,7 +9,7 @@ vi.mock("@actions/core", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@actions/core")>();
   return { ...actual, info: vi.fn(), warning: vi.fn(), error: vi.fn() };
 });
-import { budgetPrompt, cleanEnvForExec, main, readFindings, readRunEnv, run, sanitizeFinding, unquoteGitPath, type Deps, type Gateway, type PrInfo, type RunEnv } from "../src/main.js";
+import { budgetPrompt, cleanEnvForExec, main, readFindings, readRunEnv, run, sanitizeFinding, toSarif, unquoteGitPath, type Deps, type Gateway, type PrInfo, type RunEnv } from "../src/main.js";
 import { buildMessages, ISSUE_TRUNCATION_MARKER, neutralise } from "../src/prompt.js";
 import { readPrMeta } from "../src/diff.js";
 import type { DedupVerdicts } from "../src/llm.js";
@@ -22,7 +22,7 @@ import {
 } from "../src/inputs.js";
 import { callWithProbe } from "../src/llm.js";
 import { ReadonlyTokenError, StaleHeadError } from "../src/github.js";
-import type { ReviewPayload } from "../src/review.js";
+import { buildFallbackReport, redactFindings, type ReviewPayload } from "../src/review.js";
 import { TOOL_DEFS, executeTool } from "../src/agent-tools.js";
 import type { ToolContext } from "../src/agent-tools.js";
 import type { Finding } from "../src/fastpath.js";
@@ -1319,6 +1319,72 @@ describe("Fluxo B bindings and sanitizing", () => {
   });
 });
 
+describe("finding provenance contract (Q04)", () => {
+  it("readFindings accepts valid provenance shapes", () => {
+    const dir = scratch();
+    const valid = [
+      { ...LLM_FINDING },
+      { ...LLM_FINDING, source: "semgrep", confidence: 90, evidence: { analyzer: "semgrep" } },
+      { ...LLM_FINDING, source: "fastpath", confidence: 50 },
+      { ...LLM_FINDING, confidence: 0 },
+      { ...LLM_FINDING, evidence: {} },
+    ];
+    writeFileSync(join(dir, "findings.json"), JSON.stringify(valid), "utf8");
+    expect(readFindings(dir)).toEqual(valid);
+  });
+
+  it.each([
+    ["overlong source", { source: "x".repeat(101) }],
+    ["confidence 101", { confidence: 101 }],
+    ["confidence -1", { confidence: -1 }],
+    ["non-integer confidence", { confidence: 1.5 }],
+    ["string confidence", { confidence: "90" }],
+    ["non-object evidence", { evidence: "semgrep" }],
+    ["non-string analyzer", { evidence: { analyzer: 42 } }],
+    ["empty source", { source: "" }],
+  ])("readFindings rejects %s", (_label, extra) => {
+    const dir = scratch();
+    writeFileSync(join(dir, "findings.json"), JSON.stringify([{ ...LLM_FINDING, ...extra }]), "utf8");
+    expect(() => readFindings(dir)).toThrow("lupa: findings.json does not match the finding contract");
+  });
+
+  it("sanitizeFinding carries source, confidence and evidence with caps, absent stays absent", () => {
+    const carried = sanitizeFinding({
+      ...LLM_FINDING,
+      source: "semgrep",
+      confidence: 90,
+      evidence: { analyzer: "semgrep", snippet: "line" },
+    });
+    expect(carried.source).toBe("semgrep");
+    expect(carried.confidence).toBe(90);
+    expect(carried.evidence).toEqual({ analyzer: "semgrep", snippet: "line" });
+    const absent = sanitizeFinding({ ...LLM_FINDING });
+    expect(absent.source).toBeUndefined();
+    expect(absent.confidence).toBeUndefined();
+    expect(absent.evidence).toBeUndefined();
+    const capped = sanitizeFinding({
+      ...LLM_FINDING,
+      source: `s${"\0".repeat(5)}${"x".repeat(200)}`,
+      evidence: { analyzer: `a${"\u007f".repeat(5)}${"y".repeat(200)}`, snippet: `s${"\0".repeat(3)}${"z".repeat(3000)}` },
+    });
+    expect(capped.source).toBe(`s${"x".repeat(200)}`.slice(0, 100 - TRUNC.length) + TRUNC);
+    expect(Array.from(capped.source!)).toHaveLength(100);
+    expect(Array.from(capped.evidence!.analyzer!)).toHaveLength(100);
+    expect(capped.evidence!.analyzer).toContain(TRUNC);
+    expect(Array.from(capped.evidence!.snippet!)).toHaveLength(2000);
+    expect(capped.evidence!.snippet).toContain(TRUNC);
+  });
+
+  it("L2_SKIPPED carries source l2 with no confidence (fork path)", async () => {
+    const r = await runWithMocks({ comment: true, forkReadonly: true, tokenType: "app" });
+    const staged = JSON.parse(readFileSync(join(r.artifactDir, "findings.json"), "utf8")) as Finding[];
+    const skipped = staged.find((f) => f.rule === "l2-skipped");
+    expect(skipped).toBeDefined();
+    expect(skipped!.source).toBe("l2");
+    expect(skipped!.confidence).toBeUndefined();
+  });
+});
+
 describe("findings from binaries, renames and skip paths", () => {
   it("a binary over 500 KB on disk triggers large-file (real stat, not hunk length)", async () => {
     const big = 'diff --git a/big.bin b/big.bin\nBinary files a/big.bin and b/big.bin differ\n';
@@ -2079,5 +2145,103 @@ describe("dedup merge and flow wiring", () => {
     const cut = budgetPrompt(fast, text, undefined, [], fullBytes, { withIds: true });
     expect(cut.fast.length).toBeLessThan(fast.length);
     expect(cut.findingsOmitted).toBeGreaterThan(0);
+  });
+});
+
+describe("finding provenance rendering (Q04)", () => {
+  it("toSarif carries source and confidence independently, omits properties when both absent", () => {
+    const base: Finding = { severity: "warning", file: "src/a.ts", line: 2, rule: "r", message: "m" };
+    const full = toSarif([{ ...base, source: "semgrep", confidence: 90 }]) as {
+      runs: Array<{ results: Array<{ properties?: unknown; message: { text: string } }> }>;
+    };
+    expect(full.runs[0].results[0].properties).toEqual({ source: "semgrep", confidence: 90 });
+    expect(full.runs[0].results[0].message).toEqual({ text: "m" });
+    const confOnly = toSarif([{ ...base, confidence: 50 }]) as {
+      runs: Array<{ results: Array<{ properties?: unknown }> }>;
+    };
+    expect(confOnly.runs[0].results[0].properties).toEqual({ confidence: 50 });
+    const srcOnly = toSarif([{ ...base, source: "fastpath" }]) as {
+      runs: Array<{ results: Array<{ properties?: unknown }> }>;
+    };
+    expect(srcOnly.runs[0].results[0].properties).toEqual({ source: "fastpath" });
+    const neither = toSarif([base]) as {
+      runs: Array<{ results: Array<Record<string, unknown>> }>;
+    };
+    expect("properties" in neither.runs[0].results[0]).toBe(false);
+  });
+
+  it("findings.json round-trips provenance through the artifact", () => {
+    const dir = scratch();
+    const findings: Finding[] = [
+      { ...LLM_FINDING, source: "semgrep", confidence: 90, evidence: { analyzer: "semgrep" } },
+      { ...LLM_FINDING, confidence: 0 },
+    ];
+    writeFileSync(join(dir, "findings.json"), JSON.stringify(findings), "utf8");
+    expect(readFindings(dir)).toEqual(findings);
+  });
+
+  it("no-LLM run renders scanner provenance inline and in the summary", async () => {
+    const scan: Finding = { ...LLM_FINDING, source: "semgrep", confidence: 90, evidence: { analyzer: "semgrep" } };
+    const r = await runWithMocks({ llmApiKey: "", scan: [scan] });
+    expect(r.reviews).toHaveLength(1);
+    expect(r.reviews[0].comments[0].body).toContain("`src:semgrep · conf 90`");
+    const summary = readFileSync(r.summaryPath, "utf8");
+    expect(summary).toContain("- Source:");
+    expect(summary).toContain("semgrep");
+    expect(summary).toContain("- Confidence:");
+    expect(summary).toContain("- Evidence:");
+  });
+
+  it("agent run carries no provenance anywhere", async () => {
+    const r = await runWithMocks({ llmAgent: true, llm: [{ ...LLM_FINDING }] });
+    expect(r.agentCalled).toBe(1);
+    expect(r.body ?? "").not.toContain("`src:");
+    expect(r.body ?? "").not.toContain("`conf");
+    const summary = readFileSync(r.summaryPath, "utf8");
+    expect(summary).not.toContain("- Source:");
+    expect(summary).not.toContain("- Confidence:");
+    expect(summary).not.toContain("- Evidence:");
+  });
+
+  it("provenanced high and warning findings gate identically", async () => {
+    const high: Finding = { severity: "high", file: "src/a.ts", line: 2, rule: "r", message: "h", source: "fastpath", confidence: 50 };
+    const warn: Finding = { ...LLM_FINDING, source: "llm", confidence: 70 };
+    const gated = await runWithMocks({ failLevel: "high", llm: [high, warn] });
+    expect(gated.exitCode).toBe(1);
+    expect(gated.reviews[0].event).toBe("REQUEST_CHANGES");
+    const warned = await runWithMocks({ failLevel: "warning", llm: [warn] });
+    expect(warned.exitCode).toBe(2);
+    expect(warned.reviews[0].event).toBe("COMMENT");
+  });
+
+  it("publication counts are unchanged with provenance present", async () => {
+    const a: Finding = { ...LLM_FINDING, source: "semgrep", confidence: 90 };
+    const b: Finding = { severity: "warning", file: "src/b.ts", rule: "r2", message: "second", source: "llm", confidence: 70 };
+    const r = await runWithMocks({ maxFindings: 1, llm: [a, b] });
+    expect(r.body ?? "").toContain("> Omitted: 1 finding(s) omitted to fit the 1-finding publication limit.");
+  });
+
+  it("redacted secret appears on neither the fallback nor the SARIF surface", () => {
+    const secret = "sk-secret-1";
+    const redacted = redactFindings(
+      [
+        {
+          severity: "warning",
+          file: "src/a.ts",
+          line: 2,
+          rule: "r",
+          message: `saw ${secret} in code`,
+          suggestion: `rotate ${secret} now`,
+          source: "semgrep",
+          confidence: 90,
+          evidence: { analyzer: `tool ${secret}`, snippet: `token ${secret} here` },
+        },
+      ],
+      [secret],
+    );
+    const fallback = buildFallbackReport(redacted);
+    expect(fallback).not.toContain(secret);
+    expect(fallback).toContain("[REDACTED]");
+    expect(JSON.stringify(toSarif(redacted))).not.toContain(secret);
   });
 });

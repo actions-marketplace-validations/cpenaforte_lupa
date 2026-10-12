@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { runL0 } from "../src/fastpath.js";
+import { runL0, stripProvenance } from "../src/fastpath.js";
 import { isLockfile } from "../src/diff.js";
 
 describe("isLockfile", () => {
@@ -146,5 +146,53 @@ describe("runL0", () => {
       const hunks = ["@@ -3 +9 @@", "+// TODO single"].join("\n");
       expect(todoLines(hunks)).toEqual([9]);
     });
+  });
+});
+
+describe("runL0 provenance (Q04)", () => {
+  it("every L0 finding carries source fastpath and confidence 50", () => {
+    const f = runL0(
+      [
+        { file: "id_rsa", hunks: "key", truncated: false },
+        { file: "big.bin", hunks: "", truncated: false, size: 600 * 1024 },
+        { file: "img.png", hunks: "", truncated: false, size: 1024 },
+        { file: "package-lock.json", hunks: "{}", truncated: false },
+        { file: "a.ts", hunks: "// TODO fix", truncated: false },
+      ],
+      { hasManifestFor: () => false },
+    );
+    expect(f.length).toBeGreaterThan(0);
+    for (const x of f) {
+      expect(x.source).toBe("fastpath");
+      expect(x.confidence).toBe(50);
+      expect(x.evidence).toBeUndefined();
+    }
+  });
+});
+
+describe("stripProvenance (Q04 agent path)", () => {
+  const base = { severity: "warning" as const, file: "a.ts", rule: "r", message: "m" };
+
+  it("deletes source, confidence, and evidence, returning the finding", () => {
+    const f = { ...base, source: "llm", confidence: 75, evidence: { analyzer: "llm" } };
+    expect(stripProvenance(f)).toBe(f);
+    expect(f).toEqual(base);
+  });
+
+  it("is a no-op when no provenance is present", () => {
+    const f = { ...base };
+    expect(stripProvenance(f)).toBe(f);
+    expect(f).toEqual(base);
+  });
+
+  it("strips partial provenance (source-only, confidence-only, evidence-only)", () => {
+    expect(stripProvenance({ ...base, source: "llm" })).toEqual(base);
+    expect(stripProvenance({ ...base, confidence: 50 })).toEqual(base);
+    expect(stripProvenance({ ...base, evidence: { snippet: "x" } })).toEqual(base);
+  });
+
+  it("keeps every other field (line, suggestion) intact", () => {
+    const f = { ...base, line: 3, suggestion: "s", source: "llm", confidence: 0 };
+    expect(stripProvenance(f)).toEqual({ ...base, line: 3, suggestion: "s" });
   });
 });

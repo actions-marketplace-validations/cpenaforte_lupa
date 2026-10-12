@@ -24645,10 +24645,13 @@ function readCappedFileSync(path, maxBytes = DEFAULT_MAX_ARTIFACT_BYTES) {
 function oversizeMessage(source, max) {
   return `${source} output exceeds the artifact read limit (${max} bytes); results dropped`;
 }
+function sourceForLabel(label) {
+  return label.split(" (")[0];
+}
 function byteCheck(text, max, source) {
   if (Buffer.byteLength(text, "utf8") <= max)
     return void 0;
-  return [{ severity: "warning", file: "", rule: "scanner-failed", message: oversizeMessage(source, max) }];
+  return [{ severity: "warning", file: "", rule: "scanner-failed", message: oversizeMessage(source, max), source: sourceForLabel(source) }];
 }
 
 // lib/src/diff.js
@@ -24804,6 +24807,12 @@ function capText(s, cap) {
 var LARGE_FILE_BYTES = 500 * 1024;
 var TODO_RE = /\b(TODO|FIXME|XXX)\b/;
 var ENV_TEMPLATES = /* @__PURE__ */ new Set([".env.example", ".env.sample", ".env.template"]);
+function stripProvenance(f) {
+  delete f.source;
+  delete f.confidence;
+  delete f.evidence;
+  return f;
+}
 function isSensitivePath(file) {
   const name = basename2(file);
   if (ENV_TEMPLATES.has(name))
@@ -24825,7 +24834,9 @@ function runL0(files, o = {}) {
         severity: "high",
         file: f.file,
         rule: "sensitive-path",
-        message: `Sensitive file path changed: ${f.file}`
+        message: `Sensitive file path changed: ${f.file}`,
+        source: "fastpath",
+        confidence: 50
       });
     }
     if ((f.size ?? 0) > LARGE_FILE_BYTES) {
@@ -24833,7 +24844,9 @@ function runL0(files, o = {}) {
         severity: "warning",
         file: f.file,
         rule: "large-file",
-        message: `File larger than 500KB: ${f.file}`
+        message: `File larger than 500KB: ${f.file}`,
+        source: "fastpath",
+        confidence: 50
       });
     }
     if (f.binary === true || f.hunks === "" && (f.size ?? 0) > 0) {
@@ -24841,7 +24854,9 @@ function runL0(files, o = {}) {
         severity: "info",
         file: f.file,
         rule: "binary-note",
-        message: `Binary or non-text change, not reviewed: ${f.file}`
+        message: `Binary or non-text change, not reviewed: ${f.file}`,
+        source: "fastpath",
+        confidence: 50
       });
     }
     if (isLockfile(f.file) && !hasManifestFor(basename2(f.file))) {
@@ -24849,7 +24864,9 @@ function runL0(files, o = {}) {
         severity: "warning",
         file: f.file,
         rule: "lockfile-without-manifest",
-        message: `Lockfile changed without its manifest: ${f.file}`
+        message: `Lockfile changed without its manifest: ${f.file}`,
+        source: "fastpath",
+        confidence: 50
       });
     }
     for (const { line, text } of todoMarkers(f.hunks)) {
@@ -24858,7 +24875,9 @@ function runL0(files, o = {}) {
         file: f.file,
         line,
         rule: "todo-marker",
-        message: `TODO/FIXME/XXX marker: ${text.trim()}`
+        message: `TODO/FIXME/XXX marker: ${text.trim()}`,
+        source: "fastpath",
+        confidence: 50
       });
     }
   }
@@ -24998,7 +25017,8 @@ function interpretDefault(name, failure, _stdout, _changed, timeoutMs) {
       file: "",
       rule: name,
       message: `${describeFailure(name, failure, timeoutMs)}${detail ? `:
-${detail}` : ""}`
+${detail}` : ""}`,
+      source: name
     }
   ];
 }
@@ -25012,7 +25032,10 @@ function interpretGofmt(name, failure, stdout, changed, timeoutMs = L2_TIMEOUT_M
       severity: "warning",
       file,
       rule: "gofmt",
-      message: `gofmt: ${file} is not formatted (run gofmt -w ${file})`
+      message: `gofmt: ${file} is not formatted (run gofmt -w ${file})`,
+      source: "gofmt",
+      confidence: 90,
+      evidence: { analyzer: "gofmt" }
     }));
   }
   if (failure)
@@ -25675,7 +25698,7 @@ function agentAddendum(maxTurns) {
     `Tool budget: up to ${maxTurns} tool-call rounds. When you have enough evidence, respond with ONLY the JSON findings object matching the schema; no prose, no tool calls.`
   ].join("\n");
 }
-var DEDUP_INSTRUCTIONS = `Dedup verdicts: each object in the fast-findings list above carries an "id" field holding its 0-based index into the sent list. If two SENT findings describe the same underlying issue at the same location, list the pair in "duplicates" as a two-element array [idA, idB] of 0-based sent-list indices. If one of YOUR new findings restates a sent finding, set that finding's "duplicateOf" to the sent finding's 0-based id; otherwise use null. Only judge duplicates you can point to at the same file and line; when in doubt, report no verdict ("duplicates": null, "duplicateOf": null).`;
+var DEDUP_INSTRUCTIONS = `Dedup verdicts: each object in the fast-findings list above carries an "id" field holding its 0-based index into the sent list. If two SENT findings describe the same underlying issue at the same location, list the pair in "duplicates" as a two-element array [idA, idB] of 0-based sent-list indices. If one of YOUR new findings restates a sent finding, set that finding's "duplicateOf" to the sent finding's 0-based id; otherwise use null. Only judge duplicates you can point to at the same file and line; when in doubt, report no verdict ("duplicates": null, "duplicateOf": null). Set "confidence" to your 0-100 integer confidence in each new finding; otherwise use null.`;
 function buildMessages(fast, diffText, issueBody, skipped = [], agent, omitted = 0, opts) {
   const withIds = opts?.withIds === true && agent === void 0;
   const system = agent ? `${SYSTEM}
@@ -25719,7 +25742,7 @@ var PR_REVIEW_SCHEMA = {
         items: {
           type: "object",
           additionalProperties: false,
-          required: ["severity", "file", "line", "rule", "message", "suggestion", "duplicateOf"],
+          required: ["severity", "file", "line", "rule", "message", "suggestion", "duplicateOf", "confidence"],
           properties: {
             severity: { type: "string", enum: ["info", "warning", "high"] },
             file: { type: "string" },
@@ -25727,7 +25750,8 @@ var PR_REVIEW_SCHEMA = {
             rule: { type: "string" },
             message: { type: "string" },
             suggestion: { type: ["string", "null"] },
-            duplicateOf: { type: ["integer", "null"] }
+            duplicateOf: { type: ["integer", "null"] },
+            confidence: { type: ["integer", "null"] }
           }
         }
       },
@@ -26729,7 +26753,7 @@ function tryParseFinal(text) {
   if (findings === void 0) {
     return { ok: false, reason: "invalid-json", detail: "response does not match the review schema" };
   }
-  return { ok: true, findings };
+  return { ok: true, findings: findings.map(stripProvenance) };
 }
 function capToolResult(output, maxBytes) {
   try {
@@ -27068,12 +27092,16 @@ function toFindings(v) {
       severity: i.severity,
       file: i.file,
       rule: i.rule,
-      message: i.message
+      message: i.message,
+      source: "llm"
     };
     if (Number.isInteger(i.line) && i.line >= 1)
       f.line = i.line;
     if (typeof i.suggestion === "string")
       f.suggestion = i.suggestion;
+    if (typeof i.confidence === "number" && Number.isSafeInteger(i.confidence) && i.confidence >= 0 && i.confidence <= 100) {
+      f.confidence = i.confidence;
+    }
     out.push(f);
   }
   return out;
@@ -27404,7 +27432,11 @@ async function callWithProbeAgent(provider, model, baseUrl2, key, conv, o, toolC
   const memoKey = `${provider}:${model}`;
   if (TOOLS_MEMO.get(memoKey) === false) {
     info("agent tools unsupported for this model: using single-shot");
-    return callWithProbe(provider, model, baseUrl2, key, { system: conv.system, user: conv.user }, o, explicitStyle);
+    const out = await callWithProbe(provider, model, baseUrl2, key, { system: conv.system, user: conv.user }, o, explicitStyle);
+    if (out.result.ok) {
+      out.result.findings = out.result.findings.map(stripProvenance);
+    }
+    return out;
   }
   const agentOpts = {
     model,
@@ -27530,6 +27562,16 @@ function fenceFor(suggestion) {
     longest = Math.max(longest, run2[0].length);
   return "`".repeat(Math.max(3, longest + 1));
 }
+function provenanceTrailer(f) {
+  const parts = [];
+  if (f.source !== void 0)
+    parts.push(`src:${f.source}`);
+  if (f.confidence !== void 0)
+    parts.push(`conf ${f.confidence}`);
+  return parts.length === 0 ? "" : `
+
+\`${parts.join(" \xB7 ")}\``;
+}
 function formatBody(f, side) {
   let body = `**${f.severity}** [${f.rule}] ${f.message}`;
   if (hasSuggestion(f)) {
@@ -27546,7 +27588,7 @@ ${fence}`;
 Suggested: ${f.suggestion.replace(/\n/g, "\n  ")}`;
     }
   }
-  return body;
+  return body + provenanceTrailer(f);
 }
 function mapToComments(findings, hunks) {
   const index = /* @__PURE__ */ new Map();
@@ -27603,8 +27645,17 @@ function redactFindings(findings, secrets) {
         message: redact(out.message, key),
         file: redact(out.file, key),
         rule: redact(out.rule, key),
-        ...out.suggestion !== void 0 ? { suggestion: redact(out.suggestion, key) } : {}
+        ...out.suggestion !== void 0 ? { suggestion: redact(out.suggestion, key) } : {},
+        ...out.evidence !== void 0 ? {
+          evidence: {
+            ...out.evidence.analyzer !== void 0 ? { analyzer: redact(out.evidence.analyzer, key) } : {},
+            ...out.evidence.snippet !== void 0 ? { snippet: redact(out.evidence.snippet, key) } : {}
+          }
+        } : {}
       };
+    }
+    if (out.evidence !== void 0 && out.evidence === f.evidence) {
+      out = { ...out, evidence: { ...out.evidence } };
     }
     return out;
   });
@@ -27624,6 +27675,22 @@ ${value}
 ${fence}`;
     };
     const suggestion = hasSuggestion(f) ? f.suggestion : "No remediation supplied";
+    const provenance = [];
+    if (f.source !== void 0)
+      provenance.push(`- Source:
+${field(f.source)}`);
+    if (f.confidence !== void 0)
+      provenance.push(`- Confidence:
+${field(String(f.confidence))}`);
+    if (f.evidence !== void 0 && (f.evidence.analyzer !== void 0 || f.evidence.snippet !== void 0)) {
+      const parts = [];
+      if (f.evidence.analyzer !== void 0)
+        parts.push(field(`analyzer: ${f.evidence.analyzer}`));
+      if (f.evidence.snippet !== void 0)
+        parts.push(field(f.evidence.snippet));
+      provenance.push(`- Evidence:
+${parts.join("\n")}`);
+    }
     return [
       `### Finding ${index + 1}`,
       "",
@@ -27634,6 +27701,7 @@ ${field(locate(f))}`,
 ${field(f.rule)}`,
       `- Message/evidence:
 ${field(f.message)}`,
+      ...provenance,
       `- Suggested remediation (advice only):
 ${field(suggestion)}`
     ].join("\n");
@@ -27697,7 +27765,7 @@ function buildBody(general, summary2) {
     if (hasSuggestion(f))
       item += `
   Suggested: ${f.suggestion.replace(/\n/g, "\n  ")}`;
-    return item;
+    return item + provenanceTrailer(f).replace(/\n/g, "\n  ");
   });
   return `${head}
 
@@ -27743,6 +27811,38 @@ function survivor(members) {
       out.suggestion = m.suggestion;
       break;
     }
+  }
+  const sources = [];
+  for (const m of members) {
+    if (m.source !== void 0 && !sources.includes(m.source))
+      sources.push(m.source);
+  }
+  if (sources.length > 0)
+    out.source = capText(sources.join("+"), RULE_CAP);
+  let confidence;
+  for (const m of members) {
+    if (m.confidence !== void 0 && (confidence === void 0 || m.confidence > confidence)) {
+      confidence = m.confidence;
+    }
+  }
+  if (confidence !== void 0)
+    out.confidence = confidence;
+  let snippet;
+  const analyzers = [];
+  for (const m of members) {
+    if (m.evidence === void 0)
+      continue;
+    if (snippet === void 0 && m.evidence.snippet !== void 0)
+      snippet = m.evidence.snippet;
+    if (m.evidence.analyzer !== void 0 && !analyzers.includes(m.evidence.analyzer)) {
+      analyzers.push(m.evidence.analyzer);
+    }
+  }
+  if (snippet !== void 0 || analyzers.length > 0) {
+    out.evidence = {
+      ...analyzers.length > 0 ? { analyzer: capText(analyzers.join("+"), RULE_CAP) } : {},
+      ...snippet !== void 0 ? { snippet } : {}
+    };
   }
   return out;
 }
@@ -28496,8 +28596,8 @@ function runExec(file, args, cwd, env, timeoutMs = TOOL_TIMEOUT_MS) {
     });
   });
 }
-function warning2(rule, message) {
-  return { severity: "warning", file: "", rule, message };
+function warning2(rule, message, source) {
+  return source === void 0 ? { severity: "warning", file: "", rule, message } : { severity: "warning", file: "", rule, message, source };
 }
 function invocationFailed(stdout) {
   let log;
@@ -28536,29 +28636,31 @@ function findingsExitCodes(label) {
   return [];
 }
 function fromStdout(tool, label, r, timeoutMs = TOOL_TIMEOUT_MS, maxBytes = DEFAULT_MAX_ARTIFACT_BYTES) {
+  const source = sourceForLabel(label);
   if (r.missing)
-    return [warning2("scanner-missing", `${label} unavailable: ${tool} not found`)];
+    return [warning2("scanner-missing", `${label} unavailable: ${tool} not found`, source)];
   if (r.timedOut)
-    return [warning2("scanner-failed", `${label} timed out after ${timeoutMs / 1e3}s`)];
+    return [warning2("scanner-failed", `${label} timed out after ${timeoutMs / 1e3}s`, source)];
   const over = byteCheck(r.stdout, maxBytes, label);
   if (over !== void 0)
     return over;
   const parsed = r.stdout.trim() ? parseSarif(r.stdout) : void 0;
   if (!parsed) {
-    return [warning2("scanner-failed", `${label} exited ${r.code ?? "abnormally"} without parseable SARIF`)];
+    return [warning2("scanner-failed", `${label} exited ${r.code ?? "abnormally"} without parseable SARIF`, source)];
   }
+  const provenanced = parsed.map((f) => ({ ...f, source, confidence: 90, evidence: { analyzer: source } }));
   const health = invocationFailed(r.stdout);
   if (health === true) {
-    return [...parsed, warning2("scanner-failed", `${label} reported an unsuccessful run`)];
+    return [...provenanced, warning2("scanner-failed", `${label} reported an unsuccessful run`, source)];
   }
   if (health === false)
-    return parsed;
+    return provenanced;
   if (r.code === 0)
-    return parsed;
+    return provenanced;
   if (r.code === null || !findingsExitCodes(label).includes(r.code)) {
-    return [...parsed, warning2("scanner-failed", `${label} reported an unsuccessful run`)];
+    return [...provenanced, warning2("scanner-failed", `${label} reported an unsuccessful run`, source)];
   }
-  return parsed;
+  return provenanced;
 }
 function dockerArgs(dir, image, digest, args, extraMounts = []) {
   const mounts = [`${dir}:/src`, ...extraMounts].flatMap((m) => ["-v", m]);
@@ -28583,13 +28685,13 @@ async function runScanners(o) {
   if (o.sbom) {
     const sb = await runExec("docker", dockerArgs(dir, TRIVY_IMAGE, TRIVY_DIGEST, sbomArgv(".")), dir, void 0, timeoutMs);
     if (sb.missing) {
-      findings.push(warning2("scanner-missing", "sbom unavailable: docker not found"));
+      findings.push(warning2("scanner-missing", "sbom unavailable: docker not found", "sbom"));
     } else {
       const over = byteCheck(sb.stdout, maxArtifactBytes, "sbom");
       if (over !== void 0) {
         findings.push(...over);
       } else if (!isCycloneDx(sb.stdout)) {
-        findings.push(warning2("scanner-failed", `sbom exited ${sb.code ?? "abnormally"} without a CycloneDX document`));
+        findings.push(warning2("scanner-failed", `sbom exited ${sb.code ?? "abnormally"} without a CycloneDX document`, "sbom"));
       } else {
         let sbomDir;
         try {
@@ -28600,7 +28702,7 @@ async function runScanners(o) {
         } catch (e) {
           if (sbomDir)
             await rm2(sbomDir, { recursive: true, force: true }).catch(() => void 0);
-          findings.push(warning2("sbom-write", `could not write SBOM: ${e.message}`));
+          findings.push(warning2("sbom-write", `could not write SBOM: ${e.message}`, "sbom"));
         }
       }
     }
@@ -28620,7 +28722,7 @@ async function runGitleaks(dir, timeoutMs = TOOL_TIMEOUT_MS, maxBytes = DEFAULT_
   try {
     reportDir = await mkdtemp(join5(os5.tmpdir(), "gitleaks-"));
   } catch (e) {
-    return [warning2("scanner-failed", `gitleaks temp dir unavailable: ${e.message}`)];
+    return [warning2("scanner-failed", `gitleaks temp dir unavailable: ${e.message}`, "gitleaks")];
   }
   const hostReport = join5(reportDir, "report.sarif");
   try {
@@ -28628,29 +28730,30 @@ async function runGitleaks(dir, timeoutMs = TOOL_TIMEOUT_MS, maxBytes = DEFAULT_
       `${reportDir}:/out`
     ]), dir, void 0, timeoutMs);
     if (gl.missing)
-      return [warning2("scanner-missing", "gitleaks unavailable: docker not found")];
+      return [warning2("scanner-missing", "gitleaks unavailable: docker not found", "gitleaks")];
     if (gl.timedOut)
-      return [warning2("scanner-failed", `gitleaks timed out after ${timeoutMs / 1e3}s`)];
+      return [warning2("scanner-failed", `gitleaks timed out after ${timeoutMs / 1e3}s`, "gitleaks")];
     let text;
     try {
       const capped = readCappedFileSync(hostReport, maxBytes);
       if (!capped.ok) {
-        return [warning2("scanner-failed", oversizeMessage("gitleaks", maxBytes))];
+        return [warning2("scanner-failed", oversizeMessage("gitleaks", maxBytes), "gitleaks")];
       }
       text = capped.text;
     } catch {
       text = void 0;
     }
     if (text === void 0) {
-      return gl.code === 0 ? [] : [warning2("scanner-failed", `gitleaks exited ${gl.code ?? "abnormally"} with no report`)];
+      return gl.code === 0 ? [] : [warning2("scanner-failed", `gitleaks exited ${gl.code ?? "abnormally"} with no report`, "gitleaks")];
     }
     const parsed = parseSarif(text);
     if (!parsed)
-      return [warning2("scanner-failed", "gitleaks report is not parseable SARIF")];
+      return [warning2("scanner-failed", "gitleaks report is not parseable SARIF", "gitleaks")];
+    const provenanced = parsed.map((f) => ({ ...f, source: "gitleaks", confidence: 90, evidence: { analyzer: "gitleaks" } }));
     if (invocationFailed(text) === true) {
-      return [...parsed, warning2("scanner-failed", "gitleaks reported an unsuccessful run")];
+      return [...provenanced, warning2("scanner-failed", "gitleaks reported an unsuccessful run", "gitleaks")];
     }
-    return parsed;
+    return provenanced;
   } finally {
     await rm2(reportDir, { recursive: true, force: true }).catch(() => void 0);
   }
@@ -28665,7 +28768,8 @@ var L2_SKIPPED = {
   severity: "info",
   file: "",
   rule: "l2-skipped",
-  message: "L2 native toolchains were not executed: fork PR with secrets in scope. Semgrep, gitleaks and trivy still ran."
+  message: "L2 native toolchains were not executed: fork PR with secrets in scope. Semgrep, gitleaks and trivy still ran.",
+  source: "l2"
 };
 var MANIFEST_FOR = {
   "package-lock.json": "package.json",
@@ -28812,7 +28916,7 @@ function isFinding(v) {
   if (typeof v !== "object" || v === null)
     return false;
   const f = v;
-  return typeof f.severity === "string" && SEVERITIES2.has(f.severity) && typeof f.file === "string" && typeof f.rule === "string" && typeof f.message === "string" && (f.line === void 0 || typeof f.line === "number" && Number.isInteger(f.line) && f.line >= 1) && (f.suggestion === void 0 || typeof f.suggestion === "string");
+  return typeof f.severity === "string" && SEVERITIES2.has(f.severity) && typeof f.file === "string" && typeof f.rule === "string" && typeof f.message === "string" && (f.line === void 0 || typeof f.line === "number" && Number.isInteger(f.line) && f.line >= 1) && (f.suggestion === void 0 || typeof f.suggestion === "string") && (f.source === void 0 || typeof f.source === "string" && f.source.length > 0 && f.source.length <= 100) && (f.confidence === void 0 || typeof f.confidence === "number" && Number.isSafeInteger(f.confidence) && f.confidence >= 0 && f.confidence <= 100) && (f.evidence === void 0 || typeof f.evidence === "object" && f.evidence !== null && !Array.isArray(f.evidence) && (f.evidence.snippet === void 0 || typeof f.evidence.snippet === "string") && (f.evidence.analyzer === void 0 || typeof f.evidence.analyzer === "string"));
 }
 function readFindings(dir, maxBytes = DEFAULT_MAX_ARTIFACT_BYTES) {
   const path = join6(dir, "findings.json");
@@ -28859,6 +28963,23 @@ function sanitizeFinding(f) {
     out.line = line;
   if (f.suggestion !== void 0) {
     out.suggestion = capText(f.suggestion.replace(CONTROL_KEEP_TEXT, ""), SUGGESTION_CAP);
+  }
+  if (f.source !== void 0) {
+    const stripped = f.source.replace(CONTROL_ALL, "");
+    if (stripped !== "")
+      out.source = capText(stripped, RULE_CAP);
+  }
+  if (f.confidence !== void 0)
+    out.confidence = f.confidence;
+  if (f.evidence !== void 0) {
+    const evidence = {};
+    if (f.evidence.analyzer !== void 0) {
+      evidence.analyzer = capText(f.evidence.analyzer.replace(CONTROL_ALL, ""), RULE_CAP);
+    }
+    if (f.evidence.snippet !== void 0) {
+      evidence.snippet = capText(f.evidence.snippet.replace(CONTROL_KEEP_TEXT, ""), MSG_CAP);
+    }
+    out.evidence = evidence;
   }
   return out;
 }
@@ -29199,7 +29320,15 @@ function toSarif(findings) {
           ...f.line !== void 0 ? { region: { startLine: f.line } } : {}
         }
       }
-    ]
+    ],
+    // Provenance (Q04, display-only): each field independently iff present;
+    // omitted entirely when both are absent. `message.text` is unchanged.
+    ...f.source !== void 0 || f.confidence !== void 0 ? {
+      properties: {
+        ...f.source !== void 0 ? { source: f.source } : {},
+        ...f.confidence !== void 0 ? { confidence: f.confidence } : {}
+      }
+    } : {}
   }));
   return {
     $schema: "https://json.schemastore.org/sarif-2.1.0.json",
