@@ -28,7 +28,7 @@ import {
   shouldTrigger,
   StaleHeadError,
 } from "./github.js";
-import { getInputs, type ActionInputs } from "./inputs.js";
+import { getInputs, DEFAULT_MAX_ARTIFACT_BYTES, type ActionInputs } from "./inputs.js";
 import { ensureLinkedRepo, parseLinkedRepos } from "./linked-repos.js";
 import {
   callByStyle,
@@ -40,8 +40,9 @@ import {
 } from "./llm.js";
 import { buildMessages, ISSUE_TRUNCATION_MARKER, linkedIssueNumber, neutralise } from "./prompt.js";
 import { catalogProtocolFor, checkModelListed, resolveEndpoint, type CatalogProtocol, type ResolvedEndpoint } from "./providers.js";
-import { buildBody, buildFallbackReport, eventFor, exitFor, mapToComments, redactFindings, type ReviewPayload } from "./review.js";
+import { buildBody, buildFallbackReport, capBody, eventFor, exitFor, mapToComments, omissionMarkerFor, prioritizeFindings, redactFindings, type InlineComment, type ReviewPayload } from "./review.js";
 import { runScanners, type ScannerResult } from "./scanners.js";
+import { readCappedFileSync } from "./artifact-limits.js";
 
 /** Everything the run needs from the environment. Built by readRunEnv() in production. */
 export interface RunEnv {
@@ -78,7 +79,7 @@ export interface Gateway {
   getIssueBody(issue: number): Promise<string>;
   /** Repository size in KB, or undefined when unknown (any API error). */
   getRepoSize(owner: string, repo: string): Promise<number | undefined>;
-  createReview(pr: number, payload: ReviewPayload, opts: { canWrite: boolean }): Promise<void>;
+  createReview(pr: number, payload: ReviewPayload, opts: { canWrite: boolean; maxBodyChars?: number }): Promise<void>;
   createIssueComment(pr: number, body: string, opts: { enabled: boolean; issuesWrite: boolean }): Promise<void>;
 }
 
@@ -345,12 +346,14 @@ function isFinding(v: unknown): v is Finding {
   );
 }
 
-function readFindings(dir: string): Finding[] {
+export function readFindings(dir: string, maxBytes: number = DEFAULT_MAX_ARTIFACT_BYTES): Finding[] {
   const path = join(dir, "findings.json");
   if (!existsSync(path)) throw new Error(`lupa: findings.json not found in ${dir}`);
+  const capped = readCappedFileSync(path, maxBytes);
+  if (!capped.ok) throw new Error(`lupa: findings.json exceeds the artifact read limit (${maxBytes} bytes)`);
   let parsed: unknown;
   try {
-    parsed = JSON.parse(readFileSync(path, "utf8"));
+    parsed = JSON.parse(capped.text);
   } catch {
     throw new Error("lupa: findings.json is malformed JSON");
   }
@@ -733,30 +736,69 @@ interface PublishArgs {
 }
 
 /**
+ * Renders overflow inline comments into body text in the same item shape as
+ * the off-diff fold in github.ts (`- path:line` plus two-space-indented
+ * continuation lines). When the general section is empty the block carries its
+ * heading; otherwise it continues the existing list.
+ */
+function foldExcessInline(withHeading: boolean, excess: InlineComment[]): string {
+  const items = excess.map((c) => {
+    const text = c.body.replace(/\r\n?/g, "\n").replace(/(\n[ \t]*)+$/, "");
+    const head = `- ${c.path}:${c.line}`;
+    if (text.trim() === "") return head;
+    return `${head}\n  ${text.replace(/\n/g, "\n  ")}`;
+  });
+  return withHeading ? `\n\n**Findings not placed inline:**\n${items.join("\n")}` : `\n${items.join("\n")}`;
+}
+
+/**
  * Posts one review for `headSha`, or dry-runs it. Writes the summary in every case. Posts only
  * when the token can write and the PR head still equals `headSha` (checked via the API).
  * A failed issue fallback is a warning; it never changes the exit code.
  */
 async function publishReview(a: PublishArgs): Promise<void> {
-  const findings = redactFindings(a.findings, runtimeSecrets(a.env));
-  const { inline, general } = mapToComments(findings, parseHunks(a.hunks));
-  const report = buildFallbackReport(findings);
-  const body = buildBody(general, summaryFor(findings));
+  const fullSet = redactFindings(a.findings, runtimeSecrets(a.env));
+  const inputs = a.env.inputs;
+  // Publication funnel: top-N by severity, then the inline cap (excess folds
+  // to the body), then the body char cap. Gates keep the full pre-cap set.
+  const ordered = prioritizeFindings(fullSet);
+  const retained = ordered.slice(0, inputs.maxFindings);
+  const omitted = fullSet.length - retained.length;
+  const omissionMarker = omitted > 0 ? omissionMarkerFor(omitted, inputs.maxFindings) : undefined;
+  const { inline, general } = mapToComments(retained, parseHunks(a.hunks));
+  const postedInline = inline.slice(0, inputs.maxInlineComments);
+  const excessInline = inline.slice(inputs.maxInlineComments);
+  let body = buildBody(general, summaryFor(fullSet));
+  if (excessInline.length > 0) body += foldExcessInline(general.length === 0, excessInline);
+  const capped = capBody(body, inputs.maxReviewBodyChars, omissionMarker === undefined ? [] : [omissionMarker]);
   const payload: ReviewPayload = {
     commit_id: a.headSha,
-    body,
-    event: eventFor(a.env.inputs.failLevel, findings),
-    comments: inline,
+    body: capped,
+    event: eventFor(inputs.failLevel, fullSet),
+    comments: postedInline,
   };
   if (a.env.summaryPath !== undefined) {
-    appendFileSync(a.env.summaryPath, report + "\n", "utf8");
-    a.out.summaryWritten = true;
+    // The 1 MiB platform ceiling minus bytes already in the file minus the
+    // trailing newline the append adds; a missing file counts as empty.
+    let existing = 0;
+    try {
+      existing = statSync(a.env.summaryPath).size;
+    } catch {
+      existing = 0;
+    }
+    try {
+      const report = buildFallbackReport(fullSet, { maxBytes: 1048576 - existing - 1 });
+      appendFileSync(a.env.summaryPath, report + "\n", "utf8");
+      a.out.summaryWritten = true;
+    } catch (e) {
+      core.warning(`summary report skipped: ${(e as Error).message}`);
+    }
   }
   if (!a.env.inputs.postComment) {
-    const high = findings.filter((f) => f.severity === "high").length;
+    const high = fullSet.filter((f) => f.severity === "high").length;
     core.info(
       `post_comment is false: dry-run, nothing posted (would post event=${payload.event}, ` +
-        `inline=${inline.length}, general=${general.length}, high=${high})`,
+        `inline=${postedInline.length}, general=${general.length + excessInline.length}, high=${high}, omitted=${omitted})`,
     );
     return;
   }
@@ -771,7 +813,7 @@ async function publishReview(a: PublishArgs): Promise<void> {
     return;
   }
   try {
-    await a.deps.gh.createReview(a.pr, payload, { canWrite: true });
+    await a.deps.gh.createReview(a.pr, payload, { canWrite: true, maxBodyChars: inputs.maxReviewBodyChars });
     a.out.posted = true;
   } catch (e) {
     if (e instanceof StaleHeadError) {
@@ -794,7 +836,17 @@ async function publishReview(a: PublishArgs): Promise<void> {
       return;
     }
     try {
-      await a.deps.gh.createIssueComment(a.pr, report, { enabled: a.env.issueFallback, issuesWrite });
+      // The fallback publishes the retained (publication-capped) set with the
+      // publication omission marker prepended; its native marker covers any
+      // further byte overflow. The char-cap value doubles as a conservative
+      // byte budget (stricter for multibyte text, never looser).
+      const budget =
+        omissionMarker === undefined
+          ? inputs.maxReviewBodyChars
+          : inputs.maxReviewBodyChars - Buffer.byteLength(omissionMarker, "utf8") - 2;
+      const fallbackReport = buildFallbackReport(retained, { maxBytes: budget });
+      const fallbackBody = omissionMarker === undefined ? fallbackReport : `${omissionMarker}\n\n${fallbackReport}`;
+      await a.deps.gh.createIssueComment(a.pr, fallbackBody, { enabled: a.env.issueFallback, issuesWrite });
       a.out.posted = true;
     } catch (fallbackErr) {
       core.warning(`issue fallback failed: ${(fallbackErr as Error).message}`);
@@ -881,6 +933,7 @@ async function runFlowA(env: RunEnv, deps: Deps, out: Outcome): Promise<void> {
       sbom: true,
       lockfiles,
       outDir: env.artifactDir,
+      maxArtifactBytes: env.inputs.maxArtifactBytes,
     });
     if (forkWithSecrets) {
       core.warning("fork PR with secrets in scope: L2 native toolchains skipped");
@@ -934,7 +987,7 @@ async function runFlowA(env: RunEnv, deps: Deps, out: Outcome): Promise<void> {
 async function runFlowB(env: RunEnv, deps: Deps, out: Outcome): Promise<void> {
   out.slowPathSkipped = true;
   // Sanitizing pass for the privileged flow (Flow A sanitizes in runFlowA; publishReview does not sanitize).
-  const meta = readPrMeta(env.artifactDir);
+  const meta = readPrMeta(env.artifactDir, env.inputs.maxArtifactBytes);
   if (meta === undefined) {
     throw new Error(
       `lupa: pr-meta.json not found in ${env.artifactDir}; refusing to post without the PR run's artifact`,
@@ -973,7 +1026,7 @@ async function runFlowB(env: RunEnv, deps: Deps, out: Outcome): Promise<void> {
   if (live.headRef !== runBranch) {
     throw new Error("lupa: PR head branch does not match workflow_run.head_branch; refusing to post");
   }
-  const findings = readFindings(env.artifactDir).map(sanitizeFinding);
+  const findings = readFindings(env.artifactDir, env.inputs.maxArtifactBytes).map(sanitizeFinding);
   const hunks = parseDiffFiles(readDiff(env.artifactDir));
   await publishReview({ env, deps, out, pr, isFork: live.isFork, findings, hunks, headSha });
   if (!out.staleSkipped) out.exitCode = exitFor(env.inputs.failLevel, findings);
@@ -1028,7 +1081,7 @@ function realGateway(token: string): Gateway {
     },
     getRepoSize: (owner, repo) => fetchRepoSize(octokit(), owner, repo),
     createReview: (pr, payload, opts) =>
-      postReview(octokit(), pr, payload, { canWrite: opts.canWrite }).then(() => undefined),
+      postReview(octokit(), pr, payload, { canWrite: opts.canWrite, maxBodyChars: opts.maxBodyChars }).then(() => undefined),
     createIssueComment: (pr, body, opts) => postIssueFallback(octokit(), { pr, body, ...opts }),
   };
 }
