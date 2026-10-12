@@ -49,6 +49,7 @@ The diff is treated as untrusted data. By default the LLM has no tools (see Agen
 | `pr_number` | (empty) | Used only by `workflow_dispatch`. |
 | `fail_level` | `warning` | `none`, `warning` or `high`. See the gate section. |
 | `max_diff_chars` | `60000` | Diff ceiling sent to the LLM. |
+| `max_prompt_chars` | `120000` | Total UTF-8 byte budget for the assembled LLM user message (diff, findings, issue context, headers, skipped-files note); the fixed system prompt is excluded. Note: `max_diff_chars` is counted in UTF-16 code units, not bytes. |
 | `post_comment` | `true` | `false` makes a dry-run. |
 | `timeout_seconds` | `90` | LLM request timeout. A timeout degrades to a summary without retry. |
 
@@ -122,7 +123,7 @@ In agent mode, whole files from the repository (and from linked repositories men
 Budget figures are estimates. Prices change: check your provider's price page, and compare **Zen vs direto** (calling the model provider directly with its own key). Zen is pay-per-use through OpenCode, and its prices can differ from the direct provider prices.
 
 - **Cost of a typical PR:** about 3k input tokens plus 600 output tokens.
-- **Ceiling:** `max_diff_chars` 60000 is about 15k input tokens plus prompt overhead. At frontier-model prices a PR at the ceiling costs roughly $0.15 to $0.30. Compare with the typical figure above (about 3k input and 600 output tokens). Lower `max_diff_chars` to cap spend. Files larger than the per-file cap (8000 characters) are truncated, and files over the total ceiling are skipped with a note.
+- **Ceiling:** `max_prompt_chars` 120000 bytes is about 30k input tokens (≈bytes/4) plus prompt overhead. At frontier-model prices a PR at the ceiling costs roughly $0.30 to $0.60. Compare with the typical figure above (about 3k input and 600 output tokens). Lower `max_prompt_chars` to cap spend. `max_diff_chars` (60000 UTF-16 code units) stays the diff-only allowance inside that total. Files larger than the per-file cap (8000 characters) are truncated, and files over the total ceiling are skipped with a note. Any diff whose UTF-8 bytes exceed 120,000 skips the slow path at default config — e.g. ~40k units at 3 B/unit, ~60k units at 2 B/unit.
 - **peak/off-peak pricing:** some models price by time of day. For example, `deepseek-v4.1-flash` has different peak and off-peak prices. Check the current rates before choosing a model for high-volume repositories.
 - **Retries:** one retry after a fixed 500 ms delay, only on 5xx and 429. A `Retry-After` header replaces the delay, capped at 5 s. Timeouts and output truncation (`finish_reason: length`) are not retried with a smaller diff, because truncating the input does not fix truncated output.
 
@@ -140,6 +141,7 @@ The findings and the gate are separate. The review event and the exit code follo
 - A `REQUEST_CHANGES` review always has a body.
 - The action step exits non-zero for `1` and `2`, so the template runs it with `continue-on-error: true` and reads `steps.review.outputs.exit-code` in a separate gate step.
 - The template's gate passes on `0` and `2` and fails on `1`. Warning findings never block a merge. A failed run (for example an action error, where no exit code is produced) still fails the gate. To block on high-severity findings, set `fail_level: high`.
+- A prompt-budget skip passes the gate on fast findings only; the skip is recorded in the step summary.
 
 ## Scanners and their runtimes
 

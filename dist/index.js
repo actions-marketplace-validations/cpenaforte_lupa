@@ -25703,6 +25703,7 @@ function getInputs() {
     llmMaxTokens: readInt("llm_max_tokens", 2e3, 1),
     failLevel: parseFailLevel(readString("fail_level", "warning")),
     maxDiffChars: readInt("max_diff_chars", 6e4, 1),
+    maxPromptChars: readInt("max_prompt_chars", 12e4, 1),
     postComment: readBool("post_comment", true),
     timeoutSeconds: readInt("timeout_seconds", 90, 1),
     prNumber,
@@ -25978,6 +25979,10 @@ var BLOCK_TAG = /<\s*\/?\s*(?:untrusted-diff|linked-issue)\b[^>]*>?/gi;
 function neutralise(text) {
   return text.replace(BLOCK_TAG, (m) => m.replace(/</g, "&lt;").replace(/>/g, "&gt;"));
 }
+var LINKED_ISSUE_HEADER = "## Linked issue (context from the PR's closing reference)";
+var LINKED_ISSUE_OPEN = "<linked-issue>\n";
+var LINKED_ISSUE_CLOSE = "\n</linked-issue>";
+var ISSUE_TRUNCATION_MARKER = "\u2026[issue context truncated to fit the prompt budget]";
 function agentAddendum(maxTurns) {
   return [
     "You have read-only tools to inspect the repository and any linked repositories: read_file, list_dir, grep, glob. Use them to verify claims (callers, definitions, configs, tests) before reporting.",
@@ -25985,22 +25990,25 @@ function agentAddendum(maxTurns) {
     `Tool budget: up to ${maxTurns} tool-call rounds. When you have enough evidence, respond with ONLY the JSON findings object matching the schema; no prose, no tool calls.`
   ].join("\n");
 }
-function buildMessages(fast, diffText, issueBody, skipped = [], agent) {
+function buildMessages(fast, diffText, issueBody, skipped = [], agent, omitted = 0) {
   const system = agent ? `${SYSTEM}
 
 ${agentAddendum(agent.maxTurns)}` : SYSTEM;
   const parts = [];
   parts.push("## Fast findings (deterministic checks already run)");
-  parts.push(JSON.stringify(fast).replace(/</g, "\\u003c"));
+  parts.push(JSON.stringify(fast).replace(/</g, "\\u003c") + (omitted > 0 ? `
+
+Omitted ${omitted} fast finding(s) to fit the prompt budget.` : ""));
   if (skipped.length > 0) {
     parts.push("## Diff budget note\nThe following files were omitted from the diff below to fit the review budget and were not reviewed:");
-    parts.push(skipped.map((f) => `- ${neutralise(f).replace(/[\r\n]/g, "?")}`).join("\n"));
+    const shown = skipped.slice(0, 20).map((f) => `- ${neutralise(f).replace(/[\r\n]/g, "?")}`);
+    if (skipped.length > 20)
+      shown.push(`- \u2026and ${skipped.length - 20} more omitted from this note`);
+    parts.push(shown.join("\n"));
   }
   if (issueBody !== void 0 && issueBody.trim() !== "") {
-    parts.push("## Linked issue (context from the PR's closing reference)");
-    parts.push(`<linked-issue>
-${neutralise(issueBody)}
-</linked-issue>`);
+    parts.push(LINKED_ISSUE_HEADER);
+    parts.push(`${LINKED_ISSUE_OPEN}${neutralise(issueBody)}${LINKED_ISSUE_CLOSE}`);
   }
   parts.push("## Pull request diff");
   parts.push(`<untrusted-diff>
@@ -28397,6 +28405,47 @@ function sanitizeFinding(f) {
   }
   return out;
 }
+function cutToBytes(s, maxBytes) {
+  let bytes = 0;
+  let end = 0;
+  for (const ch of s) {
+    const bl = Buffer.byteLength(ch, "utf8");
+    if (bytes + bl > maxBytes)
+      break;
+    bytes += bl;
+    end += ch.length;
+  }
+  return s.slice(0, end);
+}
+function budgetPrompt(fast, promptText, issueBody, skipped, budget) {
+  const nPrompt = neutralise(promptText);
+  const nIssueFull = issueBody !== void 0 && issueBody.trim() !== "" ? neutralise(issueBody) : void 0;
+  const render = (f, ib, omitted2) => buildMessages(f, nPrompt, ib, skipped, void 0, omitted2).user;
+  let curIssue = nIssueFull;
+  let issueDropped = false;
+  let kept = [...fast];
+  let omitted = 0;
+  if (Buffer.byteLength(render(kept, curIssue, 0), "utf8") <= budget) {
+    return { fast: kept, promptText: nPrompt, issueBody: curIssue, skipped: skipped.map(neutralise), findingsOmitted: 0, issueDropped: false };
+  }
+  if (curIssue !== void 0) {
+    const noIssueBytes = Buffer.byteLength(render(kept, void 0, 0), "utf8");
+    const markerBytes = Buffer.byteLength(ISSUE_TRUNCATION_MARKER, "utf8");
+    const issueOverhead = Buffer.byteLength(render(kept, ISSUE_TRUNCATION_MARKER, 0), "utf8") - noIssueBytes - markerBytes;
+    const allowance = budget - noIssueBytes - issueOverhead;
+    if (allowance < markerBytes) {
+      curIssue = void 0;
+      issueDropped = true;
+    } else if (Buffer.byteLength(curIssue, "utf8") > allowance) {
+      curIssue = cutToBytes(curIssue, allowance - markerBytes) + ISSUE_TRUNCATION_MARKER;
+    }
+  }
+  while (kept.length > 0 && Buffer.byteLength(render(kept, curIssue, omitted), "utf8") > budget) {
+    kept = kept.slice(0, -1);
+    omitted += 1;
+  }
+  return { fast: kept, promptText: nPrompt, issueBody: curIssue, skipped: skipped.map(neutralise), findingsOmitted: omitted, issueDropped };
+}
 function fields(env) {
   return env.payload;
 }
@@ -28430,7 +28479,7 @@ function note(env, out, text) {
 function summaryFor(findings) {
   return findings.length === 0 ? "lupa: no findings." : `lupa: ${findings.length} finding(s).`;
 }
-async function slowPath(env, deps, pr, fast, promptText, issueBody, skipped, prBody) {
+async function slowPath(env, out, deps, pr, fast, promptText, issueBody, skipped, prBody) {
   const i = env.inputs;
   if (i.llmApiKey === "") {
     info("no llm_api_key: slow path skipped");
@@ -28475,7 +28524,18 @@ async function slowPath(env, deps, pr, fast, promptText, issueBody, skipped, prB
   if (check.status === "unknown") {
     warning(`model check inconclusive (${check.detail ?? "unknown error"}); continuing`);
   }
-  const messages = buildMessages(fast, promptText, issueBody, skipped);
+  const promptFast = fast.map(sanitizeFinding);
+  const b = budgetPrompt(promptFast, promptText, issueBody, skipped, i.maxPromptChars);
+  const messages = buildMessages(b.fast, b.promptText, b.issueBody, b.skipped, i.llmAgent ? { maxTurns: i.llmAgentMaxTurns } : void 0, b.findingsOmitted);
+  const promptBytes = Buffer.byteLength(messages.user, "utf8");
+  if (promptBytes > i.maxPromptChars) {
+    warning(`prompt ${promptBytes} exceeds max_prompt_chars ${i.maxPromptChars} after bounded cuts`);
+    note(env, out, `lupa: prompt ${promptBytes} exceeds max_prompt_chars ${i.maxPromptChars} after bounded cuts \u2014 LLM review skipped, gate uses fast findings only.`);
+    return void 0;
+  }
+  if (b.issueDropped) {
+    info(`linked issue context dropped to fit the ${i.maxPromptChars}-byte prompt budget`);
+  }
   const llmOpts = {
     model: i.llmModel,
     apiKey: i.llmApiKey,
@@ -28520,7 +28580,7 @@ async function slowPath(env, deps, pr, fast, promptText, issueBody, skipped, prB
       }
     };
     const conv = {
-      ...buildMessages(fast, promptText, issueBody, skipped, { maxTurns: i.llmAgentMaxTurns }),
+      ...messages,
       tools: [...TOOL_DEFS]
     };
     if (linked.length > 0)
@@ -28695,7 +28755,7 @@ async function runFlowA(env, deps, out) {
       warning(`linked issue #${issueNo} not fetched: ${e.message}`);
     }
   }
-  const llm = await slowPath(env, deps, pr, fast, prompt.text, issueBody, prompt.skipped, pull.body);
+  const llm = await slowPath(env, out, deps, pr, fast, prompt.text, issueBody, prompt.skipped, pull.body);
   out.slowPathSkipped = llm === void 0;
   out.findingsFrom = llm === void 0 ? "fastpath" : "llm";
   const all = [...fast, ...llm ?? []].map(sanitizeFinding);
@@ -28851,6 +28911,7 @@ if (isEntry) {
   });
 }
 export {
+  budgetPrompt,
   cleanEnvForExec,
   main,
   readRunEnv,
