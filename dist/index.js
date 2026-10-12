@@ -24884,6 +24884,7 @@ var AGENT_LIMITS = {
 // lib/src/agent-tools.js
 var DRIVE_LETTER = /^[a-zA-Z]:/;
 var TRUNCATION_MARKER = "\n[truncated]";
+var ERROR_MESSAGE_CAP = 2e3;
 var READ_MAX_BYTES = 1024 * 1024;
 function splitSegments(p) {
   return p.split(/[\\/]/);
@@ -24899,6 +24900,18 @@ function codePointSafeCut(s, n) {
   const code = s.charCodeAt(n);
   const cut = code >= 56320 && code <= 57343 ? n - 1 : n;
   return s.slice(0, cut);
+}
+function largestFittingCount(total, cap, byteLengthAt) {
+  let lo = 0;
+  let hi = total;
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2);
+    if (byteLengthAt(mid) <= cap)
+      lo = mid;
+    else
+      hi = mid - 1;
+  }
+  return lo;
 }
 function realpathExistingAncestor(p) {
   let cur = p;
@@ -24941,12 +24954,17 @@ function resolveWithinRoot(root, rel) {
   return resolved;
 }
 function errorResult(message) {
-  return { output: JSON.stringify({ error: message }), isError: true };
+  let msg = message;
+  if (Buffer.byteLength(msg, "utf8") > ERROR_MESSAGE_CAP) {
+    const n = largestFittingCount(msg.length, ERROR_MESSAGE_CAP, (k) => Buffer.byteLength(codePointSafeCut(msg, k) + TRUNCATION_MARKER, "utf8"));
+    msg = codePointSafeCut(msg, n) + TRUNCATION_MARKER;
+  }
+  return { output: JSON.stringify({ error: msg }), isError: true };
 }
 function okResult(payload) {
   return { output: JSON.stringify(payload), isError: false };
 }
-async function resolveRoot(repo, ctx) {
+async function resolveRoot(repo, ctx, deadlineMs) {
   const alias = repo === void 0 || repo === null || repo === "" ? "self" : String(repo);
   if (alias === "self")
     return ctx.roots.self;
@@ -24954,20 +24972,20 @@ async function resolveRoot(repo, ctx) {
   if (linked)
     return linked;
   if (ctx.ensureLinked) {
-    const res = await ctx.ensureLinked(alias);
+    const res = deadlineMs !== void 0 ? await ctx.ensureLinked(alias, { deadlineMs }) : await ctx.ensureLinked(alias);
     if ("dir" in res)
       return res.dir;
   }
   return { error: `repository not accessible: ${alias}` };
 }
-async function rootFor(args, ctx) {
-  const root = await resolveRoot(args.repo, ctx);
+async function rootFor(args, ctx, deadlineMs) {
+  const root = await resolveRoot(args.repo, ctx, deadlineMs);
   if (typeof root === "string")
     return { root };
   return { error: root.error };
 }
-async function readFile(args, ctx) {
-  const resolvedRoot = await rootFor(args, ctx);
+async function readFile(args, ctx, opts) {
+  const resolvedRoot = await rootFor(args, ctx, opts?.endMs);
   if ("error" in resolvedRoot)
     return errorResult(resolvedRoot.error);
   const rel = typeof args.path === "string" ? args.path : "";
@@ -25003,6 +25021,7 @@ async function readFile(args, ctx) {
   const actualEnd = selected.length ? start + selected.length - 1 : start - 1;
   const fullContent = selected.map((l, i) => `${start + i}: ${l}`).join("\n");
   const base = { path: rel, start_line: start, end_line: actualEnd, total_lines: total };
+  const cap = opts?.maxBytes ?? AGENT_LIMITS.resultBytes;
   const serialize = (content) => JSON.stringify({ ...base, truncated: false, content });
   const serializeTruncated = (cut) => {
     const idx = cut.lastIndexOf("\n");
@@ -25011,23 +25030,14 @@ async function readFile(args, ctx) {
     const visibleEnd = complete ? start + visible.split("\n").length - 1 : start - 1;
     return JSON.stringify({ ...base, end_line: visibleEnd, truncated: true, content: visible + TRUNCATION_MARKER });
   };
-  if (Buffer.byteLength(serialize(fullContent), "utf8") <= AGENT_LIMITS.resultBytes) {
+  if (Buffer.byteLength(serialize(fullContent), "utf8") <= cap) {
     return okResult(JSON.parse(serialize(fullContent)));
   }
-  let lo = 0;
-  let hi = fullContent.length;
-  while (lo < hi) {
-    const mid = Math.ceil((lo + hi) / 2);
-    const candidate = serializeTruncated(codePointSafeCut(fullContent, mid));
-    if (Buffer.byteLength(candidate, "utf8") <= AGENT_LIMITS.resultBytes)
-      lo = mid;
-    else
-      hi = mid - 1;
-  }
-  return okResult(JSON.parse(serializeTruncated(codePointSafeCut(fullContent, lo))));
+  const n = largestFittingCount(fullContent.length, cap, (k) => Buffer.byteLength(serializeTruncated(codePointSafeCut(fullContent, k)), "utf8"));
+  return okResult(JSON.parse(serializeTruncated(codePointSafeCut(fullContent, n))));
 }
-async function listDir(args, ctx) {
-  const resolvedRoot = await rootFor(args, ctx);
+async function listDir(args, ctx, endMs, maxBytes) {
+  const resolvedRoot = await rootFor(args, ctx, endMs);
   if ("error" in resolvedRoot)
     return errorResult(resolvedRoot.error);
   const rel = typeof args.path === "string" && args.path !== "" ? args.path : ".";
@@ -25060,8 +25070,15 @@ async function listDir(args, ctx) {
     return a.name < b.name ? -1 : a.name > b.name ? 1 : 0;
   });
   const cap = 200;
-  const truncated = entries.length > cap;
-  return okResult({ path: rel, entries: entries.slice(0, cap), truncated });
+  const overCap = entries.length > cap;
+  const sliced = entries.slice(0, cap);
+  const byteCap = maxBytes ?? AGENT_LIMITS.resultBytes;
+  const serializeList = (list, truncated) => JSON.stringify({ path: rel, entries: list, truncated });
+  if (Buffer.byteLength(serializeList(sliced, overCap), "utf8") <= byteCap) {
+    return okResult({ path: rel, entries: sliced, truncated: overCap });
+  }
+  const n = largestFittingCount(sliced.length, byteCap, (k) => Buffer.byteLength(serializeList(sliced.slice(0, k), true), "utf8"));
+  return okResult({ path: rel, entries: sliced.slice(0, n), truncated: true });
 }
 var GREP_TIMEOUT_MS = 5e3;
 var GREP_MAX_MATCHES = 100;
@@ -25304,7 +25321,7 @@ function runGrepWorker(pattern, files, limit, timeoutMs) {
     });
   });
 }
-async function grepInRoot(root, args, timeoutMs = GREP_TIMEOUT_MS, limits) {
+async function grepInRoot(root, args, timeoutMs = GREP_TIMEOUT_MS, limits, endMs, maxBytes) {
   const pattern = typeof args.pattern === "string" ? args.pattern : "";
   try {
     new RegExp(pattern);
@@ -25315,13 +25332,24 @@ async function grepInRoot(root, args, timeoutMs = GREP_TIMEOUT_MS, limits) {
   const startAbs = resolveWithinRoot(root, rel);
   if (!startAbs)
     return errorResult(`path not accessible: ${rel}`);
-  const walked = walkFiles(root, startAbs, limits);
+  if (endMs !== void 0 && endMs - Date.now() <= 0) {
+    return errorResult("grep timed out");
+  }
+  const walkLimits = endMs === void 0 ? limits : {
+    ...limits,
+    deadlineMs: Math.min(limits?.deadlineMs ?? WALK_DEFAULT_DEADLINE_MS, Math.max(0, endMs - Date.now()))
+  };
+  const walked = walkFiles(root, startAbs, walkLimits);
   let files = walked.files;
   if (args.glob)
     files = files.filter((f) => matchGlob(f.rel, args.glob));
+  if (endMs !== void 0 && endMs - Date.now() <= 0) {
+    return errorResult("grep timed out");
+  }
   const requested = args.max_results === void 0 ? GREP_MAX_MATCHES : Math.floor(Number(args.max_results));
   const limit = Number.isFinite(requested) ? Math.max(0, Math.min(requested, GREP_MAX_MATCHES)) : GREP_MAX_MATCHES;
-  const outcome = await runGrepWorker(pattern, files, limit, timeoutMs);
+  const effectiveTimeout2 = endMs === void 0 ? timeoutMs : Math.min(timeoutMs, Math.max(0, endMs - Date.now()));
+  const outcome = await runGrepWorker(pattern, files, limit, effectiveTimeout2);
   if (outcome.isError)
     return { output: outcome.output, isError: true };
   const { matches, filesScanned, hitLimit } = outcome;
@@ -25330,21 +25358,14 @@ async function grepInRoot(root, args, timeoutMs = GREP_TIMEOUT_MS, limits) {
     line: m.line,
     text: codePointSafeCut(m.text, GREP_LINE_CHARS)
   }));
+  const byteCap = maxBytes ?? AGENT_LIMITS.resultBytes;
   const serialize = (list, truncated2) => JSON.stringify({ matches: list, truncated: truncated2, files_scanned: filesScanned, skipped: walked.skipped });
-  let lo = 0;
-  let hi = capped.length;
-  while (lo < hi) {
-    const mid = Math.ceil((lo + hi) / 2);
-    if (Buffer.byteLength(serialize(capped.slice(0, mid), true), "utf8") <= AGENT_LIMITS.resultBytes)
-      lo = mid;
-    else
-      hi = mid - 1;
-  }
-  const truncated = hitLimit || walked.truncated || lo < capped.length;
-  return okResult(JSON.parse(serialize(capped.slice(0, lo), truncated)));
+  const n = largestFittingCount(capped.length, byteCap, (k) => Buffer.byteLength(serialize(capped.slice(0, k), true), "utf8"));
+  const truncated = hitLimit || walked.truncated || n < capped.length;
+  return okResult(JSON.parse(serialize(capped.slice(0, n), truncated)));
 }
-async function grep(args, ctx) {
-  const resolvedRoot = await rootFor(args, ctx);
+async function grep(args, ctx, opts) {
+  const resolvedRoot = await rootFor(args, ctx, opts?.endMs);
   if ("error" in resolvedRoot)
     return errorResult(resolvedRoot.error);
   return grepInRoot(resolvedRoot.root, {
@@ -25352,17 +25373,28 @@ async function grep(args, ctx) {
     path: typeof args.path === "string" ? args.path : void 0,
     glob: typeof args.glob === "string" ? args.glob : void 0,
     max_results: args.max_results === void 0 ? void 0 : Number(args.max_results)
-  });
+  }, opts?.timeoutMs ?? GREP_TIMEOUT_MS, void 0, opts?.endMs, opts?.maxBytes);
 }
-async function glob(args, ctx) {
-  const resolvedRoot = await rootFor(args, ctx);
+async function glob(args, ctx, endMs, maxBytes) {
+  const resolvedRoot = await rootFor(args, ctx, endMs);
   if ("error" in resolvedRoot)
     return errorResult(resolvedRoot.error);
+  if (endMs !== void 0 && endMs - Date.now() <= 0) {
+    return errorResult("glob timed out");
+  }
   const pattern = typeof args.pattern === "string" ? args.pattern : "";
-  const walked = walkPaths(resolvedRoot.root, resolvedRoot.root);
+  const walkLimits = endMs === void 0 ? void 0 : { deadlineMs: Math.min(WALK_DEFAULT_DEADLINE_MS, Math.max(0, endMs - Date.now())) };
+  const walked = walkPaths(resolvedRoot.root, resolvedRoot.root, walkLimits);
   const paths = walked.paths.filter((p) => matchGlob(p, pattern));
-  const truncated = paths.length > GLOB_MAX_PATHS || walked.truncated;
-  return okResult({ paths: paths.slice(0, GLOB_MAX_PATHS), truncated });
+  const overCap = paths.length > GLOB_MAX_PATHS || walked.truncated;
+  const sliced = paths.slice(0, GLOB_MAX_PATHS);
+  const byteCap = maxBytes ?? AGENT_LIMITS.resultBytes;
+  const serializeGlob = (list, truncated) => JSON.stringify({ paths: list, truncated });
+  if (Buffer.byteLength(serializeGlob(sliced, overCap), "utf8") <= byteCap) {
+    return okResult({ paths: sliced, truncated: overCap });
+  }
+  const n = largestFittingCount(sliced.length, byteCap, (k) => Buffer.byteLength(serializeGlob(sliced.slice(0, k), true), "utf8"));
+  return okResult({ paths: sliced.slice(0, n), truncated: true });
 }
 var TOOL_DEFS = [
   {
@@ -25419,18 +25451,18 @@ var TOOL_DEFS = [
     }
   }
 ];
-async function executeTool(name, args, ctx) {
+async function executeTool(name, args, ctx, limits) {
   const a = args && typeof args === "object" ? args : {};
   try {
     switch (name) {
       case "read_file":
-        return await readFile(a, ctx);
+        return await readFile(a, ctx, { maxBytes: limits?.maxResultBytes, endMs: limits?.deadlineMs });
       case "list_dir":
-        return await listDir(a, ctx);
+        return await listDir(a, ctx, limits?.deadlineMs, limits?.maxResultBytes);
       case "grep":
-        return await grep(a, ctx);
+        return await grep(a, ctx, { endMs: limits?.deadlineMs, maxBytes: limits?.maxResultBytes });
       case "glob":
-        return await glob(a, ctx);
+        return await glob(a, ctx, limits?.deadlineMs, limits?.maxResultBytes);
       default:
         return errorResult(`unknown tool: ${name}`);
     }
@@ -25724,6 +25756,13 @@ import { execFile as execFile2 } from "node:child_process";
 import { existsSync as existsSync4, lstatSync, mkdirSync, readdirSync as readdirSync3, readFileSync as readFileSync5, renameSync, rmSync, statSync as statSync3, writeFileSync as writeFileSync2 } from "node:fs";
 import { join as join4 } from "node:path";
 var CLONE_TIMEOUT_MS = 6e4;
+function effectiveTimeout(configuredMs, endMs, nowMs = Date.now()) {
+  if (endMs === void 0)
+    return configuredMs;
+  if (endMs - nowMs <= 0)
+    return "expired";
+  return Math.max(1, Math.min(configuredMs, endMs - nowMs));
+}
 function defaultRun(cmd, args, o) {
   return new Promise((resolve2) => {
     execFile2(cmd, args, { cwd: o.cwd, env: o.env, timeout: o.timeoutMs }, (err, stdout, stderr) => {
@@ -25822,8 +25861,14 @@ function removeDir(dir) {
 async function ensureLinkedRepo(alias, o) {
   const dir = join4(o.baseDir, alias.split("/").join("__"));
   const deps = o.deps ?? { run: defaultRun, ...o.sizeKb !== void 0 ? { sizeKb: o.sizeKb } : {} };
+  const deadlineExceeded = `repository not accessible: ${alias}: deadline exceeded`;
+  if (o.deadlineMs !== void 0 && o.deadlineMs - Date.now() <= 0) {
+    return { error: deadlineExceeded };
+  }
   if (existsSync4(dir)) {
     const sha = await validateCache(deps, alias, dir, o);
+    if (sha === "expired")
+      return { error: deadlineExceeded };
     if (sha !== null)
       return { dir, sha };
     removeDir(dir);
@@ -25847,15 +25892,22 @@ async function ensureLinkedRepo(alias, o) {
     env.GIT_CONFIG_VALUE_0 = "Authorization: Basic " + Buffer.from("x-access-token:" + o.token, "utf8").toString("base64");
   }
   const args = ["clone", "--depth", "1", "--single-branch", `https://github.com/${alias}.git`, dir];
+  const cloneTimeout = effectiveTimeout(o.timeoutMs ?? CLONE_TIMEOUT_MS, o.deadlineMs);
+  if (cloneTimeout === "expired") {
+    return { error: deadlineExceeded };
+  }
   let result;
   try {
-    result = await deps.run("git", args, { cwd: o.baseDir, env, timeoutMs: o.timeoutMs ?? CLONE_TIMEOUT_MS });
+    result = await deps.run("git", args, { cwd: o.baseDir, env, timeoutMs: cloneTimeout });
   } catch (e) {
     result = { code: null, stdout: "", stderr: e instanceof Error ? e.message : String(e) };
   }
   if (result.code !== 0) {
-    const detail = redactToken(result.stderr.trim() || "clone failed", o.token);
     removeDir(dir);
+    if (o.deadlineMs !== void 0 && o.deadlineMs - Date.now() <= 0) {
+      return { error: deadlineExceeded };
+    }
+    const detail = redactToken(result.stderr.trim() || "clone failed", o.token);
     return { error: `repository not accessible: ${alias}: ${detail}` };
   }
   if (o.maxBytes !== void 0) {
@@ -25871,7 +25923,11 @@ async function ensureLinkedRepo(alias, o) {
       return { error: "repository too large" };
     }
   }
-  const head = await cloneHead(deps, dir, o.timeoutMs ?? CLONE_TIMEOUT_MS);
+  const head = await cloneHead(deps, dir, o.timeoutMs ?? CLONE_TIMEOUT_MS, o.deadlineMs);
+  if (head === "expired") {
+    removeDir(dir);
+    return { error: deadlineExceeded };
+  }
   writeMarker(dir, { repo: alias, branch: head.branch, sha: head.sha });
   return { dir, sha: head.sha };
 }
@@ -25908,34 +25964,59 @@ function readMarker(dir) {
     return null;
   }
 }
-async function cloneHead(deps, dir, timeoutMs) {
+async function cloneHead(deps, dir, timeoutMs, deadlineMs) {
   const env = { ...process.env, GIT_TERMINAL_PROMPT: "0" };
   let branch = "";
   let sha = "";
+  const isExpired = () => deadlineMs !== void 0 && deadlineMs - Date.now() <= 0;
   try {
-    const b = await deps.run("git", ["rev-parse", "--abbrev-ref", "HEAD"], { cwd: dir, env, timeoutMs });
+    const branchTimeout = effectiveTimeout(timeoutMs, deadlineMs);
+    if (branchTimeout === "expired")
+      return "expired";
+    const b = await deps.run("git", ["rev-parse", "--abbrev-ref", "HEAD"], { cwd: dir, env, timeoutMs: branchTimeout });
     if (b.code === 0)
       branch = b.stdout.trim();
-    const h = await deps.run("git", ["rev-parse", "HEAD"], { cwd: dir, env, timeoutMs });
+    const headTimeout = effectiveTimeout(timeoutMs, deadlineMs);
+    if (headTimeout === "expired")
+      return "expired";
+    const h = await deps.run("git", ["rev-parse", "HEAD"], { cwd: dir, env, timeoutMs: headTimeout });
+    if (isExpired())
+      return "expired";
     if (h.code === 0)
       sha = h.stdout.trim();
   } catch {
+    if (isExpired())
+      return "expired";
   }
   return { branch, sha };
 }
 async function validateCache(deps, alias, dir, o) {
+  const endMs = o.deadlineMs;
+  const isExpired = () => endMs !== void 0 && endMs - Date.now() <= 0;
+  if (isExpired())
+    return "expired";
   if (!existsSync4(join4(dir, ".git")))
     return null;
   const marker = readMarker(dir);
   if (marker === null || marker.repo !== alias)
     return null;
   const env = { ...process.env, GIT_TERMINAL_PROMPT: "0" };
-  const timeoutMs = o.timeoutMs ?? CLONE_TIMEOUT_MS;
+  const configured = o.timeoutMs ?? CLONE_TIMEOUT_MS;
   try {
-    const origin = await deps.run("git", ["config", "--get", "remote.origin.url"], { cwd: dir, env, timeoutMs });
+    let timeout = effectiveTimeout(configured, endMs);
+    if (timeout === "expired")
+      return "expired";
+    const origin = await deps.run("git", ["config", "--get", "remote.origin.url"], { cwd: dir, env, timeoutMs: timeout });
+    if (isExpired())
+      return "expired";
     if (origin.code !== 0 || origin.stdout.trim() !== `https://github.com/${alias}.git`)
       return null;
-    const branch = await deps.run("git", ["rev-parse", "--abbrev-ref", "HEAD"], { cwd: dir, env, timeoutMs });
+    timeout = effectiveTimeout(configured, endMs);
+    if (timeout === "expired")
+      return "expired";
+    const branch = await deps.run("git", ["rev-parse", "--abbrev-ref", "HEAD"], { cwd: dir, env, timeoutMs: timeout });
+    if (isExpired())
+      return "expired";
     const resolvedBranch = branch.code === 0 ? branch.stdout.trim() : "";
     if (resolvedBranch === "" || resolvedBranch !== marker.branch)
       return null;
@@ -25949,11 +26030,18 @@ async function validateCache(deps, alias, dir, o) {
       if (total > o.maxBytes)
         return null;
     }
-    const head = await deps.run("git", ["rev-parse", "HEAD"], { cwd: dir, env, timeoutMs });
+    timeout = effectiveTimeout(configured, endMs);
+    if (timeout === "expired")
+      return "expired";
+    const head = await deps.run("git", ["rev-parse", "HEAD"], { cwd: dir, env, timeoutMs: timeout });
+    if (isExpired())
+      return "expired";
     if (head.code !== 0)
       return null;
     return head.stdout.trim();
   } catch {
+    if (isExpired())
+      return "expired";
     return null;
   }
 }
@@ -27018,6 +27106,8 @@ var REPAIR_NOTE = "Your previous message was not valid JSON. Respond with ONLY t
 var TIMEOUT_DETAIL = "agent budget exhausted";
 var NO_TOOLS = { allowTools: false, allowFormat: true };
 var WITH_TOOLS = { allowTools: true, allowFormat: false };
+var MARKER_BYTES = 12;
+var OVER_BUDGET_ENVELOPE = '{"error":"tool result exceeded the byte budget","truncated":true}';
 function statusOf2(result) {
   return !result.ok && result.reason === "http-error" ? result.status : void 0;
 }
@@ -27034,30 +27124,20 @@ function tryParseFinal(text) {
   }
   return { ok: true, findings };
 }
-function capOutput(output, maxResultBytes) {
-  if (Buffer.byteLength(output, "utf8") <= maxResultBytes)
+function capToolResult(output, maxBytes) {
+  try {
+    JSON.parse(output);
+  } catch {
+    return OVER_BUDGET_ENVELOPE;
+  }
+  if (Buffer.byteLength(output, "utf8") <= maxBytes)
     return output;
-  let lo = 0;
-  let hi = output.length;
-  while (lo < hi) {
-    const mid = Math.ceil((lo + hi) / 2);
-    if (Buffer.byteLength(output.slice(0, mid), "utf8") <= maxResultBytes)
-      lo = mid;
-    else
-      hi = mid - 1;
-  }
-  let cut = lo;
-  if (cut > 0 && cut < output.length) {
-    const code = output.charCodeAt(cut);
-    if (code >= 56320 && code <= 57343)
-      cut -= 1;
-  }
-  return output.slice(0, cut) + "\n[truncated]";
+  return OVER_BUDGET_ENVELOPE;
 }
 async function runAgent(conv, toolCtx, budget, hooks) {
   const clock = hooks.clock ?? Date.now;
   const start = clock();
-  const deadline = start + budget.maxSeconds * 1e3;
+  const deadline = budget.deadlineMs ?? start + budget.maxSeconds * 1e3;
   const maxCalls = budget.maxCallsPerTurn ?? AGENT_LIMITS.maxCallsPerTurn;
   const maxResultBytes = budget.maxResultBytes ?? AGENT_LIMITS.resultBytes;
   const maxTotalBytes = budget.maxTotalBytes ?? AGENT_LIMITS.totalBytes;
@@ -27072,12 +27152,29 @@ async function runAgent(conv, toolCtx, budget, hooks) {
     hooks.log(`agent done: turns=${turns} calls=${calls} bytes=${bytes} stop=${stop} elapsed=${ms / 1e3}s`);
     return { result, stop, probeAdvance, toolsUnsupported, turns, calls, bytes, elapsedMs: ms };
   };
-  const timeoutFor = (remaining) => Math.min(budget.timeoutSeconds, Math.ceil(remaining / 1e3));
+  const timeoutFor = (remaining) => Math.max(1, Math.min(budget.timeoutSeconds, Math.floor(remaining / 1e3)));
   const timedOut = () => {
     if (deadline - clock() < 1e4) {
       return finish({ ok: false, reason: "timeout", detail: TIMEOUT_DETAIL }, "budget", false);
     }
     return null;
+  };
+  const timeoutLlmResult = () => ({ ok: false, reason: "timeout", detail: TIMEOUT_DETAIL });
+  const timeoutReply = () => ({ ok: false, result: timeoutLlmResult() });
+  const callWithDeadline = (flags, opts, nowMs) => {
+    const ms = deadline - nowMs;
+    if (ms <= 0)
+      return Promise.resolve({ reply: timeoutReply(), raced: true });
+    const inner = hooks.call(conv, flags, opts);
+    inner.then(void 0, () => {
+    });
+    let timer;
+    const timeoutP = new Promise((resolve2) => {
+      timer = setTimeout(() => resolve2({ reply: timeoutReply(), raced: true }), ms);
+    });
+    return Promise.race([inner.then((reply) => ({ reply, raced: false })), timeoutP]).finally(() => {
+      clearTimeout(timer);
+    });
   };
   const appendAssistant = (reply) => {
     turnsArr.push({
@@ -27092,13 +27189,17 @@ async function runAgent(conv, toolCtx, budget, hooks) {
     if (expired)
       return expired;
     const remaining = deadline - clock();
-    const forced = turns >= budget.maxTurns || bytes >= maxTotalBytes;
+    const forced = turns >= budget.maxTurns || bytes >= maxTotalBytes || maxTotalBytes - bytes < MARKER_BYTES;
     const flags = forced ? { ...NO_TOOLS } : { ...WITH_TOOLS };
     if (forced)
       turnsArr.push({ role: "user", text: BUDGET_NOTE });
     const turnStart = clock();
     const turnIndex = turns;
-    const reply = await hooks.call(conv, flags, { timeoutSeconds: timeoutFor(remaining) });
+    const nowMs = deadline - remaining;
+    const first = await callWithDeadline(flags, { timeoutSeconds: timeoutFor(remaining), deadlineMs: deadline }, nowMs);
+    if (first.raced)
+      return finish(timeoutLlmResult(), "budget", false);
+    const reply = first.reply;
     if (!reply.ok) {
       const status = statusOf2(reply.result);
       if (turns === 0 && !forced) {
@@ -27106,7 +27207,11 @@ async function runAgent(conv, toolCtx, budget, hooks) {
           const retryExpired = timedOut();
           if (retryExpired)
             return retryExpired;
-          const retry = await hooks.call(conv, { ...NO_TOOLS }, { timeoutSeconds: timeoutFor(deadline - clock()) });
+          const retryRemaining = deadline - clock();
+          const retried = await callWithDeadline({ ...NO_TOOLS }, { timeoutSeconds: timeoutFor(retryRemaining), deadlineMs: deadline }, deadline - retryRemaining);
+          if (retried.raced)
+            return finish(timeoutLlmResult(), "budget", false);
+          const retry = retried.reply;
           if (!retry.ok) {
             const s2 = statusOf2(retry.result);
             toolsUnsupported = true;
@@ -27123,7 +27228,11 @@ async function runAgent(conv, toolCtx, budget, hooks) {
           const repairExpired = timedOut();
           if (repairExpired)
             return repairExpired;
-          const fixed = await hooks.call(conv, { ...NO_TOOLS }, { timeoutSeconds: timeoutFor(deadline - clock()) });
+          const repairRemaining = deadline - clock();
+          const repaired = await callWithDeadline({ ...NO_TOOLS }, { timeoutSeconds: timeoutFor(repairRemaining), deadlineMs: deadline }, deadline - repairRemaining);
+          if (repaired.raced)
+            return finish(timeoutLlmResult(), "budget", false);
+          const fixed = repaired.reply;
           if (!fixed.ok) {
             toolsUnsupported = true;
             return finish(fixed.result, "error", false);
@@ -27165,7 +27274,11 @@ async function runAgent(conv, toolCtx, budget, hooks) {
       if (repairExpired)
         return repairExpired;
       const repairStart = clock();
-      const fixed = await hooks.call(conv, { ...NO_TOOLS }, { timeoutSeconds: timeoutFor(deadline - clock()) });
+      const repairRemaining = deadline - clock();
+      const repaired = await callWithDeadline({ ...NO_TOOLS }, { timeoutSeconds: timeoutFor(repairRemaining), deadlineMs: deadline }, deadline - repairRemaining);
+      if (repaired.raced)
+        return finish(timeoutLlmResult(), "budget", false);
+      const fixed = repaired.reply;
       if (!fixed.ok)
         return finish(fixed.result, "error", false);
       appendAssistant(fixed);
@@ -27181,21 +27294,41 @@ async function runAgent(conv, toolCtx, budget, hooks) {
     let turnBytes = 0;
     for (let i = 0; i < reply.toolCalls.length; i++) {
       const call = reply.toolCalls[i];
-      let output;
-      let isError;
-      if (i < maxCalls) {
-        const res = await executeTool(call.name, call.args, toolCtx);
-        output = res.output;
-        isError = res.isError;
-        calls += 1;
-      } else {
-        output = `{"error":"too many tool calls in one turn (max ${maxCalls})"}`;
-        isError = true;
+      if (i >= maxCalls) {
+        turnsArr.push({
+          role: "tool",
+          id: call.id,
+          name: call.name,
+          output: `{"error":"too many tool calls in one turn (max ${maxCalls})"}`,
+          isError: true
+        });
+        continue;
       }
-      output = capOutput(output, maxResultBytes);
-      const n = Buffer.byteLength(output, "utf8");
-      bytes += n;
-      turnBytes += n;
+      const remainingBytes = maxTotalBytes - bytes;
+      if (remainingBytes < MARKER_BYTES) {
+        turnsArr.push({
+          role: "tool",
+          id: call.id,
+          name: call.name,
+          output: `{"error":"tool result budget exhausted (max ${maxTotalBytes} bytes)"}`,
+          isError: true
+        });
+        continue;
+      }
+      const effective = Math.min(maxResultBytes, remainingBytes);
+      const res = await executeTool(call.name, call.args, toolCtx, {
+        deadlineMs: Date.now() + Math.max(0, deadline - clock()),
+        maxResultBytes: Math.min(maxResultBytes, remainingBytes)
+      });
+      calls += 1;
+      const output = capToolResult(res.output, effective);
+      const replaced = output !== res.output;
+      const isError = res.isError || replaced;
+      if (!replaced) {
+        const n = Buffer.byteLength(output, "utf8");
+        bytes += n;
+        turnBytes += n;
+      }
       turnsArr.push(isError ? { role: "tool", id: call.id, name: call.name, output, isError: true } : { role: "tool", id: call.id, name: call.name, output });
     }
     hooks.log(`agent turn ${turnIndex}: tools=[${reply.toolCalls.map((t) => t.name).join(",")}] results_bytes=${turnBytes} ms=${clock() - turnStart}`);
@@ -27636,9 +27769,10 @@ async function callWithProbeAgent(provider, model, baseUrl2, key, conv, o, toolC
     maxTurns: o.maxTurns,
     maxSeconds: o.maxSeconds
   };
+  const deadlineMs = Date.now() + o.maxSeconds * 1e3;
   const runStyle = async (style) => {
     const ep = buildEndpointForStyle(provider, model, baseUrl2, key, style, o.prNumber ?? null, o.userBase ?? false);
-    const outcome = await runAgent(conv, toolCtx, { maxTurns: o.maxTurns, maxSeconds: o.maxSeconds, timeoutSeconds: o.timeoutSeconds }, { call: agentCallFor(ep, agentOpts), log: info });
+    const outcome = await runAgent(conv, toolCtx, { maxTurns: o.maxTurns, maxSeconds: o.maxSeconds, timeoutSeconds: o.timeoutSeconds, deadlineMs }, { call: agentCallFor(ep, agentOpts), log: info });
     return { outcome, via: style };
   };
   if (explicitStyle !== void 0 && explicitStyle !== "auto") {
@@ -28556,13 +28690,14 @@ async function slowPath(env, out, deps, pr, fast, promptText, issueBody, skipped
       info(`agent linked repositories: ${linked.join(", ")}`);
     const toolCtx = {
       roots: { self: env.workDir, linked: /* @__PURE__ */ new Map() },
-      ensureLinked: async (alias) => {
+      ensureLinked: async (alias, opts) => {
         if (!linked.some((l) => l.toLowerCase() === alias.toLowerCase()))
           return { error: "repository not accessible: " + alias };
         const r = await ensureLinkedRepo(alias, {
           token: i.githubToken,
           baseDir: join6(process.env.RUNNER_TEMP ?? tmpdir(), "lupa-linked"),
           maxBytes: AGENT_LIMITS.cloneMaxBytes,
+          deadlineMs: opts?.deadlineMs,
           sizeKb: async (a) => {
             const parts = a.split("/");
             if (parts.length !== 2)

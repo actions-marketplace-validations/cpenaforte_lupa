@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, sym
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ensureLinkedRepo, parseLinkedRepos } from "../src/linked-repos.js";
+import { effectiveTimeout, ensureLinkedRepo, parseLinkedRepos } from "../src/linked-repos.js";
 import type { CloneDeps } from "../src/linked-repos.js";
 
 const created: string[] = [];
@@ -421,5 +421,155 @@ describe("ensureLinkedRepo", () => {
     };
     const res = await ensureLinkedRepo("a/b/c", { token: "", baseDir, deps });
     expect(res).toEqual({ dir: join(baseDir, "a__b__c"), sha: "" });
+  });
+});
+
+describe("deadline-aware linked clones (F11)", () => {
+  it("effectiveTimeout clamps to the remaining budget with a floor of 1", () => {
+    const now = 1_000_000;
+    expect(effectiveTimeout(60000, undefined, now)).toBe(60000);
+    expect(effectiveTimeout(60000, now + 5000, now)).toBe(5000);
+    expect(effectiveTimeout(60000, now - 1, now)).toBe("expired");
+    expect(effectiveTimeout(60000, now, now)).toBe("expired");
+    expect(effectiveTimeout(60000, now + 1, now)).toBe(1);
+  });
+
+  it("expired deadline on a missing dir errors without spawning git", async () => {
+    const baseDir = tempRoot();
+    const calls: string[][] = [];
+    const deps: CloneDeps = {
+      run: async (_cmd, args) => {
+        calls.push(args);
+        return { code: 0, stdout: "", stderr: "" };
+      },
+    };
+    const res = await ensureLinkedRepo("a/b", { token: "", baseDir, deps, deadlineMs: Date.now() - 1000 });
+    expect("error" in res ? res.error : "").toContain("deadline exceeded");
+    expect(calls).toEqual([]);
+  });
+
+  it("expired deadline on a plain dir leaves the dir intact (no wipe)", async () => {
+    const baseDir = tempRoot();
+    const dir = join(baseDir, "a__b");
+    // A plain dir (no .git): the non-deadline path would wipe it and reclone.
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "stale.txt"), "stale");
+    const calls: string[][] = [];
+    const deps: CloneDeps = {
+      run: async (_cmd, args) => {
+        calls.push(args);
+        return { code: 0, stdout: "", stderr: "" };
+      },
+    };
+    const res = await ensureLinkedRepo("a/b", { token: "", baseDir, deps, deadlineMs: Date.now() - 1000 });
+    expect("error" in res ? res.error : "").toContain("deadline exceeded");
+    expect(calls).toEqual([]);
+    expect(existsSync(dir)).toBe(true);
+    expect(existsSync(join(dir, "stale.txt"))).toBe(true);
+  });
+
+  it("mid-validation expiry maps to the deadline error without wiping the cache", async () => {
+    const baseDir = tempRoot();
+    const dir = join(baseDir, "a__b");
+    mkdirSync(join(dir, ".git"), { recursive: true });
+    writeFileSync(
+      join(dir, ".lupa-clone.json"),
+      JSON.stringify({ repo: "a/b", branch: "main", sha: "0".repeat(40) }),
+    );
+    const argv: string[][] = [];
+    const deps: CloneDeps = {
+      run: async (_cmd, args) => {
+        argv.push(args);
+        // Sleep past the 100 ms deadline, then return non-zero as a
+        // clamped-timeout kill would. One-sided timing (300 ms sleep vs
+        // 100 ms deadline): entry passes, the post-call check finds expiry.
+        // Without the per-call re-check this reads as reclone-null and wipes
+        // the dir, so the dir-intact assertion is non-vacuous.
+        await new Promise((r) => setTimeout(r, 300));
+        return { code: 1, stdout: "", stderr: "killed" };
+      },
+    };
+    const res = await ensureLinkedRepo("a/b", { token: "", baseDir, deps, deadlineMs: Date.now() + 100 });
+    expect("error" in res ? res.error : "").toContain("deadline exceeded");
+    expect(argv.some((a) => a[0] === "clone")).toBe(false);
+    expect(existsSync(dir)).toBe(true);
+  });
+
+  it("cloneHead expiry removes the just-created dir (fresh residue, not a cache)", async () => {
+    const baseDir = tempRoot();
+    const dir = join(baseDir, "a__b");
+    const argv: string[][] = [];
+    const deps: CloneDeps = {
+      run: async (_cmd, args) => {
+        argv.push(args);
+        if (args[0] === "clone") {
+          // Sleep past the 100 ms deadline, then succeed: the clone lands,
+          // but cloneHead finds the budget exhausted. One-sided timing.
+          await new Promise((r) => setTimeout(r, 300));
+          mkdirSync(args[args.length - 1]!, { recursive: true });
+          return { code: 0, stdout: "", stderr: "" };
+        }
+        return { code: 0, stdout: "", stderr: "" };
+      },
+    };
+    const res = await ensureLinkedRepo("a/b", { token: "", baseDir, deps, deadlineMs: Date.now() + 100 });
+    expect("error" in res ? res.error : "").toContain("deadline exceeded");
+    expect(argv.some((a) => a[0] === "clone")).toBe(true);
+    expect(existsSync(dir)).toBe(false);
+  });
+
+  it("cloneHead final-call expiry aborts with the deadline error and removes the fresh dir", async () => {
+    const baseDir = tempRoot();
+    const dir = join(baseDir, "a__b");
+    const deps: CloneDeps = {
+      run: async (_cmd, args) => {
+        if (args[0] === "clone") {
+          mkdirSync(args[args.length - 1]!, { recursive: true });
+          return { code: 0, stdout: "", stderr: "" };
+        }
+        if (args[1] === "--abbrev-ref") return { code: 0, stdout: "main\n", stderr: "" };
+        // The final rev-parse HEAD sleeps past the 100 ms deadline, then
+        // returns non-zero as a clamped-timeout kill would. One-sided timing:
+        // without the post-call re-check this falls through to a success with
+        // an empty sha (plus a marker recording sha ""), so both assertions
+        // below are non-vacuous.
+        await new Promise((r) => setTimeout(r, 300));
+        return { code: 1, stdout: "", stderr: "killed" };
+      },
+    };
+    const res = await ensureLinkedRepo("a/b", { token: "", baseDir, deps, deadlineMs: Date.now() + 100 });
+    expect("error" in res ? res.error : "").toContain("deadline exceeded");
+    expect(existsSync(dir)).toBe(false);
+  });
+
+  it("clone killed by the deadline clamp maps to the deadline error with fresh-dir cleanup", async () => {
+    const baseDir = tempRoot();
+    const dir = join(baseDir, "a__b");
+    const deps: CloneDeps = {
+      run: async (_cmd, args) => {
+        // Sleep past the 100 ms deadline, then fail as a clamped-timeout
+        // kill would. One-sided timing: entry and the pre-clone check pass,
+        // the failure lands with the budget exhausted.
+        await new Promise((r) => setTimeout(r, 300));
+        if (args[0] === "clone") mkdirSync(args[args.length - 1]!, { recursive: true });
+        return { code: 1, stdout: "", stderr: "killed" };
+      },
+    };
+    const res = await ensureLinkedRepo("a/b", { token: "", baseDir, deps, deadlineMs: Date.now() + 100 });
+    expect("error" in res ? res.error : "").toContain("deadline exceeded");
+    expect(existsSync(dir)).toBe(false);
+  });
+
+  it("failed clone with budget remaining keeps the generic error", async () => {
+    const baseDir = tempRoot();
+    const dir = join(baseDir, "a__b");
+    const deps: CloneDeps = {
+      run: async () => ({ code: 128, stdout: "", stderr: "fatal: repository not found" }),
+    };
+    const res = await ensureLinkedRepo("a/b", { token: "", baseDir, deps, deadlineMs: Date.now() + 60000 });
+    const error = "error" in res ? res.error : "";
+    expect(error).toContain("not accessible");
+    expect(error).not.toContain("deadline exceeded");
+    expect(existsSync(dir)).toBe(false);
   });
 });
