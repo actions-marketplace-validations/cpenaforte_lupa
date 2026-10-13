@@ -2,13 +2,13 @@ import * as fs from "node:fs";
 import { describe, expect, it } from "vitest";
 
 describe("workflow templates", () => {
-  it("both templates pin the v0.8.0 release SHA", () => {
+  it("both templates pin the v0.9.0 release SHA", () => {
     for (const file of [
       "docs/workflow-template.yml",
       "docs/workflow-template-privileged.yml",
     ]) {
       expect(fs.readFileSync(file, "utf8")).toContain(
-        "uses: cpenaforte/lupa@22d1ee9530829ef158650d6c3eb599867ef2cf27",
+        "uses: cpenaforte/lupa@a69c377a7f34d35274456512d47e5cbd223a141e",
       );
     }
   });
