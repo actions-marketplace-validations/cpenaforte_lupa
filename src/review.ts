@@ -2,7 +2,7 @@ import type { Finding } from "./fastpath.js";
 import { MSG_CAP, RULE_CAP, capText } from "./fastpath.js";
 import type { FailLevel } from "./inputs.js";
 import type { DedupVerdicts } from "./llm.js";
-import type { HunkLine, ParsedHunk } from "./diff.js";
+import type { FileDiff, HunkLine, ParsedHunk } from "./diff.js";
 import { redact } from "./llm.js";
 
 export interface InlineComment {
@@ -14,6 +14,12 @@ export interface InlineComment {
   /** Reserved for v2 multi-line ranges. Never set in v1 (see mapToComments). */
   start_side?: "LEFT" | "RIGHT";
   body: string;
+  /**
+   * Finding rule, set by mapToComments for fold keys. INTERNAL: main.ts strips
+   * it when building payload.comments, so posted payloads keep today's shape.
+   * Absent (e.g. hand-built comments) means assume blocking in fold marking.
+   */
+  rule?: string;
 }
 
 export interface ReviewPayload {
@@ -64,10 +70,12 @@ function provenanceTrailer(f: Finding): string {
 /**
  * Inline body. Only RIGHT-side hits get a ```suggestion fence (a suggestion replaces the
  * commented line, which only exists on the new side). LEFT hits show the suggestion as
- * plain text instead.
+ * plain text instead. A reopened finding renders `**reopened**` between the severity
+ * and the rule (`**high** **reopened** [rule] ...`) — the thread-fetch rule parser
+ * tolerates this marker, so a re-posted thread stays parseable.
  */
-function formatBody(f: Finding, side: "LEFT" | "RIGHT"): string {
-  let body = `**${f.severity}** [${f.rule}] ${f.message}`;
+export function formatBody(f: Finding, side: "LEFT" | "RIGHT", reopened = false): string {
+  let body = reopened ? `**${f.severity}** **reopened** [${f.rule}] ${f.message}` : `**${f.severity}** [${f.rule}] ${f.message}`;
   if (hasSuggestion(f)) {
     if (side === "RIGHT") {
       const fence = fenceFor(f.suggestion);
@@ -80,20 +88,10 @@ function formatBody(f: Finding, side: "LEFT" | "RIGHT"): string {
 }
 
 /**
- * Maps findings onto commentable diff lines. A finding becomes an inline comment only when
- * its file and line are both present in the hunks; everything else (repo-level, line-less,
- * off-diff) goes to the general list, which the caller folds into the review body.
- *
- * Same line number on both sides: RIGHT wins deterministically. Findings reference new-file
- * line numbers, and a LEFT hit is used only when no RIGHT line carries that number.
- *
- * v1 never emits multi-line ranges: start_line/start_side stay unset, so a suggestion
- * replaces only the single flagged line.
+ * Hunk index shared by display (mapToComments) and gating (partitionGate).
+ * First-write-wins per file+side+line, matching the original inline logic.
  */
-export function mapToComments(
-  findings: Finding[],
-  hunks: ParsedHunk[],
-): { inline: InlineComment[]; general: Finding[] } {
+export function indexHunks(hunks: ParsedHunk[]): Map<string, Map<string, HunkLine>> {
   const index = new Map<string, Map<string, HunkLine>>();
   for (const h of hunks) {
     let byKey = index.get(h.file);
@@ -106,24 +104,165 @@ export function mapToComments(
       if (!byKey.has(k)) byKey.set(k, l);
     }
   }
+  return index;
+}
 
+/**
+ * Display hit: RIGHT wins deterministically (findings reference new-file line
+ * numbers); LEFT is the fallback. Undefined for fileless findings and lines
+ * with no hunk entry.
+ */
+function hunkHit(index: Map<string, Map<string, HunkLine>>, file: string, line: number): HunkLine | undefined {
+  const byKey = file === "" ? undefined : index.get(file);
+  if (byKey === undefined) return undefined;
+  return byKey.get(keyOf("RIGHT", line)) ?? byKey.get(keyOf("LEFT", line));
+}
+
+/** Stable identity for thread matching: rule, file, line joined by NUL. */
+export function reopenedKey(f: Finding): string {
+  return `${f.rule}\0${f.file}\0${String(f.line)}`;
+}
+
+/**
+ * Normalizes a login across both API conventions: strips one trailing `[bot]`.
+ * Compared on both sides, so `x[bot]` and `x` are identical.
+ */
+export function normalizeBot(login: string): string {
+  return login.endsWith("[bot]") ? login.slice(0, -"[bot]".length) : login;
+}
+
+/**
+ * Pure reopen match over the MERGED set, in ANY position: a resolved thread whose
+ * line drifted to context/LEFT must still re-block while the issue persists.
+ * Keeps a thread iff it is resolved, its author normalizes to the review actor
+ * (null authors never match), and its rule INTERSECTS the finding's rule
+ * (`+`-split on both sides — the posted thread rule is the joined survivor while
+ * the next run may see unmerged members). File is exact; the thread line is
+ * `line ?? originalLine` (both absent → no match). Returns the reopened keys.
+ */
+export function resolveReopened(
+  findings: Finding[],
+  threads: import("./github.js").ReviewThread[],
+  selfLogin: string,
+): Set<string> {
+  const self = normalizeBot(selfLogin);
+  const kept = threads.filter(
+    (t) =>
+      t.isResolved &&
+      t.rule !== null &&
+      t.authorLogin !== null &&
+      normalizeBot(t.authorLogin) === self &&
+      (t.line ?? t.originalLine ?? null) !== null,
+  );
+  const out = new Set<string>();
+  for (const f of findings) {
+    if (typeof f.line !== "number") continue;
+    const rules = new Set(f.rule.split("+"));
+    for (const t of kept) {
+      if (t.path !== f.file) continue;
+      if ((t.line ?? t.originalLine) !== f.line) continue;
+      const threadRules = (t.rule as string).split("+");
+      if (threadRules.some((r) => rules.has(r))) {
+        out.add(reopenedKey(f));
+        break;
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * Maps findings onto commentable diff lines. A finding becomes an inline comment only when
+ * its file and line are both present in the hunks; everything else (repo-level, line-less,
+ * off-diff) goes to the general list, which the caller folds into the review body.
+ *
+ * Same line number on both sides: RIGHT wins deterministically. Findings reference new-file
+ * line numbers, and a LEFT hit is used only when no RIGHT line carries that number.
+ *
+ * v1 never emits multi-line ranges: start_line/start_side stay unset, so a suggestion
+ * replaces only the single flagged line.
+ *
+ * Each inline comment carries the finding's rule for fold keys (INTERNAL: stripped
+ * before posting, so payload shapes are unchanged). Items whose key is in
+ * `reopened` render the `**reopened**` marker via formatBody.
+ */
+export function mapToComments(
+  findings: Finding[],
+  hunks: ParsedHunk[],
+  reopened?: ReadonlySet<string>,
+): { inline: InlineComment[]; general: Finding[] } {
+  const index = indexHunks(hunks);
   const inline: InlineComment[] = [];
   const general: Finding[] = [];
   for (const f of findings) {
-    const byKey = f.file === "" ? undefined : index.get(f.file);
-    if (byKey === undefined || !isValidLine(f.line)) {
+    if (!isValidLine(f.line)) {
       general.push(f);
       continue;
     }
     const line = f.line;
-    const hit = byKey.get(keyOf("RIGHT", line)) ?? byKey.get(keyOf("LEFT", line));
+    const hit = hunkHit(index, f.file, line);
     if (hit === undefined) {
       general.push(f);
       continue;
     }
-    inline.push({ path: f.file, line, side: hit.side, body: formatBody(f, hit.side) });
+    const isReopened = reopened?.has(reopenedKey(f)) === true;
+    inline.push({ path: f.file, line, side: hit.side, body: formatBody(f, hit.side, isReopened), rule: f.rule });
   }
   return { inline, general };
+}
+
+/**
+ * Gate partition over the merged set (input order preserved in both outputs).
+ * Introduced = TOUCHED lines only: a lined finding whose file+line hits a
+ * RIGHT-side hunk line with kind "add" (context and LEFT/deletion hits keep
+ * their inline display but never gate), plus lineless findings whose file is
+ * present in the diff (FileDiff entry not marked deleted, with empty hunks
+ * text or an add line for the file — added-empty, mode-only, rename and
+ * added-binary count; deleted and pure-removal files do not; "" never
+ * matches). Everything else is general. Placement ≠ blocking: the display
+ * split (mapToComments) is untouched.
+ */
+export function partitionGate(
+  findings: Finding[],
+  hunks: ParsedHunk[],
+  files: FileDiff[],
+): { introduced: Finding[]; general: Finding[] } {
+  const index = indexHunks(hunks);
+  const addFiles = new Set<string>();
+  for (const h of hunks) {
+    for (const l of h.lines) {
+      if (l.kind === "add") {
+        addFiles.add(h.file);
+        break;
+      }
+    }
+  }
+  const present = new Map<string, FileDiff>();
+  for (const f of files) {
+    if (!present.has(f.file)) present.set(f.file, f);
+  }
+  const introduced: Finding[] = [];
+  const general: Finding[] = [];
+  for (const f of findings) {
+    if (isValidLine(f.line)) {
+      const hit = hunkHit(index, f.file, f.line);
+      if (hit !== undefined && hit.side === "RIGHT" && hit.kind === "add") introduced.push(f);
+      else general.push(f);
+      continue;
+    }
+    if (f.file === "") {
+      general.push(f);
+      continue;
+    }
+    const entry = present.get(f.file);
+    if (entry === undefined || entry.deleted === true) {
+      general.push(f);
+      continue;
+    }
+    if (entry.hunks === "" || addFiles.has(f.file)) introduced.push(f);
+    else general.push(f);
+  }
+  return { introduced, general };
 }
 
 /** `high` requests changes only on high-severity evidence; `none` and `warning` never do. */
@@ -265,16 +404,34 @@ export function buildFallbackReport(
 /**
  * Review body: summary plus any findings that could not be placed inline. Suggestions are
  * rendered as plain text here (never as a fence). Never empty.
+ *
+ * Blocking display: every body item in `marks.blocking` carries a marker after the
+ * severity — `**reopened**` when also in `marks.reopened`, else `**blocking**`
+ * (reachable only by lineless-in-diff findings; lined introduced items are inline,
+ * never in the body). When at least one body item is outside the blocking set, a
+ * header note precedes the findings heading (omitted when zero).
  */
-export function buildBody(general: Finding[], summary: string): string {
+export function buildBody(
+  general: Finding[],
+  summary: string,
+  marks?: { reopened?: ReadonlySet<string>; blocking?: ReadonlySet<string> },
+): string {
   const head = summary.trim() === "" ? FALLBACK_SUMMARY : summary.trim();
   if (general.length === 0) return head;
+  const reopened = marks?.reopened;
+  const blocking = marks?.blocking;
   const items = general.map((f) => {
-    let item = `- **${f.severity}** ${locate(f)} [${f.rule}] ${f.message}`;
+    const key = reopenedKey(f);
+    const marker =
+      reopened?.has(key) === true ? " **reopened**" : blocking?.has(key) === true ? " **blocking**" : "";
+    let item = `- **${f.severity}**${marker} ${locate(f)} [${f.rule}] ${f.message}`;
     if (hasSuggestion(f)) item += `\n  Suggested: ${f.suggestion.replace(/\n/g, "\n  ")}`;
     return item + provenanceTrailer(f).replace(/\n/g, "\n  ");
   });
-  return `${head}\n\n**Findings not placed inline:**\n${items.join("\n")}`;
+  const outside = general.filter((f) => blocking?.has(reopenedKey(f)) !== true).length;
+  const list = `**Findings not placed inline:**\n${items.join("\n")}`;
+  if (outside === 0) return `${head}\n\n${list}`;
+  return `${head}\n\n**Note:** ${outside} finding(s) below are outside the PR diff and do not block.\n\n${list}`;
 }
 
 // ---------------------------------------------------------------------------

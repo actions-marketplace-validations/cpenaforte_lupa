@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { buildBody, buildFallbackReport, capBody, eventFor, exitFor, isTruncNoteLine, mapToComments, mergeDuplicates, omissionMarkerFor, prioritizeFindings, redactFindings, truncNoteFor } from "../src/review.js";
-import { parseHunks } from "../src/diff.js";
+import { buildBody, buildFallbackReport, capBody, eventFor, exitFor, formatBody, indexHunks, isTruncNoteLine, mapToComments, mergeDuplicates, normalizeBot, omissionMarkerFor, partitionGate, prioritizeFindings, redactFindings, reopenedKey, resolveReopened, truncNoteFor } from "../src/review.js";
+import { parseHunks, type FileDiff } from "../src/diff.js";
 import type { DedupVerdicts } from "../src/llm.js";
 import type { Finding } from "../src/fastpath.js";
 
@@ -197,6 +197,132 @@ describe("mapToComments", () => {
   });
 });
 
+describe("indexHunks", () => {
+  it("indexes RIGHT and LEFT lines with first-write-wins", () => {
+    const hunks = parseHunks([{ file: "a.ts", hunks: "@@ -3,1 +3,1 @@\n-old\n+new\n" }]);
+    const index = indexHunks(hunks);
+    expect(index.get("a.ts")?.get("LEFT:3")).toEqual({ side: "LEFT", line: 3, kind: "del" });
+    expect(index.get("a.ts")?.get("RIGHT:3")).toEqual({ side: "RIGHT", line: 3, kind: "add" });
+    expect(index.get("missing.ts")).toBeUndefined();
+  });
+
+  it("parity with mapToComments placement: RIGHT-wins, LEFT-fallback, fileless/lineless/off-diff go general", () => {
+    const hunks = parseHunks([
+      { file: "a.ts", hunks: "@@ -3,1 +3,1 @@\n-old\n+new\n@@ -10,0 +4,1 @@\n+d\n" },
+      { file: "d.ts", hunks: "@@ -3,1 +3,0 @@\n-gone\n" },
+    ]);
+    const findings: Finding[] = [
+      { severity: "info", file: "a.ts", line: 3, rule: "r", message: "both-sides" },
+      { severity: "info", file: "a.ts", line: 4, rule: "r", message: "added" },
+      { severity: "info", file: "d.ts", line: 3, rule: "r", message: "left-only" },
+      { severity: "info", file: "a.ts", line: 99, rule: "r", message: "off-diff" },
+      { severity: "info", file: "", rule: "r", message: "repo" },
+      { severity: "info", file: "a.ts", rule: "r", message: "no-line" },
+    ];
+    const r = mapToComments(findings, hunks);
+    expect(r.inline.map((c) => c.side)).toEqual(["RIGHT", "RIGHT", "LEFT"]);
+    expect(r.inline.map((c) => c.line)).toEqual([3, 4, 3]);
+    expect(r.general.map((f) => f.message)).toEqual(["off-diff", "repo", "no-line"]);
+  });
+});
+
+describe("reopenedKey", () => {
+  it("pins the rule-file-line shape joined by NUL", () => {
+    expect(
+      reopenedKey({ severity: "high", file: "a.ts", line: 2, rule: "r", message: "m" }),
+    ).toBe("r\0a.ts\0" + "2");
+  });
+
+  it("renders a missing line as undefined", () => {
+    expect(reopenedKey({ severity: "info", file: "", rule: "r", message: "m" })).toBe("r\0\0undefined");
+  });
+});
+
+describe("partitionGate", () => {
+  const F = (file: string, line: number | undefined, rule = "r"): Finding => ({
+    severity: "warning",
+    file,
+    ...(line !== undefined ? { line } : {}),
+    rule,
+    message: `${rule}@${file}:${line}`,
+  });
+
+  function filesFor(): FileDiff[] {
+    return [
+      { file: "a.ts", hunks: "@@ -1,1 +1,2 @@\n keep\n+new\n", truncated: false },
+      { file: "d.ts", hunks: "@@ -3,1 +3,0 @@\n-gone\n", truncated: false },
+      { file: "c.ts", hunks: "@@ -1,1 +1,1 @@\n same\n", truncated: false },
+      { file: "new.bin", hunks: "", truncated: false, binary: true },
+      { file: "gone.ts", hunks: "@@ -1,1 +0,0 @@\n-x\n", truncated: false, deleted: true },
+    ];
+  }
+
+  function hunksFor(): ReturnType<typeof parseHunks> {
+    return parseHunks(filesFor().map(({ file, hunks }) => ({ file, hunks })));
+  }
+
+  it("takes add-line findings, rejects ctx-line and LEFT-only findings", () => {
+    const files = filesFor();
+    const hunks = hunksFor();
+    expect(partitionGate([F("a.ts", 2)], hunks, files).introduced).toHaveLength(1);
+    expect(partitionGate([F("a.ts", 1)], hunks, files).introduced).toEqual([]);
+    expect(partitionGate([F("a.ts", 1)], hunks, files).general).toHaveLength(1);
+    expect(partitionGate([F("d.ts", 3)], hunks, files).introduced).toEqual([]);
+    expect(partitionGate([F("d.ts", 3)], hunks, files).general).toHaveLength(1);
+    expect(partitionGate([F("a.ts", 99)], hunks, files).introduced).toEqual([]);
+  });
+
+  it("ctx-line and LEFT-only findings stay display-inline while out of the gate", () => {
+    const hunks = hunksFor();
+    expect(mapToComments([F("a.ts", 1)], hunks).inline).toHaveLength(1);
+    const left = mapToComments([F("d.ts", 3)], hunks);
+    expect(left.inline).toHaveLength(1);
+    expect(left.inline[0]!.side).toBe("LEFT");
+  });
+
+  it("takes lineless findings on present files with hunks or add lines", () => {
+    const files = filesFor();
+    const hunks = hunksFor();
+    // a.ts has hunks text with an add line.
+    expect(partitionGate([F("a.ts", undefined)], hunks, files).introduced).toHaveLength(1);
+    // new.bin is hunks-empty (added-binary) but present: counts.
+    expect(partitionGate([F("new.bin", undefined)], hunks, files).introduced).toHaveLength(1);
+  });
+
+  it("rejects lineless findings on deleted and pure-removal files", () => {
+    const files = filesFor();
+    const hunks = hunksFor();
+    expect(partitionGate([F("gone.ts", undefined)], hunks, files).introduced).toEqual([]);
+    expect(partitionGate([F("d.ts", undefined)], hunks, files).introduced).toEqual([]);
+  });
+
+  it("rejects lineless findings with empty or absent files", () => {
+    const files = filesFor();
+    const hunks = hunksFor();
+    expect(partitionGate([F("", undefined)], hunks, files).introduced).toEqual([]);
+    expect(partitionGate([F("absent.ts", undefined)], hunks, files).introduced).toEqual([]);
+  });
+
+  it("treats a null line like a missing line (same predicate as mapToComments)", () => {
+    const files = filesFor();
+    const hunks = hunksFor();
+    const nulled = { ...F("a.ts", undefined), line: null } as unknown as Finding;
+    expect(mapToComments([nulled], hunks).inline).toEqual([]);
+    expect(partitionGate([nulled], hunks, files).introduced).toHaveLength(1);
+    const nulledAbsent = { ...F("absent.ts", undefined), line: null } as unknown as Finding;
+    expect(partitionGate([nulledAbsent], hunks, files).introduced).toEqual([]);
+  });
+
+  it("preserves input order in both partitions", () => {
+    const files = filesFor();
+    const hunks = hunksFor();
+    const findings = [F("a.ts", 1, "ctx"), F("a.ts", 2, "add"), F("absent.ts", undefined, "abs"), F("new.bin", undefined, "bin")];
+    const { introduced, general } = partitionGate(findings, hunks, files);
+    expect(introduced.map((f) => f.rule)).toEqual(["add", "bin"]);
+    expect(general.map((f) => f.rule)).toEqual(["ctx", "abs"]);
+  });
+});
+
 describe("parseHunks", () => {
   it("assigns side per line and ignores the no-newline marker", () => {
     const h = parseHunks([{ file: "b.ts", hunks: "@@ -1,2 +1,2 @@\n ctx\n-old\n+new\n\\ No newline at end of file\n" }]);
@@ -243,9 +369,9 @@ describe("buildBody", () => {
 
   it("appends general findings to the summary with file:line locators", () => {
     const body = buildBody([{ severity: "warning", file: "a.ts", line: 99, rule: "r", message: "off diff" }], "Summary");
-    expect(body).toContain("Summary");
-    expect(body).toContain("off diff");
-    expect(body).toContain("a.ts:99");
+    expect(body).toBe(
+      "Summary\n\n**Note:** 1 finding(s) below are outside the PR diff and do not block.\n\n**Findings not placed inline:**\n- **warning** a.ts:99 [r] off diff",
+    );
   });
 
   it("locator: file without line, and (repository) for repo-level", () => {
@@ -256,8 +382,52 @@ describe("buildBody", () => {
       ],
       "S",
     );
-    expect(body).toContain("b.ts [r] no line");
-    expect(body).toContain("(repository) [r] repo wide");
+    expect(body).toBe(
+      "S\n\n**Note:** 2 finding(s) below are outside the PR diff and do not block.\n\n**Findings not placed inline:**\n- **info** b.ts [r] no line\n- **info** (repository) [r] repo wide",
+    );
+  });
+
+  it("note order is head, NOTE, heading, then items", () => {
+    const body = buildBody(
+      [
+        { severity: "warning", file: "a.ts", line: 99, rule: "r", message: "first" },
+        { severity: "info", file: "", rule: "q", message: "second" },
+      ],
+      "Head",
+    );
+    const lines = body.split("\n");
+    expect(lines[0]).toBe("Head");
+    expect(lines[2]).toBe("**Note:** 2 finding(s) below are outside the PR diff and do not block.");
+    expect(lines[4]).toBe("**Findings not placed inline:**");
+    expect(lines[5]).toContain("first");
+    expect(lines[6]).toContain("second");
+  });
+
+  it("the note counts only items outside the blocking set", () => {
+    const blockingItem: Finding = { severity: "info", file: "touched.bin", rule: "binary-note", message: "bin" };
+    const offItem: Finding = { severity: "warning", file: "a.ts", line: 99, rule: "r", message: "off diff" };
+    const blocking = new Set([reopenedKey(blockingItem)]);
+    const body = buildBody([blockingItem, offItem], "Head", { blocking });
+    expect(body).toContain("**Note:** 1 finding(s) below are outside the PR diff and do not block.");
+    expect(body).toContain("- **info** **blocking** touched.bin [binary-note] bin");
+    expect(body).toContain("- **warning** a.ts:99 [r] off diff");
+  });
+
+  it("omits the note when every body item blocks", () => {
+    const item: Finding = { severity: "info", file: "touched.bin", rule: "binary-note", message: "bin" };
+    const body = buildBody([item], "Head", { blocking: new Set([reopenedKey(item)]) });
+    expect(body).toBe("Head\n\n**Findings not placed inline:**\n- **info** **blocking** touched.bin [binary-note] bin");
+    expect(body).not.toContain("outside the PR diff");
+  });
+
+  it("**reopened** wins over **blocking** on the same item", () => {
+    const item: Finding = { severity: "high", file: "a.ts", line: 99, rule: "r", message: "drifted" };
+    const key = reopenedKey(item);
+    const body = buildBody([item], "Head", { reopened: new Set([key]), blocking: new Set([key]) });
+    expect(body).toContain("- **high** **reopened** a.ts:99 [r] drifted");
+    expect(body).not.toContain("**blocking**");
+    // Reopened items re-block, so nothing is outside the blocking set: no note.
+    expect(body).not.toContain("outside the PR diff");
   });
 });
 
@@ -854,5 +1024,114 @@ describe("finding provenance rendering (Q04)", () => {
     expect(exitFor("high", provenanced)).toBe(1);
     expect(exitFor("warning", provenanced)).toBe(2);
     expect(exitFor("none", provenanced)).toBe(0);
+  });
+});
+
+describe("normalizeBot", () => {
+  it("strips one trailing [bot] on either side", () => {
+    expect(normalizeBot("lupa[bot]")).toBe("lupa");
+    expect(normalizeBot("lupa")).toBe("lupa");
+    expect(normalizeBot("github-actions[bot]")).toBe("github-actions");
+  });
+
+  it("leaves plain logins unchanged", () => {
+    expect(normalizeBot("octocat")).toBe("octocat");
+    expect(normalizeBot("")).toBe("");
+  });
+});
+
+describe("resolveReopened", () => {
+  const F = (rule: string, file: string, line?: number): Finding => ({
+    severity: "high",
+    file,
+    ...(line !== undefined ? { line } : {}),
+    rule,
+    message: "m",
+  });
+  const T = (o: Partial<import("../src/github.js").ReviewThread> & { rule?: string | null }): import("../src/github.js").ReviewThread => ({
+    authorLogin: "self",
+    isResolved: true,
+    path: "a.ts",
+    line: 10,
+    rule: "r",
+    ...o,
+  });
+
+  it("matches a resolved own thread with rule intersection and exact file+line", () => {
+    const out = resolveReopened([F("r", "a.ts", 10)], [T({})], "self");
+    expect(out.has(reopenedKey(F("r", "a.ts", 10)))).toBe(true);
+  });
+
+  it("matches on originalLine when line is absent", () => {
+    const out = resolveReopened([F("r", "a.ts", 10)], [T({ line: null, originalLine: 10 })], "self");
+    expect(out).toHaveLength(1);
+  });
+
+  it("matches a joined-thread rule against unmerged members", () => {
+    const out = resolveReopened([F("a", "a.ts", 10), F("b", "a.ts", 10)], [T({ rule: "a+b" })], "self");
+    expect(out.has(reopenedKey(F("a", "a.ts", 10)))).toBe(true);
+    expect(out.has(reopenedKey(F("b", "a.ts", 10)))).toBe(true);
+  });
+
+  it("matches a drifted-line member (context/LEFT position still re-blocks)", () => {
+    const out = resolveReopened([F("r", "a.ts", 3)], [T({ path: "a.ts", line: 3 })], "self");
+    expect(out.has(reopenedKey(F("r", "a.ts", 3)))).toBe(true);
+  });
+
+  it("matches across [bot] conventions on either side", () => {
+    expect(resolveReopened([F("r", "a.ts", 10)], [T({ authorLogin: "self[bot]" })], "self")).toHaveLength(1);
+    expect(resolveReopened([F("r", "a.ts", 10)], [T({ authorLogin: "self" })], "self[bot]")).toHaveLength(1);
+  });
+
+  it("rejects unresolved threads", () => {
+    expect(resolveReopened([F("r", "a.ts", 10)], [T({ isResolved: false })], "self")).toHaveLength(0);
+  });
+
+  it("rejects foreign and null authors", () => {
+    expect(resolveReopened([F("r", "a.ts", 10)], [T({ authorLogin: "other" })], "self")).toHaveLength(0);
+    expect(resolveReopened([F("r", "a.ts", 10)], [T({ authorLogin: null })], "self")).toHaveLength(0);
+  });
+
+  it("rejects null rules", () => {
+    expect(resolveReopened([F("r", "a.ts", 10)], [T({ rule: null })], "self")).toHaveLength(0);
+  });
+
+  it("rejects rules containing ] (the parser never yields them)", () => {
+    expect(resolveReopened([F("r]junk", "a.ts", 10)], [T({ rule: "r" })], "self")).toHaveLength(0);
+  });
+
+  it("rejects line mismatches and threads with both lines absent", () => {
+    expect(resolveReopened([F("r", "a.ts", 11)], [T({})], "self")).toHaveLength(0);
+    expect(resolveReopened([F("r", "a.ts", 10)], [T({ line: null, originalLine: null })], "self")).toHaveLength(0);
+    expect(resolveReopened([F("r", "a.ts", 10)], [T({ line: undefined, originalLine: undefined })], "self")).toHaveLength(0);
+  });
+
+  it("rejects file mismatches", () => {
+    expect(resolveReopened([F("r", "b.ts", 10)], [T({})], "self")).toHaveLength(0);
+  });
+});
+
+describe("formatBody reopened marker", () => {
+  const F = (): Finding => ({ severity: "high", file: "a.ts", line: 10, rule: "r", message: "m" });
+
+  it("renders **reopened** between severity and rule when true", () => {
+    expect(formatBody(F(), "RIGHT", true)).toContain("**high** **reopened** [r]");
+  });
+
+  it("renders today's shape when false or omitted", () => {
+    expect(formatBody(F(), "RIGHT", false)).toContain("**high** [r]");
+    expect(formatBody(F(), "RIGHT", false)).not.toContain("reopened");
+    expect(formatBody(F(), "RIGHT")).toContain("**high** [r]");
+  });
+
+  it("marks inline items whose key is reopened via mapToComments", () => {
+    const findings: Finding[] = [F()];
+    const hunks = parseHunks([{ file: "a.ts", hunks: "@@ -9,2 +9,2 @@\n ctx\n-old\n+new\n" }]);
+    const key = reopenedKey(findings[0]!);
+    const marked = mapToComments(findings, hunks, new Set([key]));
+    expect(marked.inline).toHaveLength(1);
+    expect(marked.inline[0]!.body).toContain("**reopened**");
+    const plain = mapToComments(findings, hunks);
+    expect(plain.inline[0]!.body).not.toContain("reopened");
   });
 });

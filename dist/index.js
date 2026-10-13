@@ -27572,8 +27572,8 @@ function provenanceTrailer(f) {
 
 \`${parts.join(" \xB7 ")}\``;
 }
-function formatBody(f, side) {
-  let body = `**${f.severity}** [${f.rule}] ${f.message}`;
+function formatBody(f, side, reopened = false) {
+  let body = reopened ? `**${f.severity}** **reopened** [${f.rule}] ${f.message}` : `**${f.severity}** [${f.rule}] ${f.message}`;
   if (hasSuggestion(f)) {
     if (side === "RIGHT") {
       const fence = fenceFor(f.suggestion);
@@ -27590,7 +27590,7 @@ Suggested: ${f.suggestion.replace(/\n/g, "\n  ")}`;
   }
   return body + provenanceTrailer(f);
 }
-function mapToComments(findings, hunks) {
+function indexHunks(hunks) {
   const index = /* @__PURE__ */ new Map();
   for (const h of hunks) {
     let byKey = index.get(h.file);
@@ -27604,23 +27604,104 @@ function mapToComments(findings, hunks) {
         byKey.set(k, l);
     }
   }
+  return index;
+}
+function hunkHit(index, file, line) {
+  const byKey = file === "" ? void 0 : index.get(file);
+  if (byKey === void 0)
+    return void 0;
+  return byKey.get(keyOf("RIGHT", line)) ?? byKey.get(keyOf("LEFT", line));
+}
+function reopenedKey(f) {
+  return `${f.rule}\0${f.file}\0${String(f.line)}`;
+}
+function normalizeBot(login) {
+  return login.endsWith("[bot]") ? login.slice(0, -"[bot]".length) : login;
+}
+function resolveReopened(findings, threads, selfLogin) {
+  const self = normalizeBot(selfLogin);
+  const kept = threads.filter((t) => t.isResolved && t.rule !== null && t.authorLogin !== null && normalizeBot(t.authorLogin) === self && (t.line ?? t.originalLine ?? null) !== null);
+  const out = /* @__PURE__ */ new Set();
+  for (const f of findings) {
+    if (typeof f.line !== "number")
+      continue;
+    const rules = new Set(f.rule.split("+"));
+    for (const t of kept) {
+      if (t.path !== f.file)
+        continue;
+      if ((t.line ?? t.originalLine) !== f.line)
+        continue;
+      const threadRules = t.rule.split("+");
+      if (threadRules.some((r) => rules.has(r))) {
+        out.add(reopenedKey(f));
+        break;
+      }
+    }
+  }
+  return out;
+}
+function mapToComments(findings, hunks, reopened) {
+  const index = indexHunks(hunks);
   const inline = [];
   const general = [];
   for (const f of findings) {
-    const byKey = f.file === "" ? void 0 : index.get(f.file);
-    if (byKey === void 0 || !isValidLine(f.line)) {
+    if (!isValidLine(f.line)) {
       general.push(f);
       continue;
     }
     const line = f.line;
-    const hit = byKey.get(keyOf("RIGHT", line)) ?? byKey.get(keyOf("LEFT", line));
+    const hit = hunkHit(index, f.file, line);
     if (hit === void 0) {
       general.push(f);
       continue;
     }
-    inline.push({ path: f.file, line, side: hit.side, body: formatBody(f, hit.side) });
+    const isReopened = reopened?.has(reopenedKey(f)) === true;
+    inline.push({ path: f.file, line, side: hit.side, body: formatBody(f, hit.side, isReopened), rule: f.rule });
   }
   return { inline, general };
+}
+function partitionGate(findings, hunks, files) {
+  const index = indexHunks(hunks);
+  const addFiles = /* @__PURE__ */ new Set();
+  for (const h of hunks) {
+    for (const l of h.lines) {
+      if (l.kind === "add") {
+        addFiles.add(h.file);
+        break;
+      }
+    }
+  }
+  const present = /* @__PURE__ */ new Map();
+  for (const f of files) {
+    if (!present.has(f.file))
+      present.set(f.file, f);
+  }
+  const introduced = [];
+  const general = [];
+  for (const f of findings) {
+    if (isValidLine(f.line)) {
+      const hit = hunkHit(index, f.file, f.line);
+      if (hit !== void 0 && hit.side === "RIGHT" && hit.kind === "add")
+        introduced.push(f);
+      else
+        general.push(f);
+      continue;
+    }
+    if (f.file === "") {
+      general.push(f);
+      continue;
+    }
+    const entry = present.get(f.file);
+    if (entry === void 0 || entry.deleted === true) {
+      general.push(f);
+      continue;
+    }
+    if (entry.hunks === "" || addFiles.has(f.file))
+      introduced.push(f);
+    else
+      general.push(f);
+  }
+  return { introduced, general };
 }
 function eventFor(failLevel, findings) {
   if (failLevel === "high" && findings.some((f) => f.severity === "high"))
@@ -27756,21 +27837,33 @@ ${marker}`;
     throw new RangeError("maxBytes is too small for the report heading and omission marker");
   return render(retained, omissionMarker);
 }
-function buildBody(general, summary2) {
+function buildBody(general, summary2, marks) {
   const head = summary2.trim() === "" ? FALLBACK_SUMMARY : summary2.trim();
   if (general.length === 0)
     return head;
+  const reopened = marks?.reopened;
+  const blocking = marks?.blocking;
   const items = general.map((f) => {
-    let item = `- **${f.severity}** ${locate(f)} [${f.rule}] ${f.message}`;
+    const key = reopenedKey(f);
+    const marker = reopened?.has(key) === true ? " **reopened**" : blocking?.has(key) === true ? " **blocking**" : "";
+    let item = `- **${f.severity}**${marker} ${locate(f)} [${f.rule}] ${f.message}`;
     if (hasSuggestion(f))
       item += `
   Suggested: ${f.suggestion.replace(/\n/g, "\n  ")}`;
     return item + provenanceTrailer(f).replace(/\n/g, "\n  ");
   });
+  const outside = general.filter((f) => blocking?.has(reopenedKey(f)) !== true).length;
+  const list = `**Findings not placed inline:**
+${items.join("\n")}`;
+  if (outside === 0)
+    return `${head}
+
+${list}`;
   return `${head}
 
-**Findings not placed inline:**
-${items.join("\n")}`;
+**Note:** ${outside} finding(s) below are outside the PR diff and do not block.
+
+${list}`;
 }
 var MERGE_SEVERITY_RANK = { info: 0, warning: 1, high: 2 };
 function mergeable(a, b) {
@@ -28036,12 +28129,14 @@ async function getRepoSize(octokit, owner, repo) {
     return void 0;
   }
 }
-function foldComments(body, comments) {
+function foldComments(body, comments, blocking, commentKeys) {
   if (comments.length === 0)
     return body;
-  const items = comments.map((c) => {
+  const items = comments.map((c, i) => {
     const text = c.body.replace(/\r\n?/g, "\n").replace(/(\n[ \t]*)+$/, "");
-    const head = `- ${c.path}:${c.line}`;
+    const key = commentKeys?.[i] ?? null;
+    const suffix = key !== null && blocking !== void 0 && !blocking.has(key) ? " (non-blocking)" : "";
+    const head = `- ${c.path}:${c.line}${suffix}`;
     if (text.trim() === "")
       return head;
     return `${head}
@@ -28122,7 +28217,7 @@ async function postReview(octokit, pr, payload, opts) {
         throw new StaleHeadError(commitId, head);
       }
       if (!degraded && comments.length > 0 && OFF_DIFF.test(detail)) {
-        body = recapFoldedBody(foldComments(body, comments), opts?.maxBodyChars ?? DEFAULT_MAX_REVIEW_BODY_CHARS);
+        body = recapFoldedBody(foldComments(body, comments, opts?.blocking, opts?.commentKeys), opts?.maxBodyChars ?? DEFAULT_MAX_REVIEW_BODY_CHARS);
         comments = [];
         degraded = true;
         continue;
@@ -28130,6 +28225,86 @@ async function postReview(octokit, pr, payload, opts) {
       throw new Error("review post rejected (HTTP 422)");
     }
   }
+}
+var THREAD_RULE_RE = /^\*\*(\w+)\*\* (?:\*\*reopened\*\* )?\[([^[\]]+)\]/;
+function threadRuleOf(body) {
+  if (typeof body !== "string")
+    return null;
+  const m = THREAD_RULE_RE.exec(body);
+  return m === null ? null : m[2];
+}
+function asThread(n) {
+  const first = n.comments?.nodes?.[0];
+  const login = first?.author?.login;
+  const line = typeof n.line === "number" ? n.line : null;
+  const originalLine = typeof n.originalLine === "number" ? n.originalLine : null;
+  return {
+    authorLogin: typeof login === "string" ? login : null,
+    isResolved: n.isResolved === true,
+    path: typeof n.path === "string" ? n.path : "",
+    line,
+    originalLine,
+    rule: threadRuleOf(first?.body)
+  };
+}
+async function listReviewThreads(octokit, owner, repo, pr) {
+  try {
+    const data = await octokit.graphql(`query ($owner: String!, $repo: String!, $pr: Int!) {
+        repository(owner: $owner, name: $repo) {
+          pullRequest(number: $pr) {
+            reviewThreads(last: 100) {
+              pageInfo { hasPreviousPage }
+              nodes {
+                isResolved
+                path
+                line
+                originalLine
+                comments(first: 1) { nodes { author { login } body } }
+              }
+            }
+          }
+        }
+      }`, { owner, repo, pr });
+    const threads = data.repository?.pullRequest?.reviewThreads;
+    if (threads === void 0 || !Array.isArray(threads.nodes))
+      throw new Error("reviewThreads missing");
+    if (threads.pageInfo?.hasPreviousPage === true) {
+      warning("lupa: more than 100 review threads; re-checking the newest 100 only");
+    }
+    return threads.nodes.map(asThread);
+  } catch (e) {
+    warning(`lupa: review-thread re-read failed (${e.message}); gating on diff membership only`);
+    return [];
+  }
+}
+var LUPA_BODY_PREFIX = "lupa:";
+async function fetchActor(octokit, owner, repo, pr) {
+  try {
+    const me = await octokit.rest.users.getAuthenticated();
+    const login = me.data.login;
+    if (typeof login === "string" && login !== "")
+      return login;
+  } catch {
+  }
+  try {
+    const reviews = await octokit.paginate(octokit.rest.pulls.listReviews, {
+      owner,
+      repo,
+      pull_number: pr,
+      per_page: 100
+    });
+    let newest;
+    for (const r of reviews) {
+      if (typeof r.body === "string" && r.body.startsWith(LUPA_BODY_PREFIX) && typeof r.user?.login === "string") {
+        newest = r.user.login;
+      }
+    }
+    if (newest !== void 0)
+      return newest;
+  } catch {
+  }
+  warning("lupa: could not determine the review actor; skipping the wrongly-resolved re-check");
+  return void 0;
 }
 async function postIssueFallback(octokit, opts) {
   if (!opts.enabled)
@@ -28891,7 +29066,7 @@ function parseDiffFiles(text, workDir) {
   for (const line of text.split("\n")) {
     if (line.startsWith("diff --git ")) {
       const file = headerFile(line);
-      cur = file === void 0 ? void 0 : { file, lines: [], binary: false };
+      cur = file === void 0 ? void 0 : { file, lines: [], binary: false, deleted: false };
       if (cur !== void 0)
         sections.push(cur);
       continue;
@@ -28900,6 +29075,8 @@ function parseDiffFiles(text, workDir) {
       continue;
     if (line.startsWith("Binary files ") || line.startsWith("GIT binary patch"))
       cur.binary = true;
+    if (line.startsWith("deleted file mode"))
+      cur.deleted = true;
     cur.lines.push(line);
   }
   return sections.map((s) => {
@@ -28909,6 +29086,8 @@ function parseDiffFiles(text, workDir) {
     const f = { file: s.file, hunks, truncated: false, size };
     if (s.binary)
       f.binary = true;
+    if (s.deleted)
+      f.deleted = true;
     return f;
   });
 }
@@ -29208,10 +29387,12 @@ async function slowPath(env, out, deps, pr, fast, promptText, issueBody, skipped
 function runtimeSecrets(env) {
   return [env.inputs.githubToken, env.inputs.llmApiKey].filter((s) => s !== "");
 }
-function foldExcessInline(withHeading, excess) {
+function foldExcessInline(withHeading, excess, blocking) {
   const items = excess.map((c) => {
     const text = c.body.replace(/\r\n?/g, "\n").replace(/(\n[ \t]*)+$/, "");
-    const head = `- ${c.path}:${c.line}`;
+    const key = c.rule === void 0 ? null : `${c.rule}\0${c.path}\0${c.line}`;
+    const suffix = key !== null && blocking !== void 0 && !blocking.has(key) ? " (non-blocking)" : "";
+    const head = `- ${c.path}:${c.line}${suffix}`;
     if (text.trim() === "")
       return head;
     return `${head}
@@ -29229,22 +29410,42 @@ async function publishReview(a) {
   const { merged, dropped } = a.verdicts === void 0 ? { merged: fullSet, dropped: 0 } : mergeDuplicates(fullSet, a.verdicts);
   if (dropped > 0)
     warning(`lupa: ignored ${dropped} unmergeable dedup verdict(s)`);
+  const parsed = parseHunks(a.hunks);
+  const { introduced } = partitionGate(merged, parsed, a.hunks);
+  const introducedKeys = new Set(introduced.map(reopenedKey));
+  let reopened = /* @__PURE__ */ new Set();
+  if (introduced.length < merged.length && a.env.inputs.githubToken !== "") {
+    try {
+      const self = await a.deps.gh.getActor(a.pr);
+      if (self === void 0) {
+        warning("lupa: review actor unknown; skipping the wrongly-resolved re-check");
+      } else {
+        reopened = resolveReopened(merged, await a.deps.gh.listReviewThreads(a.pr), self);
+      }
+    } catch {
+      warning("lupa: review-thread re-read failed; gating on diff membership only");
+      reopened = /* @__PURE__ */ new Set();
+    }
+  }
+  const blocking = merged.filter((f) => introducedKeys.has(reopenedKey(f)) || reopened.has(reopenedKey(f)));
+  const blockingKeys = new Set(blocking.map(reopenedKey));
   const ordered = prioritizeFindings(merged);
   const retained = ordered.slice(0, inputs.maxFindings);
   const omitted = merged.length - retained.length;
   const omissionMarker = omitted > 0 ? omissionMarkerFor(omitted, inputs.maxFindings) : void 0;
-  const { inline, general } = mapToComments(retained, parseHunks(a.hunks));
+  const { inline, general } = mapToComments(retained, parsed, reopened);
   const postedInline = inline.slice(0, inputs.maxInlineComments);
   const excessInline = inline.slice(inputs.maxInlineComments);
-  let body = buildBody(general, summaryFor(fullSet));
+  let body = buildBody(general, summaryFor(fullSet), { reopened, blocking: blockingKeys });
   if (excessInline.length > 0)
-    body += foldExcessInline(general.length === 0, excessInline);
+    body += foldExcessInline(general.length === 0, excessInline, blockingKeys);
   const capped = capBody(body, inputs.maxReviewBodyChars, omissionMarker === void 0 ? [] : [omissionMarker]);
+  const commentKeys = postedInline.map((c) => c.rule === void 0 ? null : `${c.rule}\0${c.path}\0${c.line}`);
   const payload = {
     commit_id: a.headSha,
     body: capped,
-    event: eventFor(inputs.failLevel, fullSet),
-    comments: postedInline
+    event: eventFor(inputs.failLevel, blocking),
+    comments: postedInline.map(({ rule, ...c }) => c)
   };
   if (a.env.summaryPath !== void 0) {
     let existing = 0;
@@ -29263,28 +29464,28 @@ async function publishReview(a) {
   }
   if (!a.env.inputs.postComment) {
     const high = fullSet.filter((f) => f.severity === "high").length;
-    info(`post_comment is false: dry-run, nothing posted (would post event=${payload.event}, inline=${postedInline.length}, general=${general.length + excessInline.length}, high=${high}, omitted=${omitted})`);
-    return;
+    info(`post_comment is false: dry-run, nothing posted (would post event=${payload.event}, inline=${postedInline.length}, general=${general.length + excessInline.length}, high=${high}, blocking=${blocking.length}, omitted=${omitted})`);
+    return { blocking };
   }
   const canWrite = !a.isFork || a.env.tokenType === "app" || a.env.tokenType === "workflow-run";
   if (!canWrite) {
     warning("fork PR with a read-only token: review not posted; summary and artifact only");
-    return;
+    return { blocking };
   }
   const live = await a.deps.gh.getPr(a.pr);
   if (live.headSha !== a.headSha) {
     warning(`PR head moved from ${a.headSha} to ${live.headSha}: skipping review for the stale head`);
-    return;
+    return { blocking };
   }
   try {
-    await a.deps.gh.createReview(a.pr, payload, { canWrite: true, maxBodyChars: inputs.maxReviewBodyChars });
+    await a.deps.gh.createReview(a.pr, payload, { canWrite: true, maxBodyChars: inputs.maxReviewBodyChars, blocking: blockingKeys, commentKeys });
     a.out.posted = true;
   } catch (e) {
     if (e instanceof StaleHeadError) {
       note(a.env, a.out, `lupa: PR head moved during posting; analyzed ${e.analyzedSha}, live ${e.liveSha}; skipping review for the stale head \u2014 a fresh run will cover the new head.`);
       a.out.staleSkipped = true;
       a.out.exitCode = 0;
-      return;
+      return { blocking };
     }
     if (!(e instanceof ReadonlyTokenError))
       throw e;
@@ -29292,7 +29493,7 @@ async function publishReview(a) {
     const issuesWrite = a.env.issueFallback && canWrite;
     if (!issuesWrite) {
       warning("issue fallback unavailable (not enabled, or token lacks issues: write); nothing posted");
-      return;
+      return { blocking };
     }
     try {
       const budget = omissionMarker === void 0 ? inputs.maxReviewBodyChars : inputs.maxReviewBodyChars - Buffer.byteLength(omissionMarker, "utf8") - 2;
@@ -29306,6 +29507,7 @@ ${fallbackReport}`;
       warning(`issue fallback failed: ${fallbackErr.message}`);
     }
   }
+  return { blocking };
 }
 function toSarif(findings) {
   const level = (s) => s === "high" ? "error" : s === "warning" ? "warning" : "note";
@@ -29420,9 +29622,9 @@ async function runFlowA(env, deps, out) {
   writePrMeta(verdicts === void 0 ? meta : { ...meta, verdicts }, env.artifactDir);
   const { merged: sarifSet } = verdicts === void 0 ? { merged: redacted } : mergeDuplicates(redacted, verdicts);
   writeFileSync3(join6(env.artifactDir, "sarif.json"), JSON.stringify(toSarif(sarifSet), null, 2) + "\n", "utf8");
-  await publishReview({ env, deps, out, pr, isFork: pull.isFork, findings: all, hunks: files, headSha: env.headSha, verdicts });
+  const { blocking } = await publishReview({ env, deps, out, pr, isFork: pull.isFork, findings: all, hunks: files, headSha: env.headSha, verdicts });
   if (!out.staleSkipped)
-    out.exitCode = exitFor(env.inputs.failLevel, all);
+    out.exitCode = exitFor(env.inputs.failLevel, blocking);
 }
 async function runFlowB(env, deps, out) {
   out.slowPathSkipped = true;
@@ -29460,9 +29662,9 @@ async function runFlowB(env, deps, out) {
   }
   const findings = readFindings(env.artifactDir, env.inputs.maxArtifactBytes).map(sanitizeFinding);
   const hunks = parseDiffFiles(readDiff(env.artifactDir));
-  await publishReview({ env, deps, out, pr, isFork: live.isFork, findings, hunks, headSha, verdicts: meta.verdicts });
+  const { blocking } = await publishReview({ env, deps, out, pr, isFork: live.isFork, findings, hunks, headSha, verdicts: meta.verdicts });
   if (!out.staleSkipped)
-    out.exitCode = exitFor(env.inputs.failLevel, findings);
+    out.exitCode = exitFor(env.inputs.failLevel, blocking);
 }
 async function run(env, deps) {
   const out = newOutcome();
@@ -29506,7 +29708,19 @@ function realGateway(token) {
       return r.data.body ?? "";
     },
     getRepoSize: (owner, repo) => getRepoSize(octokit(), owner, repo),
-    createReview: (pr, payload, opts) => postReview(octokit(), pr, payload, { canWrite: opts.canWrite, maxBodyChars: opts.maxBodyChars }).then(() => void 0),
+    listReviewThreads: async (pr) => {
+      if (token === "")
+        return [];
+      const { owner, repo } = context2.repo;
+      return listReviewThreads(octokit(), owner, repo, pr);
+    },
+    getActor: async (pr) => {
+      if (token === "")
+        return void 0;
+      const { owner, repo } = context2.repo;
+      return fetchActor(octokit(), owner, repo, pr);
+    },
+    createReview: (pr, payload, opts) => postReview(octokit(), pr, payload, { canWrite: opts.canWrite, maxBodyChars: opts.maxBodyChars, blocking: opts.blocking, commentKeys: opts.commentKeys }).then(() => void 0),
     createIssueComment: (pr, body, opts) => postIssueFallback(octokit(), { pr, body, ...opts })
   };
 }
@@ -29574,6 +29788,7 @@ export {
   budgetPrompt,
   cleanEnvForExec,
   main,
+  parseDiffFiles,
   readFindings,
   readRunEnv,
   run,
