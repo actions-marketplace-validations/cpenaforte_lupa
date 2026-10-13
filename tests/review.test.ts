@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { buildBody, buildFallbackReport, capBody, eventFor, exitFor, formatBody, indexHunks, isTruncNoteLine, mapToComments, mergeDuplicates, normalizeBot, omissionMarkerFor, partitionGate, prioritizeFindings, redactFindings, reopenedKey, resolveReopened, truncNoteFor } from "../src/review.js";
+import { buildBody, buildFallbackReport, capBody, eventFor, exitFor, formatBody, hasPatch, indexHunks, isTruncNoteLine, mapToComments, mergeDuplicates, normalizeBot, omissionMarkerFor, partitionGate, prioritizeFindings, redactFindings, reopenedKey, resolveReopened, truncNoteFor } from "../src/review.js";
 import { parseHunks, type FileDiff } from "../src/diff.js";
 import type { DedupVerdicts } from "../src/llm.js";
-import type { Finding } from "../src/fastpath.js";
+import { TRUNC_MARK, type Finding } from "../src/fastpath.js";
 
 // a.ts: line 3 is a deletion (LEFT 3), line 4 an addition (RIGHT 4); line 99 is outside every hunk.
 function hunksFixture() {
@@ -119,9 +119,9 @@ describe("mapToComments", () => {
     expect("start_side" in withoutSuggestion.inline[0]).toBe(false);
   });
 
-  it("RIGHT suggestion renders a ```suggestion fence", () => {
+  it("RIGHT patch renders a ```suggestion fence", () => {
     const r = mapToComments(
-      [{ severity: "warning", file: "a.ts", line: 10, rule: "r", message: "m", suggestion: "fixed" }],
+      [{ severity: "warning", file: "a.ts", line: 10, rule: "r", message: "m", patch: "fixed" }],
       rangeFixture(),
     );
     expect(r.inline[0].body).toContain("```suggestion\nfixed\n```");
@@ -148,14 +148,14 @@ describe("mapToComments", () => {
     expect(r.inline[0].body).not.toContain("```");
   });
 
-  it("suggestion containing backticks gets a longer fence that cannot be closed early", () => {
-    const suggestion = "a ```js\nx\n```";
+  it("patch containing backticks gets a longer fence that cannot be closed early", () => {
+    const patch = "a ```js\nx\n```";
     const r = mapToComments(
-      [{ severity: "warning", file: "a.ts", line: 10, rule: "r", message: "m", suggestion }],
+      [{ severity: "warning", file: "a.ts", line: 10, rule: "r", message: "m", patch }],
       rangeFixture(),
     );
     const body = r.inline[0].body;
-    expect(body).toContain("````suggestion\n" + suggestion + "\n````");
+    expect(body).toContain("````suggestion\n" + patch + "\n````");
     expect(body.endsWith("````")).toBe(true);
   });
 
@@ -510,6 +510,210 @@ describe("redactFindings", () => {
     input[0].evidence!.analyzer = "mutated";
     input[0].evidence!.snippet = "mutated";
     expect(out[0].evidence).toEqual({ analyzer: "semgrep", snippet: "code" });
+  });
+
+  it("redactFindings redacts secrets in patch (fresh object, input untouched)", () => {
+    const input: Finding[] = [
+      { severity: "warning", file: "a.ts", line: 1, rule: "r", message: "m", patch: "token sk-secret-1 here" },
+    ];
+    const out = redactFindings(input, ["sk-secret-1"]);
+    expect(out[0].patch).toBe("token [REDACTED] here");
+    expect(out[0]).not.toBe(input[0]);
+    expect(input[0].patch).toBe("token sk-secret-1 here");
+  });
+});
+
+describe("hasPatch", () => {
+  it("accepts a non-empty string patch, trimming only for the test (stored verbatim)", () => {
+    expect(hasPatch({ severity: "warning", file: "a.ts", rule: "r", message: "m", patch: "const x = 1;" })).toBe(true);
+    expect(hasPatch({ severity: "warning", file: "a.ts", rule: "r", message: "m", patch: "  const x = 1;  " })).toBe(true);
+  });
+
+  it("rejects absent, empty, whitespace-only, and TRUNC_MARK-capped patches", () => {
+    expect(hasPatch({ severity: "warning", file: "a.ts", rule: "r", message: "m" })).toBe(false);
+    expect(hasPatch({ severity: "warning", file: "a.ts", rule: "r", message: "m", patch: "" })).toBe(false);
+    expect(hasPatch({ severity: "warning", file: "a.ts", rule: "r", message: "m", patch: "  \n\t " })).toBe(false);
+    expect(
+      hasPatch({ severity: "warning", file: "a.ts", rule: "r", message: "m", patch: `code${TRUNC_MARK}` }),
+    ).toBe(false);
+  });
+});
+
+describe("Q01 patch rendering", () => {
+  // a.ts line 10 is a RIGHT addition (rangeFixture); a.ts line 3 is a LEFT deletion (hunksFixture).
+  const right = (extra: Partial<Finding>): Finding => ({
+    severity: "warning",
+    file: "a.ts",
+    line: 10,
+    rule: "r",
+    message: "m",
+    ...extra,
+  });
+  const left = (extra: Partial<Finding>): Finding => ({
+    severity: "high",
+    file: "a.ts",
+    line: 3,
+    rule: "r",
+    message: "m",
+    ...extra,
+  });
+
+  it("RIGHT + patch renders the fence verbatim, then Suggested advice, then the trailer", () => {
+    const r = mapToComments(
+      [right({ patch: "const x = 1;", suggestion: "explain it", source: "llm", confidence: 70 })],
+      rangeFixture(),
+    );
+    expect(r.inline[0].side).toBe("RIGHT");
+    const body = r.inline[0].body;
+    expect(body).toContain("```suggestion\nconst x = 1;\n```");
+    expect(body).toContain("Suggested: explain it");
+    expect(body.indexOf("**warning**")).toBeLessThan(body.indexOf("```suggestion"));
+    expect(body.indexOf("```suggestion")).toBeLessThan(body.indexOf("Suggested: explain it"));
+    expect(body.indexOf("Suggested: explain it")).toBeLessThan(body.indexOf("`src:llm · conf 70`"));
+    // Trailer is fence-external: it renders after the last fence close.
+    expect(body.indexOf("`src:llm · conf 70`")).toBeGreaterThan(body.lastIndexOf("```"));
+  });
+
+  it("RIGHT patch renders verbatim (no trim) even when whitespace-padded", () => {
+    const r = mapToComments([right({ patch: "  const x = 1;  " })], rangeFixture());
+    expect(r.inline[0].body).toContain("```suggestion\n  const x = 1;  \n```");
+  });
+
+  it("RIGHT + suggestion-only renders advice with no fence (the audit regression pin)", () => {
+    const r = mapToComments([right({ suggestion: "explain it" })], rangeFixture());
+    const body = r.inline[0].body;
+    expect(body).not.toContain("```");
+    expect(body).toContain("Suggested: explain it");
+  });
+
+  it("empty, whitespace-only, and TRUNC_MARK-capped patches never fence on RIGHT (suggestion normal)", () => {
+    for (const patch of ["", "   \n\t ", `code${TRUNC_MARK}`]) {
+      const r = mapToComments([right({ patch, suggestion: "advice" })], rangeFixture());
+      const body = r.inline[0].body;
+      expect(body).not.toContain("```");
+      expect(body).toContain("Suggested: advice");
+    }
+    const absent = mapToComments([right({ suggestion: "advice" })], rangeFixture());
+    expect(absent.inline[0].body).not.toContain("```");
+  });
+
+  it("LEFT + patch renders the advice-only label, a plain sized block, then Suggested (pinned separators)", () => {
+    const r = mapToComments([left({ patch: "const x = 1;", suggestion: "explain it" })], hunksFixture());
+    expect(r.inline[0].side).toBe("LEFT");
+    const body = r.inline[0].body;
+    expect(body).toContain("\n\nSuggested replacement (advice only):\n```\nconst x = 1;\n```");
+    expect(body).toContain("\n\nSuggested: explain it");
+    expect(body).not.toContain("```suggestion");
+  });
+
+  it("LEFT patch containing backticks gets a longer fence (never ```suggestion)", () => {
+    const patch = "a ```js\nx\n```";
+    const r = mapToComments([left({ patch })], hunksFixture());
+    const body = r.inline[0].body;
+    expect(body).toContain("Suggested replacement (advice only):\n````\n" + patch + "\n````");
+    expect(body).not.toContain("```suggestion");
+  });
+
+  it("LEFT with an invalid patch renders no advice block (suggestion normal)", () => {
+    for (const patch of ["", "  \n ", `code${TRUNC_MARK}`]) {
+      const r = mapToComments([left({ patch, suggestion: "advice" })], hunksFixture());
+      const body = r.inline[0].body;
+      expect(body).not.toContain("Suggested replacement");
+      expect(body).not.toContain("```");
+      expect(body).toContain("Suggested: advice");
+    }
+    const absent = mapToComments([left({ suggestion: "advice" })], hunksFixture());
+    expect(absent.inline[0].body).not.toContain("Suggested replacement");
+  });
+
+  it("general-body item with a patch renders the advice-only block indented, then Suggested", () => {
+    const body = buildBody(
+      [{ severity: "warning", file: "a.ts", line: 99, rule: "r", message: "off diff", patch: "const x = 1;", suggestion: "explain it" }],
+      "Summary",
+    );
+    expect(body).toContain(
+      "- **warning** a.ts:99 [r] off diff\n  Suggested replacement (advice only):\n  ```\n  const x = 1;\n  ```\n  Suggested: explain it",
+    );
+    expect(body).not.toContain("```suggestion");
+  });
+
+  it("general-body item with a multiline patch indents every continuation line", () => {
+    const body = buildBody(
+      [{ severity: "warning", file: "a.ts", line: 99, rule: "r", message: "off diff", patch: "a\nb" }],
+      "Summary",
+    );
+    expect(body).toContain("\n  ```\n  a\n  b\n  ```");
+  });
+
+  it("general-body item with an invalid patch renders no advice block (suggestion normal)", () => {
+    const body = buildBody(
+      [{ severity: "warning", file: "a.ts", line: 99, rule: "r", message: "off diff", patch: "   ", suggestion: "advice" }],
+      "Summary",
+    );
+    expect(body).not.toContain("Suggested replacement");
+    expect(body).not.toContain("```");
+    expect(body).toContain("Suggested: advice");
+  });
+
+  it("fallback report adds the Proposed patch row LAST, after remediation", () => {
+    const report = buildFallbackReport([
+      {
+        severity: "warning",
+        file: "a.ts",
+        line: 2,
+        rule: "r",
+        message: "m",
+        patch: "const x = 1;",
+        suggestion: "fix",
+        source: "semgrep",
+        confidence: 90,
+        evidence: { analyzer: "semgrep", snippet: "flagged" },
+      },
+    ]);
+    expect(report).toContain("- Proposed patch (advice only):\n```text\nconst x = 1;\n```");
+    const msgIdx = report.indexOf("- Message/evidence:");
+    const srcIdx = report.indexOf("- Source:");
+    const confIdx = report.indexOf("- Confidence:");
+    const evIdx = report.indexOf("- Evidence:");
+    const remIdx = report.indexOf("- Suggested remediation");
+    const patchIdx = report.indexOf("- Proposed patch (advice only):");
+    expect(msgIdx).toBeLessThan(srcIdx);
+    expect(srcIdx).toBeLessThan(confIdx);
+    expect(confIdx).toBeLessThan(evIdx);
+    expect(evIdx).toBeLessThan(remIdx);
+    expect(remIdx).toBeLessThan(patchIdx);
+  });
+
+  it("fallback report omits the patch row for an invalid patch, keeping the remediation placeholder", () => {
+    const report = buildFallbackReport([
+      { severity: "warning", file: "a.ts", line: 2, rule: "r", message: "m", patch: "   " },
+    ]);
+    expect(report).not.toContain("- Proposed patch");
+    expect(report).toContain("- Suggested remediation (advice only):\n```text\nNo remediation supplied\n```");
+  });
+
+  it("audit pins: credential-rotation and SQL prose in suggestion render as advice, never fenced", () => {
+    const rotation = mapToComments(
+      [right({ suggestion: "Rotate the leaked credential immediately and audit access logs." })],
+      rangeFixture(),
+    );
+    expect(rotation.inline[0].body).not.toContain("```");
+    expect(rotation.inline[0].body).toContain("Suggested: Rotate the leaked credential immediately and audit access logs.");
+
+    const sql = mapToComments(
+      [right({ suggestion: "Use a parameterized query instead of string concatenation." })],
+      rangeFixture(),
+    );
+    expect(sql.inline[0].body).not.toContain("```");
+    expect(sql.inline[0].body).toContain("Suggested: Use a parameterized query instead of string concatenation.");
+  });
+
+  it("audit pins: a genuine one-line replacement in patch still fences", () => {
+    const r = mapToComments(
+      [right({ patch: 'db.query("SELECT * FROM users WHERE id = $1", [id]);' })],
+      rangeFixture(),
+    );
+    expect(r.inline[0].body).toContain('```suggestion\ndb.query("SELECT * FROM users WHERE id = $1", [id]);\n```');
   });
 });
 
@@ -874,9 +1078,9 @@ describe("finding provenance rendering (Q04)", () => {
     expect(confZeroOnly.inline[0].body).toContain("`conf 0`");
   });
 
-  it("trailer renders AFTER the suggestion fence, never inside the patch", () => {
+  it("trailer renders AFTER the patch fence, never inside the patch", () => {
     const r = mapToComments(
-      [F("warning", "a.ts", 10, "r", "m", { source: "semgrep", confidence: 90, suggestion: "fixed" })],
+      [F("warning", "a.ts", 10, "r", "m", { source: "semgrep", confidence: 90, patch: "fixed" })],
       rightHunks(),
     );
     const body = r.inline[0].body;
@@ -1004,6 +1208,25 @@ describe("finding provenance rendering (Q04)", () => {
       V([[0, 1]]),
     ).merged[0]!;
     expect(none.evidence).toBeUndefined();
+  });
+
+  it("survivor takes the first member satisfying hasPatch, absent iff none", () => {
+    const first = mergeDuplicates(
+      [F("warning", "a.ts", 1, "r0", "m0", { patch: "first-patch" }), F("warning", "a.ts", 1, "r1", "m1", { patch: "second-patch" })],
+      V([[0, 1]]),
+    ).merged[0]!;
+    expect(first.patch).toBe("first-patch");
+    // A whitespace-only first patch must not shadow a valid later one.
+    const skip = mergeDuplicates(
+      [F("warning", "a.ts", 1, "r0", "m0", { patch: "   " }), F("warning", "a.ts", 1, "r1", "m1", { patch: "second-patch" })],
+      V([[0, 1]]),
+    ).merged[0]!;
+    expect(skip.patch).toBe("second-patch");
+    const none = mergeDuplicates(
+      [F("warning", "a.ts", 1, "r0", "m0"), F("warning", "a.ts", 1, "r1", "m1")],
+      V([[0, 1]]),
+    ).merged[0]!;
+    expect(none.patch).toBeUndefined();
   });
 
   it("cross-file pair stays ungrouped with provenance intact", () => {
