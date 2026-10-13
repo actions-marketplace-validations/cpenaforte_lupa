@@ -12,7 +12,7 @@ vi.mock("@actions/core", async (importOriginal) => {
 import { budgetPrompt, cleanEnvForExec, main, readFindings, readRunEnv, run, sanitizeFinding, toSarif, unquoteGitPath, type Deps, type Gateway, type PrInfo, type RunEnv } from "../src/main.js";
 import { buildMessages, ISSUE_TRUNCATION_MARKER, neutralise } from "../src/prompt.js";
 import { readPrMeta } from "../src/diff.js";
-import type { DedupVerdicts } from "../src/llm.js";
+import type { DedupVerdicts, LlmUsage } from "../src/llm.js";
 import type { ActionInputs, LlmApiStyle, LlmProvider } from "../src/inputs.js";
 import {
   DEFAULT_MAX_ARTIFACT_BYTES,
@@ -265,6 +265,10 @@ interface MockOpts {
   llm?: Finding[];
   /** Verdicts returned by the mocked slow-path LLM seams (single-shot only; agent seams never carry verdicts). */
   llmVerdicts?: DedupVerdicts;
+  /** Aggregate usage returned by the mocked slow-path LLM seams (absent = the usage-less default). */
+  llmUsage?: LlmUsage;
+  /** Slow-path LLM seams return an ok:false failure instead of a result (silence pin). */
+  llmFail?: boolean;
   headMoves?: boolean;
   /** getPr throws once the call count exceeds this number. */
   failGetPrAfter?: number;
@@ -372,7 +376,13 @@ async function runWithMocks(o: MockOpts = {}) {
         rec.llmCalled += 1;
         rec.llmVia = "style";
         rec.prompts = messages as { system: string; user: string };
-        return { ok: true, findings: o.llm ?? [LLM_FINDING], ...(o.llmVerdicts !== undefined ? { verdicts: o.llmVerdicts } : {}) };
+        if (o.llmFail) return { ok: false, reason: "timeout", detail: "slow path failed (test)", ...(o.llmUsage !== undefined ? { usage: o.llmUsage } : {}) };
+        return {
+          ok: true,
+          findings: o.llm ?? [LLM_FINDING],
+          ...(o.llmVerdicts !== undefined ? { verdicts: o.llmVerdicts } : {}),
+          ...(o.llmUsage !== undefined ? { usage: o.llmUsage } : {}),
+        };
       },
       callWithProbe:
         o.realLlm === true
@@ -390,7 +400,8 @@ async function runWithMocks(o: MockOpts = {}) {
               } catch {
                 // No early payload on disk; leave earlyFindingsRaw unset.
               }
-              return { ok: true, findings: o.llm ?? [LLM_FINDING], ...(o.llmVerdicts !== undefined ? { verdicts: o.llmVerdicts } : {}) };
+              if (o.llmFail) return { ok: false, reason: "timeout", detail: "slow path failed (test)", ...(o.llmUsage !== undefined ? { usage: o.llmUsage } : {}) };
+              return { ok: true, findings: o.llm ?? [LLM_FINDING], ...(o.llmVerdicts !== undefined ? { verdicts: o.llmVerdicts } : {}), ...(o.llmUsage !== undefined ? { usage: o.llmUsage } : {}) };
             },
       callByStyleAgent: async (_ep, conv, opts, toolCtx) => {
         rec.agentCalled += 1;
@@ -400,7 +411,8 @@ async function runWithMocks(o: MockOpts = {}) {
         rec.agentToolCtx = toolCtx as ToolContext | undefined;
         rec.agentMaxTurns = (opts as { maxTurns?: number }).maxTurns;
         rec.agentMaxSeconds = (opts as { maxSeconds?: number }).maxSeconds;
-        return { ok: true, findings: o.llm ?? [LLM_FINDING] };
+        if (o.llmFail) return { ok: false, reason: "timeout", detail: "slow path failed (test)", ...(o.llmUsage !== undefined ? { usage: o.llmUsage } : {}) };
+        return { ok: true, findings: o.llm ?? [LLM_FINDING], ...(o.llmUsage !== undefined ? { usage: o.llmUsage } : {}) };
       },
       callWithProbeAgent: async (_provider, _model, _baseUrl, _key, conv, opts, toolCtx) => {
         rec.agentCalled += 1;
@@ -415,7 +427,8 @@ async function runWithMocks(o: MockOpts = {}) {
           rec.toolOutput = res.output;
           rec.toolError = res.isError;
         }
-        return { ok: true, findings: o.llm ?? [LLM_FINDING] };
+        if (o.llmFail) return { ok: false, reason: "timeout", detail: "slow path failed (test)", ...(o.llmUsage !== undefined ? { usage: o.llmUsage } : {}) };
+        return { ok: true, findings: o.llm ?? [LLM_FINDING], ...(o.llmUsage !== undefined ? { usage: o.llmUsage } : {}) };
       },
     },
   };
@@ -937,6 +950,62 @@ describe("run() orchestration", () => {
     expect(r.llmVia).toBe("probe");
     expect(r.llmCalled).toBe(1);
     expect(r.getPrCalls).toBe(2);
+  });
+
+  // Task 78: aggregate usage note — one gated line on each of the 3 success
+  // returns (agent branch, verdicts === undefined, final); silence otherwise.
+  describe("aggregate LLM usage note", () => {
+    const USAGE: LlmUsage = { input: 10, output: 4, calls: 2 };
+    const LINE = "lupa: llm usage input=10 output=4 tokens (calls=2)";
+
+    it("single-shot final return (verdicts present) emits the exact line to log and summary", async () => {
+      const info = vi.mocked(core.info);
+      info.mockClear();
+      const r = await runWithMocks({ llmUsage: USAGE, llmVerdicts: { pairs: [], links: [], malformed: 0 } });
+      expect(r.posted).toBe(true);
+      expect(info.mock.calls.map((c) => String(c[0]))).toContain(LINE);
+      expect(readFileSync(r.summaryPath, "utf8")).toContain(LINE);
+    });
+
+    it("single-shot early return (verdicts undefined) emits the exact line", async () => {
+      const r = await runWithMocks({ llmUsage: USAGE });
+      expect(readFileSync(r.summaryPath, "utf8")).toContain(LINE);
+    });
+
+    it("agent branch emits the exact line", async () => {
+      const r = await runWithMocks({ llmAgent: true, llmUsage: USAGE });
+      expect(r.agentCalled).toBe(1);
+      expect(readFileSync(r.summaryPath, "utf8")).toContain(LINE);
+    });
+
+    it("silence: a usage-less run (the eval-harness shape) emits no llm usage line anywhere", async () => {
+      const info = vi.mocked(core.info);
+      info.mockClear();
+      const r = await runWithMocks({});
+      expect(r.posted).toBe(true);
+      expect(info.mock.calls.map((c) => String(c[0])).join("\n")).not.toContain("llm usage");
+      expect(readFileSync(r.summaryPath, "utf8")).not.toContain("llm usage");
+    });
+
+    it("silence: a no-llm-key run emits no llm usage line anywhere", async () => {
+      const info = vi.mocked(core.info);
+      info.mockClear();
+      const r = await runWithMocks({ llmApiKey: "" });
+      expect(r.posted).toBe(true);
+      expect(r.llmCalled).toBe(0);
+      expect(info.mock.calls.map((c) => String(c[0])).join("\n")).not.toContain("llm usage");
+      expect(readFileSync(r.summaryPath, "utf8")).not.toContain("llm usage");
+    });
+
+    it("silence: an ok:false slow-path failure emits no llm usage line anywhere", async () => {
+      const info = vi.mocked(core.info);
+      info.mockClear();
+      const r = await runWithMocks({ llmFail: true, llmUsage: USAGE });
+      expect(r.posted).toBe(true);
+      expect(r.llmCalled).toBe(1);
+      expect(info.mock.calls.map((c) => String(c[0])).join("\n")).not.toContain("llm usage");
+      expect(readFileSync(r.summaryPath, "utf8")).not.toContain("llm usage");
+    });
   });
 
   it("publishReview redacts github_token and llm_api_key from findings before posting", async () => {
