@@ -6,11 +6,13 @@ import {
   tokenFieldFor,
   parseContent,
   ensureOllama,
+  extractUsage,
   OllamaMissingError,
   InvalidJsonError,
 } from "../src/llm.js";
 import type { ResolvedEndpoint } from "../src/providers.js";
 import type { Conversation } from "../src/agent-types.js";
+import type { LlmUsage } from "../src/llm.js";
 
 // ---------- helpers ----------
 
@@ -195,6 +197,110 @@ describe("tokenFieldFor", () => {
   });
 });
 
+describe("extractUsage", () => {
+  it("chat: present → exact {input,output} (shape only, no calls key)", () => {
+    expect(extractUsage({ usage: { prompt_tokens: 10, completion_tokens: 4 } }, "openai-chat")).toEqual({
+      input: 10,
+      output: 4,
+    });
+  });
+
+  it("chat: absent / partial / non-object / non-finite / negative → undefined", () => {
+    expect(extractUsage({}, "openai-chat")).toBeUndefined();
+    expect(extractUsage({ usage: {} }, "openai-chat")).toBeUndefined();
+    expect(extractUsage({ usage: { prompt_tokens: 10 } }, "openai-chat")).toBeUndefined();
+    expect(extractUsage({ usage: { completion_tokens: 4 } }, "openai-chat")).toBeUndefined();
+    expect(extractUsage({ usage: null }, "openai-chat")).toBeUndefined();
+    expect(extractUsage({ usage: { prompt_tokens: NaN, completion_tokens: 4 } }, "openai-chat")).toBeUndefined();
+    expect(extractUsage({ usage: { prompt_tokens: Infinity, completion_tokens: 4 } }, "openai-chat")).toBeUndefined();
+    expect(extractUsage({ usage: { prompt_tokens: -1, completion_tokens: 4 } }, "openai-chat")).toBeUndefined();
+    expect(extractUsage(null, "openai-chat")).toBeUndefined();
+    expect(extractUsage([{ usage: { prompt_tokens: 1, completion_tokens: 1 } }], "openai-chat")).toBeUndefined();
+    expect(extractUsage("x", "openai-chat")).toBeUndefined();
+    expect(extractUsage(7, "openai-chat")).toBeUndefined();
+  });
+
+  it("responses: present → exact; absent / partial / non-object → undefined", () => {
+    expect(extractUsage({ usage: { input_tokens: 7, output_tokens: 3 } }, "openai-responses")).toEqual({
+      input: 7,
+      output: 3,
+    });
+    expect(extractUsage({}, "openai-responses")).toBeUndefined();
+    expect(extractUsage({ usage: { input_tokens: 7 } }, "openai-responses")).toBeUndefined();
+    expect(extractUsage({ usage: { output_tokens: 3 } }, "openai-responses")).toBeUndefined();
+    expect(extractUsage({ usage: { input_tokens: -2, output_tokens: 3 } }, "openai-responses")).toBeUndefined();
+    expect(extractUsage(null, "openai-responses")).toBeUndefined();
+    expect(extractUsage([], "openai-responses")).toBeUndefined();
+  });
+
+  it("messages: input+output present → exact (caches absent add nothing)", () => {
+    expect(extractUsage({ usage: { input_tokens: 5, output_tokens: 2 } }, "anthropic-messages")).toEqual({
+      input: 5,
+      output: 2,
+    });
+  });
+
+  it("messages: cache read + creation fold into input", () => {
+    expect(
+      extractUsage(
+        { usage: { input_tokens: 5, output_tokens: 2, cache_read_input_tokens: 3, cache_creation_input_tokens: 4 } },
+        "anthropic-messages",
+      ),
+    ).toEqual({ input: 12, output: 2 });
+  });
+
+  it("messages: caches alone (no input_tokens) do not form an input → undefined", () => {
+    expect(
+      extractUsage({ usage: { output_tokens: 2, cache_read_input_tokens: 3 } }, "anthropic-messages"),
+    ).toBeUndefined();
+  });
+
+  it("messages: wrong-typed caches are treated as 0, never concatenated", () => {
+    expect(
+      extractUsage(
+        { usage: { input_tokens: 5, output_tokens: 2, cache_read_input_tokens: "7", cache_creation_input_tokens: null } },
+        "anthropic-messages",
+      ),
+    ).toEqual({ input: 5, output: 2 });
+  });
+
+  it("messages: output missing / negative input / non-object usage → undefined", () => {
+    expect(extractUsage({ usage: { input_tokens: 5 } }, "anthropic-messages")).toBeUndefined();
+    expect(extractUsage({ usage: { input_tokens: -1, output_tokens: 2 } }, "anthropic-messages")).toBeUndefined();
+    expect(extractUsage({ usage: null }, "anthropic-messages")).toBeUndefined();
+    expect(extractUsage(null, "anthropic-messages")).toBeUndefined();
+  });
+
+  it("google: prompt + candidates present → exact", () => {
+    expect(
+      extractUsage({ usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 4 } }, "google-models"),
+    ).toEqual({ input: 10, output: 4 });
+  });
+
+  it("google: total−prompt wins when both present; candidates fallback otherwise", () => {
+    expect(
+      extractUsage(
+        { usageMetadata: { promptTokenCount: 10, totalTokenCount: 16, candidatesTokenCount: 4 } },
+        "google-models",
+      ),
+    ).toEqual({ input: 10, output: 6 });
+    expect(
+      extractUsage({ usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 4 } }, "google-models"),
+    ).toEqual({ input: 10, output: 4 });
+  });
+
+  it("google: negative derived output / missing prompt / non-object → undefined", () => {
+    expect(
+      extractUsage({ usageMetadata: { promptTokenCount: 10, totalTokenCount: 3 } }, "google-models"),
+    ).toBeUndefined();
+    expect(
+      extractUsage({ usageMetadata: { totalTokenCount: 5, candidatesTokenCount: 4 } }, "google-models"),
+    ).toBeUndefined();
+    expect(extractUsage({ usageMetadata: [] }, "google-models")).toBeUndefined();
+    expect(extractUsage(null, "google-models")).toBeUndefined();
+  });
+});
+
 describe("callLlm request shape", () => {
   it("explicit sampling IS sent for openai non-reasoning, still omitted for anthropic", async () => {
     await callLlm(fakeOpenAiEp(), msgs(), { ...opts(), model: "gpt-4o-mini", temperature: 0.3 });
@@ -291,10 +397,14 @@ describe("callLlm response handling", () => {
 
   it("accepts fence-wrapped JSON content end to end", async () => {
     stubFetch(() => json(200, okChat('```json\n{"findings":[]}\n```')));
-    expect(await callLlm(fakeOpenAiEp(), msgs(), opts())).toEqual({ ok: true, findings: [] });
+    expect(await callLlm(fakeOpenAiEp(), msgs(), opts())).toEqual({
+      ok: true,
+      findings: [],
+      verdicts: { pairs: [], links: [], malformed: 0 },
+    });
   });
 
-  it("maps findings to exactly {severity,file,line?,rule,message,suggestion?}, null to undefined", async () => {
+  it("maps findings to exactly {severity,file,line?,rule,message,suggestion?} plus source llm, null to undefined", async () => {
     const content = JSON.stringify({
       findings: [
         { severity: "high", file: "a.ts", line: null, rule: "r1", message: "m1", suggestion: null },
@@ -306,9 +416,10 @@ describe("callLlm response handling", () => {
     expect(r).toEqual({
       ok: true,
       findings: [
-        { severity: "high", file: "a.ts", rule: "r1", message: "m1" },
-        { severity: "warning", file: "b.ts", line: 7, rule: "r2", message: "m2", suggestion: "fix" },
+        { severity: "high", file: "a.ts", rule: "r1", message: "m1", source: "llm" },
+        { severity: "warning", file: "b.ts", line: 7, rule: "r2", message: "m2", suggestion: "fix", source: "llm" },
       ],
+      verdicts: { pairs: [], links: [], malformed: 0 },
     });
     expect(r.ok && "line" in r.findings[0]).toBe(false);
     expect(r.ok && "suggestion" in r.findings[0]).toBe(false);
@@ -339,6 +450,200 @@ describe("callLlm response handling", () => {
     expect(r).toMatchObject({ ok: false, reason: "unsupported" });
     expect(fetchCallCount()).toBe(0);
   });
+
+  it("attaches calls:1 usage alongside input/output when the body carries usage", async () => {
+    stubFetch(() => json(200, { ...okChat(), usage: { prompt_tokens: 12, completion_tokens: 3 } }));
+    const r = await callLlm(fakeOpenAiEp(), msgs(), opts());
+    expect(r).toEqual({
+      ok: true,
+      findings: [],
+      verdicts: { pairs: [], links: [], malformed: 0 },
+      usage: { input: 12, output: 3, calls: 1 },
+    });
+  });
+
+  it("carries no usage key when the body omits usage (absent, not undefined)", async () => {
+    const r = await callLlm(fakeOpenAiEp(), msgs(), opts());
+    expect(r.ok).toBe(true);
+    expect(r).not.toHaveProperty("usage");
+  });
+});
+
+describe("dedup verdicts (parseVerdicts via callLlm)", () => {
+  const F = (extra: Record<string, unknown> = {}) => ({
+    severity: "warning",
+    file: "a.ts",
+    line: 1,
+    rule: "r",
+    message: "m",
+    suggestion: null,
+    ...extra,
+  });
+  const CLEAN = { severity: "warning", file: "a.ts", line: 1, rule: "r", message: "m", source: "llm" };
+
+  it("extracts duplicates pairs and duplicateOf pointers (toFindings ignores the new keys)", async () => {
+    const content = JSON.stringify({
+      findings: [F({ duplicateOf: 1 }), F({ duplicateOf: null })],
+      duplicates: [[0, 1]],
+    });
+    stubFetch(() => json(200, okChat(content)));
+    expect(await callLlm(fakeOpenAiEp(), msgs(), opts())).toEqual({
+      ok: true,
+      findings: [CLEAN, CLEAN],
+      verdicts: { pairs: [[0, 1]], links: [[0, 1]], malformed: 0 },
+    });
+  });
+
+  it("null or absent verdict keys mean empty verdicts", async () => {
+    stubFetch(() => json(200, okChat('{"findings":[]}')));
+    expect(await callLlm(fakeOpenAiEp(), msgs(), opts())).toEqual({
+      ok: true,
+      findings: [],
+      verdicts: { pairs: [], links: [], malformed: 0 },
+    });
+    stubFetch(() => json(200, okChat('{"findings":[], "duplicates": null}')));
+    expect(await callLlm(fakeOpenAiEp(), msgs(), opts())).toEqual({
+      ok: true,
+      findings: [],
+      verdicts: { pairs: [], links: [], malformed: 0 },
+    });
+  });
+
+  it("drops self-pairs, negative, non-integer, and non-pair entries with counts", async () => {
+    const content = JSON.stringify({
+      findings: [F({ duplicateOf: 0 }), F({ duplicateOf: -2 }), F({ duplicateOf: "x" }), F()],
+      duplicates: [[0, 0], [-1, 2], [1.5, 2], "nope", 5, null, [0, 1]],
+    });
+    stubFetch(() => json(200, okChat(content)));
+    expect(await callLlm(fakeOpenAiEp(), msgs(), opts())).toEqual({
+      ok: true,
+      findings: [CLEAN, CLEAN, CLEAN, CLEAN],
+      verdicts: { pairs: [[0, 1]], links: [[0, 0]], malformed: 8 },
+    });
+  });
+
+  it("drops wrong-length pairs", async () => {
+    const content = JSON.stringify({ findings: [], duplicates: [[0], [0, 1, 2], []] });
+    stubFetch(() => json(200, okChat(content)));
+    expect(await callLlm(fakeOpenAiEp(), msgs(), opts())).toEqual({
+      ok: true,
+      findings: [],
+      verdicts: { pairs: [], links: [], malformed: 3 },
+    });
+  });
+});
+
+describe("LLM structured confidence (toFindings via callLlm)", () => {
+  const F = (extra: Record<string, unknown> = {}) => ({
+    severity: "warning",
+    file: "a.ts",
+    line: 1,
+    rule: "r",
+    message: "m",
+    suggestion: null,
+    ...extra,
+  });
+
+  it("carries a valid confidence and assigns source llm", async () => {
+    const content = JSON.stringify({ findings: [F({ confidence: 75 })] });
+    stubFetch(() => json(200, okChat(content)));
+    expect(await callLlm(fakeOpenAiEp(), msgs(), opts())).toEqual({
+      ok: true,
+      findings: [{ severity: "warning", file: "a.ts", line: 1, rule: "r", message: "m", source: "llm", confidence: 75 }],
+      verdicts: { pairs: [], links: [], malformed: 0 },
+    });
+  });
+
+  it("absent or null confidence stays absent (source still assigned)", async () => {
+    const content = JSON.stringify({ findings: [F(), F({ confidence: null })] });
+    stubFetch(() => json(200, okChat(content)));
+    const clean = { severity: "warning", file: "a.ts", line: 1, rule: "r", message: "m", source: "llm" };
+    expect(await callLlm(fakeOpenAiEp(), msgs(), opts())).toEqual({
+      ok: true,
+      findings: [clean, clean],
+      verdicts: { pairs: [], links: [], malformed: 0 },
+    });
+  });
+
+  it.each([150, -1, 1.5, "high", true, NaN])("drops malformed confidence %p (field only, finding kept)", async (bad) => {
+    const content = JSON.stringify({ findings: [F({ confidence: bad })] });
+    stubFetch(() => json(200, okChat(content)));
+    expect(await callLlm(fakeOpenAiEp(), msgs(), opts())).toEqual({
+      ok: true,
+      findings: [{ severity: "warning", file: "a.ts", line: 1, rule: "r", message: "m", source: "llm" }],
+      verdicts: { pairs: [], links: [], malformed: 0 },
+    });
+  });
+
+  it("keeps boundary values 0 and 100", async () => {
+    const content = JSON.stringify({ findings: [F({ confidence: 0 }), F({ confidence: 100 })] });
+    stubFetch(() => json(200, okChat(content)));
+    expect(await callLlm(fakeOpenAiEp(), msgs(), opts())).toEqual({
+      ok: true,
+      findings: [
+        { severity: "warning", file: "a.ts", line: 1, rule: "r", message: "m", source: "llm", confidence: 0 },
+        { severity: "warning", file: "a.ts", line: 1, rule: "r", message: "m", source: "llm", confidence: 100 },
+      ],
+      verdicts: { pairs: [], links: [], malformed: 0 },
+    });
+  });
+});
+
+describe("LLM structured patch (toFindings via callLlm)", () => {
+  const F = (extra: Record<string, unknown> = {}) => ({
+    severity: "warning",
+    file: "a.ts",
+    line: 1,
+    rule: "r",
+    message: "m",
+    suggestion: null,
+    ...extra,
+  });
+  const CLEAN = { severity: "warning", file: "a.ts", line: 1, rule: "r", message: "m", source: "llm" };
+
+  it("carries a string patch verbatim", async () => {
+    const content = JSON.stringify({ findings: [F({ patch: "const x = 1;" })] });
+    stubFetch(() => json(200, okChat(content)));
+    expect(await callLlm(fakeOpenAiEp(), msgs(), opts())).toEqual({
+      ok: true,
+      findings: [{ ...CLEAN, patch: "const x = 1;" }],
+      verdicts: { pairs: [], links: [], malformed: 0 },
+    });
+  });
+
+  it("null or absent patch stays absent (source still assigned)", async () => {
+    const content = JSON.stringify({ findings: [F(), F({ patch: null })] });
+    stubFetch(() => json(200, okChat(content)));
+    expect(await callLlm(fakeOpenAiEp(), msgs(), opts())).toEqual({
+      ok: true,
+      findings: [CLEAN, CLEAN],
+      verdicts: { pairs: [], links: [], malformed: 0 },
+    });
+  });
+
+  it("drops wrong-typed patches as a field only, keeping every finding (positions untouched)", async () => {
+    for (const bad of [["x"], 42, true, { a: 1 }]) {
+      const content = JSON.stringify({ findings: [F({ patch: bad })] });
+      stubFetch(() => json(200, okChat(content)));
+      expect(await callLlm(fakeOpenAiEp(), msgs(), opts())).toEqual({
+        ok: true,
+        findings: [CLEAN],
+        verdicts: { pairs: [], links: [], malformed: 0 },
+      });
+    }
+  });
+
+  it("a finding with suggestion only is unchanged (no patch field)", async () => {
+    const content = JSON.stringify({ findings: [F({ suggestion: "advice" })] });
+    stubFetch(() => json(200, okChat(content)));
+    const r = await callLlm(fakeOpenAiEp(), msgs(), opts());
+    expect(r).toEqual({
+      ok: true,
+      findings: [{ ...CLEAN, suggestion: "advice" }],
+      verdicts: { pairs: [], links: [], malformed: 0 },
+    });
+    expect(r.ok && "patch" in r.findings[0]).toBe(false);
+  });
 });
 
 describe("retry and timeout", () => {
@@ -350,13 +655,21 @@ describe("retry and timeout", () => {
 
   it("retries 5xx once then succeeds", async () => {
     stubFetch((_c, n) => (n === 1 ? json(503, { error: "busy" }) : json(200, okChat())));
-    expect(await callLlm(fakeOpenAiEp(), msgs(), opts())).toEqual({ ok: true, findings: [] });
+    expect(await callLlm(fakeOpenAiEp(), msgs(), opts())).toEqual({
+      ok: true,
+      findings: [],
+      verdicts: { pairs: [], links: [], malformed: 0 },
+    });
     expect(fetchCallCount()).toBe(2);
   }, 15000);
 
   it("retries 429 honoring Retry-After", async () => {
     stubFetch((_c, n) => (n === 1 ? json(429, {}, { "retry-after": "0" }) : json(200, okChat())));
-    expect(await callLlm(fakeOpenAiEp(), msgs(), opts())).toEqual({ ok: true, findings: [] });
+    expect(await callLlm(fakeOpenAiEp(), msgs(), opts())).toEqual({
+      ok: true,
+      findings: [],
+      verdicts: { pairs: [], links: [], malformed: 0 },
+    });
     expect(fetchCallCount()).toBe(2);
   });
 
@@ -368,7 +681,7 @@ describe("retry and timeout", () => {
     expect(fetchCallCount()).toBe(1);
     await vi.advanceTimersByTimeAsync(1);
     expect(fetchCallCount()).toBe(2);
-    expect(await p).toEqual({ ok: true, findings: [] });
+    expect(await p).toEqual({ ok: true, findings: [], verdicts: { pairs: [], links: [], malformed: 0 } });
   });
 
   it("clamps an oversized Retry-After to 5s", async () => {
@@ -379,7 +692,7 @@ describe("retry and timeout", () => {
     expect(fetchCallCount()).toBe(1);
     await vi.advanceTimersByTimeAsync(1);
     expect(fetchCallCount()).toBe(2);
-    expect(await p).toEqual({ ok: true, findings: [] });
+    expect(await p).toEqual({ ok: true, findings: [], verdicts: { pairs: [], links: [], malformed: 0 } });
   });
 
   it("without Retry-After, backs off 500ms before the retry", async () => {
@@ -390,7 +703,7 @@ describe("retry and timeout", () => {
     expect(fetchCallCount()).toBe(1);
     await vi.advanceTimersByTimeAsync(1);
     expect(fetchCallCount()).toBe(2);
-    expect(await p).toEqual({ ok: true, findings: [] });
+    expect(await p).toEqual({ ok: true, findings: [], verdicts: { pairs: [], links: [], malformed: 0 } });
   });
 
   it.each([
@@ -406,7 +719,7 @@ describe("retry and timeout", () => {
     expect(fetchCallCount()).toBe(1);
     await vi.advanceTimersByTimeAsync(1);
     expect(fetchCallCount()).toBe(2);
-    expect(await p).toEqual({ ok: true, findings: [] });
+    expect(await p).toEqual({ ok: true, findings: [], verdicts: { pairs: [], links: [], malformed: 0 } });
   });
 
   it("gives up after one retry on persistent 5xx", async () => {
@@ -687,5 +1000,20 @@ describe("callChatTurn", () => {
       ok: false,
       result: { ok: false, reason: "invalid-json", detail: "response truncated (finish_reason=length)" },
     });
+  });
+
+  it("attaches calls:1 usage on a turn when the body carries usage", async () => {
+    const usage: LlmUsage = { input: 8, output: 2, calls: 1 };
+    stubFetch(() => json(200, { ...okChat('{"findings":[]}'), usage: { prompt_tokens: 8, completion_tokens: 2 } }));
+    const r = await callChatTurn(fakeOpenAiEp(), conv(), turnOpts(), toolFlags);
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.usage).toEqual(usage);
+  });
+
+  it("null turn body: ok with no usage key (attach point stays absent)", async () => {
+    stubFetch(() => json(200, null));
+    const r = await callChatTurn(fakeOpenAiEp(), conv(), turnOpts(), toolFlags);
+    expect(r.ok).toBe(true);
+    expect(r).not.toHaveProperty("usage");
   });
 });

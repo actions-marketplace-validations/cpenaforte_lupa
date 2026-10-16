@@ -15,20 +15,23 @@ import {
   type FileDiff,
   type PrMeta,
 } from "./diff.js";
-import { runL0, type Finding } from "./fastpath.js";
+import { capText, MSG_CAP, RULE_CAP, runL0, type Finding } from "./fastpath.js";
 import { runL2 } from "./l2.js";
 import { TOOL_DEFS, type ToolContext } from "./agent-tools.js";
 import { AGENT_LIMITS, type Conversation } from "./agent-types.js";
 import {
+  fetchActor as fetchReviewActor,
   getRepoSize as fetchRepoSize,
+  listReviewThreads as fetchReviewThreads,
   postIssueFallback,
   postReview,
   ReadonlyTokenError,
   resolvePrNumber,
   shouldTrigger,
   StaleHeadError,
+  type ReviewThread,
 } from "./github.js";
-import { getInputs, type ActionInputs } from "./inputs.js";
+import { getInputs, DEFAULT_MAX_ARTIFACT_BYTES, type ActionInputs } from "./inputs.js";
 import { ensureLinkedRepo, parseLinkedRepos } from "./linked-repos.js";
 import {
   callByStyle,
@@ -36,12 +39,14 @@ import {
   callWithProbe,
   callWithProbeAgent as runProbeAgent,
   ensureOllama,
+  type DedupVerdicts,
   type LlmResult,
 } from "./llm.js";
-import { buildMessages, linkedIssueNumber } from "./prompt.js";
+import { buildMessages, ISSUE_TRUNCATION_MARKER, linkedIssueNumber, neutralise } from "./prompt.js";
 import { catalogProtocolFor, checkModelListed, resolveEndpoint, type CatalogProtocol, type ResolvedEndpoint } from "./providers.js";
-import { buildBody, buildFallbackReport, eventFor, exitFor, mapToComments, redactFindings, type ReviewPayload } from "./review.js";
+import { buildBody, buildFallbackReport, capBody, eventFor, exitFor, mapToComments, mergeDuplicates, omissionMarkerFor, partitionGate, prioritizeFindings, redactFindings, reopenedKey, resolveReopened, type InlineComment, type ReviewPayload } from "./review.js";
 import { runScanners, type ScannerResult } from "./scanners.js";
+import { readCappedFileSync } from "./artifact-limits.js";
 
 /** Everything the run needs from the environment. Built by readRunEnv() in production. */
 export interface RunEnv {
@@ -54,8 +59,8 @@ export interface RunEnv {
   artifactDir: string;
   baseSha: string;
   headSha: string;
-  /** PR_REVIEWER_TOKEN_TYPE === "app". An App token may write on a fork PR. */
-  tokenIsApp: boolean;
+  /** PR_REVIEWER_TOKEN_TYPE: "app" or "workflow-run" may write on a fork PR; "github-token" (and unset/unknown) never posts on a fork. */
+  tokenType: "app" | "workflow-run" | "github-token";
   /** PR_REVIEWER_ISSUE_FALLBACK === "true". Only set when the template grants issues: write. */
   issueFallback: boolean;
   /** GITHUB_STEP_SUMMARY, when present. */
@@ -78,8 +83,17 @@ export interface Gateway {
   getIssueBody(issue: number): Promise<string>;
   /** Repository size in KB, or undefined when unknown (any API error). */
   getRepoSize(owner: string, repo: string): Promise<number | undefined>;
-  createReview(pr: number, payload: ReviewPayload, opts: { canWrite: boolean }): Promise<void>;
+  createReview(pr: number, payload: ReviewPayload, opts: { canWrite: boolean; maxBodyChars?: number; blocking?: ReadonlySet<string>; commentKeys?: readonly (string | null)[] }): Promise<void>;
   createIssueComment(pr: number, body: string, opts: { enabled: boolean; issuesWrite: boolean }): Promise<void>;
+  /** This PR's review threads for the wrongly-resolved re-check (fail-open: empty on any error). */
+  listReviewThreads(pr: number): Promise<ReviewThread[]>;
+  /**
+   * Login that posted our reviews (primary: authenticated user; fallback: newest
+   * lupa-body review). Undefined when neither resolves — publishReview then
+   * skips the reopen check. The pr is passed explicitly: publishReview owns a.pr
+   * on both flows, with no context.issue dependency (undefined on workflow_run).
+   */
+  getActor(pr: number): Promise<string | undefined>;
 }
 
 /** Scanner, linter and LLM boundary. The privileged flow never invokes these. */
@@ -149,11 +163,8 @@ interface EventFields {
 
 const SHA_RE = /^[0-9a-f]{40}$/;
 const SEVERITIES: ReadonlySet<string> = new Set(["info", "warning", "high"]);
-const MSG_CAP = 2000;
 const SUGGESTION_CAP = 4000;
 const FILE_CAP = 200;
-const RULE_CAP = 100;
-const TRUNC_MARK = "…[truncated]";
 /** Emitted in place of L2 execution on fork PRs with secrets in scope. */
 const L2_SKIPPED: Finding = {
   severity: "info",
@@ -161,6 +172,7 @@ const L2_SKIPPED: Finding = {
   rule: "l2-skipped",
   message:
     "L2 native toolchains were not executed: fork PR with secrets in scope. Semgrep, gitleaks and trivy still ran.",
+  source: "l2",
 };
 
 /** Lockfile basename to the manifest that must change with it. Unmapped lockfiles are not flagged. */
@@ -302,21 +314,23 @@ function headerFile(line: string): string | undefined {
 
 /**
  * Splits `git diff -U3` output into per-file sections. `hunks` starts at the first `@@`, so
- * file headers never reach the hunk parsers. Binary sections are flagged from git's own text.
+ * file headers never reach the hunk parsers. Binary sections are flagged from git's own text,
+ * and deleted-file sections from the `deleted file mode` header.
  */
-function parseDiffFiles(text: string, workDir?: string): FileDiff[] {
-  type Section = { file: string; lines: string[]; binary: boolean };
+export function parseDiffFiles(text: string, workDir?: string): FileDiff[] {
+  type Section = { file: string; lines: string[]; binary: boolean; deleted: boolean };
   const sections: Section[] = [];
   let cur: Section | undefined;
   for (const line of text.split("\n")) {
     if (line.startsWith("diff --git ")) {
       const file = headerFile(line);
-      cur = file === undefined ? undefined : { file, lines: [], binary: false };
+      cur = file === undefined ? undefined : { file, lines: [], binary: false, deleted: false };
       if (cur !== undefined) sections.push(cur);
       continue;
     }
     if (cur === undefined) continue;
     if (line.startsWith("Binary files ") || line.startsWith("GIT binary patch")) cur.binary = true;
+    if (line.startsWith("deleted file mode")) cur.deleted = true;
     cur.lines.push(line);
   }
   return sections.map((s) => {
@@ -327,6 +341,7 @@ function parseDiffFiles(text: string, workDir?: string): FileDiff[] {
     const size = hunks === "" && !s.binary ? 0 : sizeOf(workDir, s.file);
     const f: FileDiff = { file: s.file, hunks, truncated: false, size };
     if (s.binary) f.binary = true;
+    if (s.deleted) f.deleted = true;
     return f;
   });
 }
@@ -341,16 +356,30 @@ function isFinding(v: unknown): v is Finding {
     typeof f.rule === "string" &&
     typeof f.message === "string" &&
     (f.line === undefined || (typeof f.line === "number" && Number.isInteger(f.line) && f.line >= 1)) &&
-    (f.suggestion === undefined || typeof f.suggestion === "string")
+    (f.suggestion === undefined || typeof f.suggestion === "string") &&
+    (f.patch === undefined || typeof f.patch === "string") &&
+    (f.source === undefined || (typeof f.source === "string" && f.source.length > 0 && f.source.length <= 100)) &&
+    (f.confidence === undefined ||
+      (typeof f.confidence === "number" && Number.isSafeInteger(f.confidence) && f.confidence >= 0 && f.confidence <= 100)) &&
+    (f.evidence === undefined ||
+      (typeof f.evidence === "object" &&
+        f.evidence !== null &&
+        !Array.isArray(f.evidence) &&
+        ((f.evidence as Record<string, unknown>).snippet === undefined ||
+          typeof (f.evidence as Record<string, unknown>).snippet === "string") &&
+        ((f.evidence as Record<string, unknown>).analyzer === undefined ||
+          typeof (f.evidence as Record<string, unknown>).analyzer === "string")))
   );
 }
 
-function readFindings(dir: string): Finding[] {
+export function readFindings(dir: string, maxBytes: number = DEFAULT_MAX_ARTIFACT_BYTES): Finding[] {
   const path = join(dir, "findings.json");
   if (!existsSync(path)) throw new Error(`lupa: findings.json not found in ${dir}`);
+  const capped = readCappedFileSync(path, maxBytes);
+  if (!capped.ok) throw new Error(`lupa: findings.json exceeds the artifact read limit (${maxBytes} bytes)`);
   let parsed: unknown;
   try {
-    parsed = JSON.parse(readFileSync(path, "utf8"));
+    parsed = JSON.parse(capped.text);
   } catch {
     throw new Error("lupa: findings.json is malformed JSON");
   }
@@ -367,16 +396,6 @@ function writeFindings(dir: string, findings: Finding[]): void {
 // ---------------------------------------------------------------------------
 // Finding sanitizing (R7). LLM output and the privileged artifact are untrusted text.
 // ---------------------------------------------------------------------------
-
-/**
- * Caps by code points (not UTF-16 units), so a cut never splits a surrogate pair.
- * The cap includes the truncation marker.
- */
-function capText(s: string, cap: number): string {
-  const cps = Array.from(s);
-  if (cps.length <= cap) return s;
-  return cps.slice(0, cap - Array.from(TRUNC_MARK).length).join("") + TRUNC_MARK;
-}
 
 /** C0 and DEL controls except TAB and LF (kept for multi-line messages and suggestions). */
 const CONTROL_KEEP_TEXT = /[\u0000-\u0008\u000b-\u001f\u007f]/g;
@@ -419,7 +438,104 @@ export function sanitizeFinding(f: Finding): Finding {
   if (f.suggestion !== undefined) {
     out.suggestion = capText(f.suggestion.replace(CONTROL_KEEP_TEXT, ""), SUGGESTION_CAP);
   }
+  if (f.patch !== undefined) {
+    out.patch = capText(f.patch.replace(CONTROL_KEEP_TEXT, ""), SUGGESTION_CAP);
+  }
+  if (f.source !== undefined) {
+    const stripped = f.source.replace(CONTROL_ALL, "");
+    if (stripped !== "") out.source = capText(stripped, RULE_CAP);
+  }
+  if (f.confidence !== undefined) out.confidence = f.confidence;
+  if (f.evidence !== undefined) {
+    const evidence: NonNullable<Finding["evidence"]> = {};
+    if (f.evidence.analyzer !== undefined) {
+      evidence.analyzer = capText(f.evidence.analyzer.replace(CONTROL_ALL, ""), RULE_CAP);
+    }
+    if (f.evidence.snippet !== undefined) {
+      evidence.snippet = capText(f.evidence.snippet.replace(CONTROL_KEEP_TEXT, ""), MSG_CAP);
+    }
+    out.evidence = evidence;
+  }
   return out;
+}
+
+// ---------------------------------------------------------------------------
+// Prompt budget (F10). The variable user-message portion of the single-shot
+// inference request — fast findings, linked-issue context, and diff together —
+// is bounded in UTF-8 bytes (Buffer.byteLength, what actually ships).
+// ---------------------------------------------------------------------------
+
+/** Prefix of `s` holding at most `maxBytes` UTF-8 bytes, cut on a code-point boundary. */
+function cutToBytes(s: string, maxBytes: number): string {
+  let bytes = 0;
+  let end = 0;
+  for (const ch of s) {
+    const bl = Buffer.byteLength(ch, "utf8");
+    if (bytes + bl > maxBytes) break;
+    bytes += bl;
+    end += ch.length;
+  }
+  return s.slice(0, end);
+}
+
+/**
+ * Fits the structured prompt regions into `budget` UTF-8 bytes. Cut order:
+ * linked-issue context first (truncate with a marker, or drop when the
+ * allowance is negative), then whole fast findings from the tail with a
+ * re-rendered omitted count; the diff is never cut. Every region is
+ * neutralised first, exactly as `buildMessages` renders it, and every
+ * measurement runs on the rendered string. Findings objects pass through
+ * (only their serialized form is escaped at render); posting and artifacts
+ * keep using the full `fast` array, so omitted findings still reach the review.
+ */
+export function budgetPrompt(
+  fast: Finding[],
+  promptText: string,
+  issueBody: string | undefined,
+  skipped: string[],
+  budget: number,
+  opts?: { withIds?: boolean },
+): { fast: Finding[]; promptText: string; issueBody: string | undefined; skipped: string[]; findingsOmitted: number; issueDropped: boolean } {
+  const nPrompt = neutralise(promptText);
+  const nIssueFull = issueBody !== undefined && issueBody.trim() !== "" ? neutralise(issueBody) : undefined;
+  const render = (f: Finding[], ib: string | undefined, omitted: number): string =>
+    buildMessages(f, nPrompt, ib, skipped, undefined, omitted, opts).user;
+
+  let curIssue = nIssueFull;
+  let issueDropped = false;
+  let kept = [...fast];
+  let omitted = 0;
+
+  if (Buffer.byteLength(render(kept, curIssue, 0), "utf8") <= budget) {
+    return { fast: kept, promptText: nPrompt, issueBody: curIssue, skipped: skipped.map(neutralise), findingsOmitted: 0, issueDropped: false };
+  }
+
+  // Step 1: linked-issue context. The allowance is sized once against the full
+  // findings set: budget minus everything else plus the fixed cost of carrying
+  // any issue text (header, separators, tags, marker — byte-exact, measured on
+  // the rendered regions, never estimated).
+  if (curIssue !== undefined) {
+    const noIssueBytes = Buffer.byteLength(render(kept, undefined, 0), "utf8");
+    const markerBytes = Buffer.byteLength(ISSUE_TRUNCATION_MARKER, "utf8");
+    const issueOverhead =
+      Buffer.byteLength(render(kept, ISSUE_TRUNCATION_MARKER, 0), "utf8") - noIssueBytes - markerBytes;
+    const allowance = budget - noIssueBytes - issueOverhead;
+    if (allowance < markerBytes) {
+      curIssue = undefined;
+      issueDropped = true;
+    } else if (Buffer.byteLength(curIssue, "utf8") > allowance) {
+      curIssue = cutToBytes(curIssue, allowance - markerBytes) + ISSUE_TRUNCATION_MARKER;
+    }
+  }
+
+  // Step 2: fast-findings overflow. Whole findings dropped from the tail with a
+  // re-rendered count — never mid-finding cuts, so the JSON stays parseable.
+  while (kept.length > 0 && Buffer.byteLength(render(kept, curIssue, omitted), "utf8") > budget) {
+    kept = kept.slice(0, -1);
+    omitted += 1;
+  }
+
+  return { fast: kept, promptText: nPrompt, issueBody: curIssue, skipped: skipped.map(neutralise), findingsOmitted: omitted, issueDropped };
 }
 
 // ---------------------------------------------------------------------------
@@ -470,9 +586,12 @@ function summaryFor(findings: Finding[]): string {
  * Slow path (LLM). Returns undefined when it is skipped: no key, nothing to send, bad config,
  * an absent model, or a failed call. Every skip is a warning; the fast path still posts.
  * The LLM key is intentional API use; the model is given no tools.
+ * On success the verdict envelope carries the model's duplicate judgements with links
+ * converted to absolute all-list indices; the agent-mode return carries no verdicts (no merge, by design).
  */
 async function slowPath(
   env: RunEnv,
+  out: Outcome,
   deps: Deps,
   pr: number,
   fast: Finding[],
@@ -480,8 +599,15 @@ async function slowPath(
   issueBody: string | undefined,
   skipped: string[],
   prBody: string,
-): Promise<Finding[] | undefined> {
+): Promise<{ findings: Finding[]; verdicts?: DedupVerdicts } | undefined> {
   const i = env.inputs;
+  /** One aggregate-usage line when the consumed result observed usage; silent otherwise. */
+  const noteUsage = (result: LlmResult): void => {
+    if (result.ok && result.usage !== undefined) {
+      const u = result.usage;
+      note(env, out, `lupa: llm usage input=${u.input} output=${u.output} tokens (calls=${u.calls})`);
+    }
+  };
   if (i.llmApiKey === "") {
     core.info("no llm_api_key: slow path skipped");
     return undefined;
@@ -527,7 +653,26 @@ async function slowPath(
   if (check.status === "unknown") {
     core.warning(`model check inconclusive (${check.detail ?? "unknown error"}); continuing`);
   }
-  const messages = buildMessages(fast, promptText, issueBody, skipped);
+  const promptFast = fast.map(sanitizeFinding);
+  const b = budgetPrompt(promptFast, promptText, issueBody, skipped, i.maxPromptChars, { withIds: !i.llmAgent });
+  const messages = buildMessages(
+    b.fast,
+    b.promptText,
+    b.issueBody,
+    b.skipped,
+    i.llmAgent ? { maxTurns: i.llmAgentMaxTurns } : undefined,
+    b.findingsOmitted,
+    { withIds: !i.llmAgent },
+  );
+  const promptBytes = Buffer.byteLength(messages.user, "utf8");
+  if (promptBytes > i.maxPromptChars) {
+    core.warning(`prompt ${promptBytes} exceeds max_prompt_chars ${i.maxPromptChars} after bounded cuts`);
+    note(env, out, `lupa: prompt ${promptBytes} exceeds max_prompt_chars ${i.maxPromptChars} after bounded cuts — LLM review skipped, gate uses fast findings only.`);
+    return undefined;
+  }
+  if (b.issueDropped) {
+    core.info(`linked issue context dropped to fit the ${i.maxPromptChars}-byte prompt budget`);
+  }
   const llmOpts = {
     model: i.llmModel,
     apiKey: i.llmApiKey,
@@ -551,13 +696,14 @@ async function slowPath(
     if (linked.length > 0) core.info(`agent linked repositories: ${linked.join(", ")}`);
     const toolCtx: ToolContext = {
       roots: { self: env.workDir, linked: new Map() },
-      ensureLinked: async (alias) => {
+      ensureLinked: async (alias, opts?) => {
         if (!linked.some((l) => l.toLowerCase() === alias.toLowerCase()))
           return { error: "repository not accessible: " + alias };
         const r = await ensureLinkedRepo(alias, {
           token: i.githubToken,
           baseDir: join(process.env.RUNNER_TEMP ?? tmpdir(), "lupa-linked"),
           maxBytes: AGENT_LIMITS.cloneMaxBytes,
+          deadlineMs: opts?.deadlineMs,
           sizeKb: async (a) => {
             const parts = a.split("/");
             if (parts.length !== 2) return undefined;
@@ -573,7 +719,7 @@ async function slowPath(
       },
     };
     const conv: Conversation = {
-      ...buildMessages(fast, promptText, issueBody, skipped, { maxTurns: i.llmAgentMaxTurns }),
+      ...messages,
       tools: [...TOOL_DEFS],
     };
     if (linked.length > 0)
@@ -603,7 +749,8 @@ async function slowPath(
       core.warning(`slow path failed (${res.reason}): ${res.detail}`);
       return undefined;
     }
-    return res.findings;
+    noteUsage(res);
+    return { findings: res.findings };
   }
   const res: LlmResult =
     i.llmApiStyle === "auto" && i.llmPath === ""
@@ -613,7 +760,29 @@ async function slowPath(
     core.warning(`slow path failed (${res.reason}): ${res.detail}`);
     return undefined;
   }
-  return res.findings;
+  const verdicts = res.verdicts;
+  if (verdicts === undefined) {
+    noteUsage(res);
+    return { findings: res.findings };
+  }
+  // Links convert to absolute all-list indices against the UNCUT fast list (never b.fast.length).
+  // Verdicts naming a cut-tail sent index (≥ b.fast.length) name findings the model never saw:
+  // dropped whole and counted as malformed. All findings are kept regardless.
+  const kept = b.fast.length;
+  let malformed = verdicts.malformed;
+  const pairs: Array<[number, number]> = [];
+  for (const [a, c] of verdicts.pairs) {
+    if (c >= kept || a >= kept) malformed += 1;
+    else pairs.push([a, c]);
+  }
+  const links: Array<[number, number]> = [];
+  for (const [r, s] of verdicts.links) {
+    if (s >= kept) malformed += 1;
+    else links.push([fast.length + r, s]);
+  }
+  if (malformed > 0) core.warning(`lupa: ignored ${malformed} malformed dedup verdict(s)`);
+  noteUsage(res);
+  return { findings: res.findings, verdicts: { pairs, links, malformed } };
 }
 
 // Artifact redaction is runtime-key masking only: the run's own github_token and
@@ -632,48 +801,130 @@ interface PublishArgs {
   findings: Finding[];
   hunks: FileDiff[];
   headSha: string;
+  verdicts?: DedupVerdicts;
+}
+
+/**
+ * Renders overflow inline comments into body text in the same item shape as
+ * the off-diff fold in github.ts (`- path:line` plus two-space-indented
+ * continuation lines). Items outside the blocking set carry a ` (non-blocking)`
+ * suffix (rule absent means assume blocking: no marker). When the general
+ * section is empty the block carries its heading; otherwise it continues the
+ * existing list.
+ */
+function foldExcessInline(withHeading: boolean, excess: InlineComment[], blocking?: ReadonlySet<string>): string {
+  const items = excess.map((c) => {
+    const text = c.body.replace(/\r\n?/g, "\n").replace(/(\n[ \t]*)+$/, "");
+    const key = c.rule === undefined ? null : `${c.rule}\0${c.path}\0${c.line}`;
+    const suffix = key !== null && blocking !== undefined && !blocking.has(key) ? " (non-blocking)" : "";
+    const head = `- ${c.path}:${c.line}${suffix}`;
+    if (text.trim() === "") return head;
+    return `${head}\n  ${text.replace(/\n/g, "\n  ")}`;
+  });
+  return withHeading ? `\n\n**Findings not placed inline:**\n${items.join("\n")}` : `\n${items.join("\n")}`;
 }
 
 /**
  * Posts one review for `headSha`, or dry-runs it. Writes the summary in every case. Posts only
  * when the token can write and the PR head still equals `headSha` (checked via the API).
  * A failed issue fallback is a warning; it never changes the exit code.
+ *
+ * The blocking set (PR-touched findings plus wrongly-resolved reopened ones) is
+ * computed BEFORE all early returns (dry-run, fork-readonly, stale-head) and
+ * returned for the flow exits, so every exit path gates on it. The reopen read
+ * (getActor + listReviewThreads) is short-circuited when every merged finding
+ * is already introduced — reopen can add nothing — or when no token is
+ * configured (empty token: no call, no warn), and any thread/infra
+ * failure falls back to diff-only gating without throwing.
  */
-async function publishReview(a: PublishArgs): Promise<void> {
-  const findings = redactFindings(a.findings, runtimeSecrets(a.env));
-  const { inline, general } = mapToComments(findings, parseHunks(a.hunks));
-  const report = buildFallbackReport(findings);
-  const body = buildBody(general, summaryFor(findings));
+async function publishReview(a: PublishArgs): Promise<{ blocking: Finding[] }> {
+  const fullSet = redactFindings(a.findings, runtimeSecrets(a.env));
+  const inputs = a.env.inputs;
+  // Dedup merge before the funnel. Gate inputs keep the full pre-merge set (provably
+  // identical outcomes); the funnel — top-N, inline, body — runs on the merged set, and
+  // omission counts reflect the post-merge cut (merged-away findings are represented, never omitted).
+  const { merged, dropped } =
+    a.verdicts === undefined ? { merged: fullSet, dropped: 0 } : mergeDuplicates(fullSet, a.verdicts);
+  if (dropped > 0) core.warning(`lupa: ignored ${dropped} unmergeable dedup verdict(s)`);
+  const parsed = parseHunks(a.hunks);
+  const { introduced } = partitionGate(merged, parsed, a.hunks);
+  const introducedKeys = new Set(introduced.map(reopenedKey));
+  let reopened = new Set<string>();
+  if (introduced.length < merged.length && a.env.inputs.githubToken !== "") {
+    try {
+      const self = await a.deps.gh.getActor(a.pr);
+      if (self === undefined) {
+        core.warning("lupa: review actor unknown; skipping the wrongly-resolved re-check");
+      } else {
+        reopened = resolveReopened(merged, await a.deps.gh.listReviewThreads(a.pr), self);
+      }
+    } catch {
+      core.warning("lupa: review-thread re-read failed; gating on diff membership only");
+      reopened = new Set<string>();
+    }
+  }
+  // Single filter over merged in merged order: introduced or reopened. A
+  // finding that is both is counted once (never concatenated).
+  const blocking = merged.filter((f) => introducedKeys.has(reopenedKey(f)) || reopened.has(reopenedKey(f)));
+  const blockingKeys = new Set(blocking.map(reopenedKey));
+  // Publication funnel: top-N by severity, then the inline cap (excess folds
+  // to the body), then the body char cap. Gates keep the blocking set.
+  const ordered = prioritizeFindings(merged);
+  const retained = ordered.slice(0, inputs.maxFindings);
+  const omitted = merged.length - retained.length;
+  const omissionMarker = omitted > 0 ? omissionMarkerFor(omitted, inputs.maxFindings) : undefined;
+  const { inline, general } = mapToComments(retained, parsed, reopened);
+  const postedInline = inline.slice(0, inputs.maxInlineComments);
+  const excessInline = inline.slice(inputs.maxInlineComments);
+  let body = buildBody(general, summaryFor(fullSet), { reopened, blocking: blockingKeys });
+  if (excessInline.length > 0) body += foldExcessInline(general.length === 0, excessInline, blockingKeys);
+  const capped = capBody(body, inputs.maxReviewBodyChars, omissionMarker === undefined ? [] : [omissionMarker]);
+  // commentKeys ride index-aligned with the posted comments for the 422 fold path;
+  // rule is internal (fold keys only) and never ships in the payload.
+  const commentKeys = postedInline.map((c) => (c.rule === undefined ? null : `${c.rule}\0${c.path}\0${c.line}`));
   const payload: ReviewPayload = {
     commit_id: a.headSha,
-    body,
-    event: eventFor(a.env.inputs.failLevel, findings),
-    comments: inline,
+    body: capped,
+    event: eventFor(inputs.failLevel, blocking),
+    comments: postedInline.map(({ rule, ...c }) => c),
   };
   if (a.env.summaryPath !== undefined) {
-    appendFileSync(a.env.summaryPath, report + "\n", "utf8");
-    a.out.summaryWritten = true;
+    // The 1 MiB platform ceiling minus bytes already in the file minus the
+    // trailing newline the append adds; a missing file counts as empty.
+    let existing = 0;
+    try {
+      existing = statSync(a.env.summaryPath).size;
+    } catch {
+      existing = 0;
+    }
+    try {
+      const report = buildFallbackReport(fullSet, { maxBytes: 1048576 - existing - 1 });
+      appendFileSync(a.env.summaryPath, report + "\n", "utf8");
+      a.out.summaryWritten = true;
+    } catch (e) {
+      core.warning(`summary report skipped: ${(e as Error).message}`);
+    }
   }
   if (!a.env.inputs.postComment) {
-    const high = findings.filter((f) => f.severity === "high").length;
+    const high = fullSet.filter((f) => f.severity === "high").length;
     core.info(
       `post_comment is false: dry-run, nothing posted (would post event=${payload.event}, ` +
-        `inline=${inline.length}, general=${general.length}, high=${high})`,
+        `inline=${postedInline.length}, general=${general.length + excessInline.length}, high=${high}, blocking=${blocking.length}, omitted=${omitted})`,
     );
-    return;
+    return { blocking };
   }
-  const canWrite = !a.isFork || a.env.tokenIsApp;
+  const canWrite = !a.isFork || a.env.tokenType === "app" || a.env.tokenType === "workflow-run";
   if (!canWrite) {
     core.warning("fork PR with a read-only token: review not posted; summary and artifact only");
-    return;
+    return { blocking };
   }
   const live = await a.deps.gh.getPr(a.pr);
   if (live.headSha !== a.headSha) {
     core.warning(`PR head moved from ${a.headSha} to ${live.headSha}: skipping review for the stale head`);
-    return;
+    return { blocking };
   }
   try {
-    await a.deps.gh.createReview(a.pr, payload, { canWrite: true });
+    await a.deps.gh.createReview(a.pr, payload, { canWrite: true, maxBodyChars: inputs.maxReviewBodyChars, blocking: blockingKeys, commentKeys });
     a.out.posted = true;
   } catch (e) {
     if (e instanceof StaleHeadError) {
@@ -684,7 +935,7 @@ async function publishReview(a: PublishArgs): Promise<void> {
       );
       a.out.staleSkipped = true;
       a.out.exitCode = 0;
-      return;
+      return { blocking };
     }
     if (!(e instanceof ReadonlyTokenError)) throw e;
     core.error(`review post refused by GitHub: ${e.detail !== "" ? e.detail : e.message}`);
@@ -693,15 +944,26 @@ async function publishReview(a: PublishArgs): Promise<void> {
     const issuesWrite = a.env.issueFallback && canWrite;
     if (!issuesWrite) {
       core.warning("issue fallback unavailable (not enabled, or token lacks issues: write); nothing posted");
-      return;
+      return { blocking };
     }
     try {
-      await a.deps.gh.createIssueComment(a.pr, report, { enabled: a.env.issueFallback, issuesWrite });
+      // The fallback publishes the retained (publication-capped) set with the
+      // publication omission marker prepended; its native marker covers any
+      // further byte overflow. The char-cap value doubles as a conservative
+      // byte budget (stricter for multibyte text, never looser).
+      const budget =
+        omissionMarker === undefined
+          ? inputs.maxReviewBodyChars
+          : inputs.maxReviewBodyChars - Buffer.byteLength(omissionMarker, "utf8") - 2;
+      const fallbackReport = buildFallbackReport(retained, { maxBytes: budget });
+      const fallbackBody = omissionMarker === undefined ? fallbackReport : `${omissionMarker}\n\n${fallbackReport}`;
+      await a.deps.gh.createIssueComment(a.pr, fallbackBody, { enabled: a.env.issueFallback, issuesWrite });
       a.out.posted = true;
     } catch (fallbackErr) {
       core.warning(`issue fallback failed: ${(fallbackErr as Error).message}`);
     }
   }
+  return { blocking };
 }
 
 /**
@@ -724,6 +986,16 @@ export function toSarif(findings: Finding[]): unknown {
           },
         },
       ],
+      // Provenance (Q04, display-only): each field independently iff present;
+      // omitted entirely when both are absent. `message.text` is unchanged.
+      ...((f.source !== undefined || f.confidence !== undefined
+        ? {
+            properties: {
+              ...(f.source !== undefined ? { source: f.source } : {}),
+              ...(f.confidence !== undefined ? { confidence: f.confidence } : {}),
+            },
+          }
+        : {})),
     }));
   return {
     $schema: "https://json.schemastore.org/sarif-2.1.0.json",
@@ -774,7 +1046,7 @@ async function runFlowA(env: RunEnv, deps: Deps, out: Outcome): Promise<void> {
   // L2 toolchains (linters, build tooling) would execute PR-controlled config with secrets nearby,
   // so they are skipped. Trusted, data-driven scanners still run.
   const forkWithSecrets =
-    pull.isFork && (env.eventName !== "pull_request" || env.tokenIsApp || env.inputs.llmApiKey !== "");
+    pull.isFork && (env.eventName !== "pull_request" || env.tokenType === "app" || env.inputs.llmApiKey !== "");
   const { scan, l2 } = await withScrubbedEnv(async () => {
     const s = await deps.analysis.runScanners({
       dir: env.workDir,
@@ -783,6 +1055,7 @@ async function runFlowA(env: RunEnv, deps: Deps, out: Outcome): Promise<void> {
       sbom: true,
       lockfiles,
       outDir: env.artifactDir,
+      maxArtifactBytes: env.inputs.maxArtifactBytes,
     });
     if (forkWithSecrets) {
       core.warning("fork PR with secrets in scope: L2 native toolchains skipped");
@@ -816,16 +1089,26 @@ async function runFlowA(env: RunEnv, deps: Deps, out: Outcome): Promise<void> {
     }
   }
 
-  const llm = await slowPath(env, deps, pr, fast, prompt.text, issueBody, prompt.skipped, pull.body);
+  const llm = await slowPath(env, out, deps, pr, fast, prompt.text, issueBody, prompt.skipped, pull.body);
+  if (llm === undefined) {
+    note(env, out, "lupa: dedup skipped (slow path unavailable); scanner findings published unmerged");
+  }
   out.slowPathSkipped = llm === undefined;
   out.findingsFrom = llm === undefined ? "fastpath" : "llm";
-  const all = [...fast, ...(llm ?? [])].map(sanitizeFinding);
+  // No judge ran (no LLM): the verdicts key still lands on pr-meta as the empty object.
+  // Agent runs carry no verdicts and merge nothing, by design.
+  const verdicts: DedupVerdicts | undefined =
+    llm === undefined ? { pairs: [], links: [], malformed: 0 } : llm.verdicts;
+  const all = [...fast, ...(llm?.findings ?? [])].map(sanitizeFinding);
   const redacted = redactFindings(all, runtimeSecrets(env));
   writeFindings(env.artifactDir, redacted);
-  writeFileSync(join(env.artifactDir, "sarif.json"), JSON.stringify(toSarif(redacted), null, 2) + "\n", "utf8");
+  writePrMeta(verdicts === undefined ? meta : { ...meta, verdicts }, env.artifactDir);
+  // SARIF is a publication surface: the same pure merge over the same inputs as the funnel.
+  const { merged: sarifSet } = verdicts === undefined ? { merged: redacted } : mergeDuplicates(redacted, verdicts);
+  writeFileSync(join(env.artifactDir, "sarif.json"), JSON.stringify(toSarif(sarifSet), null, 2) + "\n", "utf8");
 
-  await publishReview({ env, deps, out, pr, isFork: pull.isFork, findings: all, hunks: files, headSha: env.headSha });
-  if (!out.staleSkipped) out.exitCode = exitFor(env.inputs.failLevel, all);
+  const { blocking } = await publishReview({ env, deps, out, pr, isFork: pull.isFork, findings: all, hunks: files, headSha: env.headSha, verdicts });
+  if (!out.staleSkipped) out.exitCode = exitFor(env.inputs.failLevel, blocking);
 }
 
 /**
@@ -836,7 +1119,7 @@ async function runFlowA(env: RunEnv, deps: Deps, out: Outcome): Promise<void> {
 async function runFlowB(env: RunEnv, deps: Deps, out: Outcome): Promise<void> {
   out.slowPathSkipped = true;
   // Sanitizing pass for the privileged flow (Flow A sanitizes in runFlowA; publishReview does not sanitize).
-  const meta = readPrMeta(env.artifactDir);
+  const meta = readPrMeta(env.artifactDir, env.inputs.maxArtifactBytes);
   if (meta === undefined) {
     throw new Error(
       `lupa: pr-meta.json not found in ${env.artifactDir}; refusing to post without the PR run's artifact`,
@@ -875,10 +1158,12 @@ async function runFlowB(env: RunEnv, deps: Deps, out: Outcome): Promise<void> {
   if (live.headRef !== runBranch) {
     throw new Error("lupa: PR head branch does not match workflow_run.head_branch; refusing to post");
   }
-  const findings = readFindings(env.artifactDir).map(sanitizeFinding);
+  const findings = readFindings(env.artifactDir, env.inputs.maxArtifactBytes).map(sanitizeFinding);
   const hunks = parseDiffFiles(readDiff(env.artifactDir));
-  await publishReview({ env, deps, out, pr, isFork: live.isFork, findings, hunks, headSha });
-  if (!out.staleSkipped) out.exitCode = exitFor(env.inputs.failLevel, findings);
+  // A missing verdicts key means no judge ran: silent no-merge. Out-of-range indices
+  // range-check inside the publishReview merge (dropped with the count).
+  const { blocking } = await publishReview({ env, deps, out, pr, isFork: live.isFork, findings, hunks, headSha, verdicts: meta.verdicts });
+  if (!out.staleSkipped) out.exitCode = exitFor(env.inputs.failLevel, blocking);
 }
 
 /** Runs one review. Returns the outcome; main() maps exitCode to the process. */
@@ -929,8 +1214,19 @@ function realGateway(token: string): Gateway {
       return r.data.body ?? "";
     },
     getRepoSize: (owner, repo) => fetchRepoSize(octokit(), owner, repo),
+    listReviewThreads: async (pr) => {
+      // No token (dry-run without one): skip silently — the expected path.
+      if (token === "") return [];
+      const { owner, repo } = context.repo;
+      return fetchReviewThreads(octokit(), owner, repo, pr);
+    },
+    getActor: async (pr) => {
+      if (token === "") return undefined;
+      const { owner, repo } = context.repo;
+      return fetchReviewActor(octokit(), owner, repo, pr);
+    },
     createReview: (pr, payload, opts) =>
-      postReview(octokit(), pr, payload, { canWrite: opts.canWrite }).then(() => undefined),
+      postReview(octokit(), pr, payload, { canWrite: opts.canWrite, maxBodyChars: opts.maxBodyChars, blocking: opts.blocking, commentKeys: opts.commentKeys }).then(() => undefined),
     createIssueComment: (pr, body, opts) => postIssueFallback(octokit(), { pr, body, ...opts }),
   };
 }
@@ -971,6 +1267,8 @@ export function readRunEnv(): RunEnv {
       ? (JSON.parse(readFileSync(eventPath, "utf8")) as Record<string, unknown>)
       : {};
   const inputs = getInputs();
+  const value = process.env.PR_REVIEWER_TOKEN_TYPE;
+  const tokenType = value === 'app' ? 'app' : value === 'workflow-run' ? 'workflow-run' : 'github-token';
   return {
     eventName: process.env.GITHUB_EVENT_NAME ?? "",
     payload,
@@ -979,7 +1277,7 @@ export function readRunEnv(): RunEnv {
     artifactDir: process.env.PR_REVIEWER_ARTIFACT_DIR ?? join(process.env.RUNNER_TEMP ?? tmpdir(), "pr-reviewer-out"),
     baseSha: process.env.PR_REVIEWER_BASE_SHA ?? "",
     headSha: process.env.PR_REVIEWER_HEAD_SHA ?? "",
-    tokenIsApp: process.env.PR_REVIEWER_TOKEN_TYPE === "app",
+    tokenType,
     issueFallback: process.env.PR_REVIEWER_ISSUE_FALLBACK === "true",
     ...(process.env.GITHUB_STEP_SUMMARY ? { summaryPath: process.env.GITHUB_STEP_SUMMARY } : {}),
   };

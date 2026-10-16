@@ -3,7 +3,9 @@ import type { Conversation, ToolCall } from "../agent-types.js";
 import {
   attempt,
   errMessage,
+  extractUsage,
   parseContent,
+  parseVerdicts,
   redact,
   retryDelayMs,
   sleep,
@@ -237,7 +239,13 @@ export async function callMessages(
   if (findings === undefined) {
     return { ok: false, reason: "invalid-json", detail: "response does not match the review schema" };
   }
-  return { ok: true, findings };
+  const u = extractUsage(json, "anthropic-messages");
+  return {
+    ok: true,
+    findings,
+    verdicts: parseVerdicts(parsed),
+    ...(u ? { usage: { ...u, calls: 1 } } : {}),
+  };
 }
 
 /**
@@ -310,5 +318,12 @@ export async function callMessagesTurn(
   }
   const reply = parseMessagesReply(json, mFlags);
   if (!reply.ok) return { ok: false, result: reply.result };
-  return { ok: true, text: reply.text ?? "", toolCalls: reply.toolCalls, rawItems: reply.rawItems };
+  const u = extractUsage(json, "anthropic-messages");
+  return {
+    ok: true,
+    text: reply.text ?? "",
+    toolCalls: reply.toolCalls,
+    rawItems: reply.rawItems,
+    ...(u ? { usage: { ...u, calls: 1 } } : {}),
+  };
 }

@@ -71,7 +71,7 @@ afterEach(() => {
 describe("callResponses", () => {
   it("posts input array + max_output_tokens + strict format", async () => {
     const r = await callResponses(fakeResponsesEp(), msgs(), opts());
-    expect(r).toEqual({ ok: true, findings: [] });
+    expect(r).toEqual({ ok: true, findings: [], verdicts: { pairs: [], links: [], malformed: 0 } });
     expect(calls.at(-1)!.url).toBe("https://opencode.ai/zen/v1/responses");
     const body = lastBody();
     expect(body.model).toBe("gpt-6-luna");
@@ -92,12 +92,27 @@ describe("callResponses", () => {
     expect(body.top_p).toBeUndefined();
   });
 
+  it("attaches calls:1 usage when the envelope carries usage; absent otherwise", async () => {
+    stubFetch(() => json(200, okResponses('{"findings":[]}', { usage: { input_tokens: 7, output_tokens: 3 } })));
+    const withUsage = await callResponses(fakeResponsesEp(), msgs(), opts());
+    expect(withUsage).toEqual({
+      ok: true,
+      findings: [],
+      verdicts: { pairs: [], links: [], malformed: 0 },
+      usage: { input: 7, output: 3, calls: 1 },
+    });
+    stubFetch(() => json(200, okResponses('{"findings":[]}')));
+    const withoutUsage = await callResponses(fakeResponsesEp(), msgs(), opts());
+    expect(withoutUsage.ok).toBe(true);
+    expect(withoutUsage).not.toHaveProperty("usage");
+  });
+
   it("falls back without format on 400", async () => {
     stubFetch((_c, n) =>
       n === 1 ? json(400, { error: "unsupported format" }) : json(200, okResponses('{"findings":[]}')),
     );
     const r = await callResponses(fakeResponsesEp(), msgs(), opts());
-    expect(r).toEqual({ ok: true, findings: [] });
+    expect(r).toEqual({ ok: true, findings: [], verdicts: { pairs: [], links: [], malformed: 0 } });
     expect(calls.length).toBe(2);
     expect(JSON.parse(String(calls[0]!.init.body)).text).toBeDefined();
     expect(JSON.parse(String(calls[1]!.init.body))).not.toHaveProperty("text");
@@ -113,7 +128,7 @@ describe("callResponses", () => {
         ],
       }),
     );
-    expect(await callResponses(fakeResponsesEp(), msgs(), opts())).toEqual({ ok: true, findings: [] });
+    expect(await callResponses(fakeResponsesEp(), msgs(), opts())).toEqual({ ok: true, findings: [], verdicts: { pairs: [], links: [], malformed: 0 } });
   });
 
   it("refusal item → content-filter skip; incomplete → degrade", async () => {
@@ -145,7 +160,7 @@ describe("callResponses", () => {
     stubFetch((_c, n) =>
       n === 1 ? json(429, { error: "rate limited" }, { "retry-after": "0" }) : json(200, okResponses('{"findings":[]}')),
     );
-    expect(await callResponses(fakeResponsesEp(), msgs(), opts())).toEqual({ ok: true, findings: [] });
+    expect(await callResponses(fakeResponsesEp(), msgs(), opts())).toEqual({ ok: true, findings: [], verdicts: { pairs: [], links: [], malformed: 0 } });
     expect(calls.length).toBe(2);
 
     // Persistent 5xx → exactly one retry (two calls, never three).
@@ -206,6 +221,19 @@ describe("callResponsesTurn", () => {
       { type: "function", name: "read_file", description: "Read a file", parameters: toolDef.parameters },
     ]);
     expect("text" in body).toBe(false);
+  });
+
+  it("turn attaches calls:1 usage from the envelope", async () => {
+    stubFetch(() =>
+      json(200, {
+        status: "completed",
+        output: [{ type: "message", content: [{ type: "output_text", text: '{"findings":[]}' }] }],
+        usage: { input_tokens: 9, output_tokens: 1 },
+      }),
+    );
+    const r = await callResponsesTurn(fakeResponsesEp(), conv(), turnOpts(), toolFlags);
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.usage).toEqual({ input: 9, output: 1, calls: 1 });
   });
 
   it("translates function_call echo and function_call_output", async () => {

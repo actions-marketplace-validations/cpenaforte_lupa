@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { buildBody, buildFallbackReport, eventFor, exitFor, mapToComments, redactFindings } from "../src/review.js";
-import { parseHunks } from "../src/diff.js";
-import type { Finding } from "../src/fastpath.js";
+import { buildBody, buildFallbackReport, capBody, eventFor, exitFor, formatBody, hasPatch, indexHunks, isTruncNoteLine, mapToComments, mergeDuplicates, normalizeBot, omissionMarkerFor, partitionGate, prioritizeFindings, redactFindings, reopenedKey, resolveReopened, truncNoteFor } from "../src/review.js";
+import { parseHunks, type FileDiff } from "../src/diff.js";
+import type { DedupVerdicts } from "../src/llm.js";
+import { TRUNC_MARK, type Finding } from "../src/fastpath.js";
 
 // a.ts: line 3 is a deletion (LEFT 3), line 4 an addition (RIGHT 4); line 99 is outside every hunk.
 function hunksFixture() {
@@ -118,9 +119,9 @@ describe("mapToComments", () => {
     expect("start_side" in withoutSuggestion.inline[0]).toBe(false);
   });
 
-  it("RIGHT suggestion renders a ```suggestion fence", () => {
+  it("RIGHT patch renders a ```suggestion fence", () => {
     const r = mapToComments(
-      [{ severity: "warning", file: "a.ts", line: 10, rule: "r", message: "m", suggestion: "fixed" }],
+      [{ severity: "warning", file: "a.ts", line: 10, rule: "r", message: "m", patch: "fixed" }],
       rangeFixture(),
     );
     expect(r.inline[0].body).toContain("```suggestion\nfixed\n```");
@@ -147,14 +148,14 @@ describe("mapToComments", () => {
     expect(r.inline[0].body).not.toContain("```");
   });
 
-  it("suggestion containing backticks gets a longer fence that cannot be closed early", () => {
-    const suggestion = "a ```js\nx\n```";
+  it("patch containing backticks gets a longer fence that cannot be closed early", () => {
+    const patch = "a ```js\nx\n```";
     const r = mapToComments(
-      [{ severity: "warning", file: "a.ts", line: 10, rule: "r", message: "m", suggestion }],
+      [{ severity: "warning", file: "a.ts", line: 10, rule: "r", message: "m", patch }],
       rangeFixture(),
     );
     const body = r.inline[0].body;
-    expect(body).toContain("````suggestion\n" + suggestion + "\n````");
+    expect(body).toContain("````suggestion\n" + patch + "\n````");
     expect(body.endsWith("````")).toBe(true);
   });
 
@@ -193,6 +194,132 @@ describe("mapToComments", () => {
     const body = buildBody(r.general, "sum");
     expect(body).toContain("Suggested: s");
     expect(body).not.toContain("```");
+  });
+});
+
+describe("indexHunks", () => {
+  it("indexes RIGHT and LEFT lines with first-write-wins", () => {
+    const hunks = parseHunks([{ file: "a.ts", hunks: "@@ -3,1 +3,1 @@\n-old\n+new\n" }]);
+    const index = indexHunks(hunks);
+    expect(index.get("a.ts")?.get("LEFT:3")).toEqual({ side: "LEFT", line: 3, kind: "del" });
+    expect(index.get("a.ts")?.get("RIGHT:3")).toEqual({ side: "RIGHT", line: 3, kind: "add" });
+    expect(index.get("missing.ts")).toBeUndefined();
+  });
+
+  it("parity with mapToComments placement: RIGHT-wins, LEFT-fallback, fileless/lineless/off-diff go general", () => {
+    const hunks = parseHunks([
+      { file: "a.ts", hunks: "@@ -3,1 +3,1 @@\n-old\n+new\n@@ -10,0 +4,1 @@\n+d\n" },
+      { file: "d.ts", hunks: "@@ -3,1 +3,0 @@\n-gone\n" },
+    ]);
+    const findings: Finding[] = [
+      { severity: "info", file: "a.ts", line: 3, rule: "r", message: "both-sides" },
+      { severity: "info", file: "a.ts", line: 4, rule: "r", message: "added" },
+      { severity: "info", file: "d.ts", line: 3, rule: "r", message: "left-only" },
+      { severity: "info", file: "a.ts", line: 99, rule: "r", message: "off-diff" },
+      { severity: "info", file: "", rule: "r", message: "repo" },
+      { severity: "info", file: "a.ts", rule: "r", message: "no-line" },
+    ];
+    const r = mapToComments(findings, hunks);
+    expect(r.inline.map((c) => c.side)).toEqual(["RIGHT", "RIGHT", "LEFT"]);
+    expect(r.inline.map((c) => c.line)).toEqual([3, 4, 3]);
+    expect(r.general.map((f) => f.message)).toEqual(["off-diff", "repo", "no-line"]);
+  });
+});
+
+describe("reopenedKey", () => {
+  it("pins the rule-file-line shape joined by NUL", () => {
+    expect(
+      reopenedKey({ severity: "high", file: "a.ts", line: 2, rule: "r", message: "m" }),
+    ).toBe("r\0a.ts\0" + "2");
+  });
+
+  it("renders a missing line as undefined", () => {
+    expect(reopenedKey({ severity: "info", file: "", rule: "r", message: "m" })).toBe("r\0\0undefined");
+  });
+});
+
+describe("partitionGate", () => {
+  const F = (file: string, line: number | undefined, rule = "r"): Finding => ({
+    severity: "warning",
+    file,
+    ...(line !== undefined ? { line } : {}),
+    rule,
+    message: `${rule}@${file}:${line}`,
+  });
+
+  function filesFor(): FileDiff[] {
+    return [
+      { file: "a.ts", hunks: "@@ -1,1 +1,2 @@\n keep\n+new\n", truncated: false },
+      { file: "d.ts", hunks: "@@ -3,1 +3,0 @@\n-gone\n", truncated: false },
+      { file: "c.ts", hunks: "@@ -1,1 +1,1 @@\n same\n", truncated: false },
+      { file: "new.bin", hunks: "", truncated: false, binary: true },
+      { file: "gone.ts", hunks: "@@ -1,1 +0,0 @@\n-x\n", truncated: false, deleted: true },
+    ];
+  }
+
+  function hunksFor(): ReturnType<typeof parseHunks> {
+    return parseHunks(filesFor().map(({ file, hunks }) => ({ file, hunks })));
+  }
+
+  it("takes add-line findings, rejects ctx-line and LEFT-only findings", () => {
+    const files = filesFor();
+    const hunks = hunksFor();
+    expect(partitionGate([F("a.ts", 2)], hunks, files).introduced).toHaveLength(1);
+    expect(partitionGate([F("a.ts", 1)], hunks, files).introduced).toEqual([]);
+    expect(partitionGate([F("a.ts", 1)], hunks, files).general).toHaveLength(1);
+    expect(partitionGate([F("d.ts", 3)], hunks, files).introduced).toEqual([]);
+    expect(partitionGate([F("d.ts", 3)], hunks, files).general).toHaveLength(1);
+    expect(partitionGate([F("a.ts", 99)], hunks, files).introduced).toEqual([]);
+  });
+
+  it("ctx-line and LEFT-only findings stay display-inline while out of the gate", () => {
+    const hunks = hunksFor();
+    expect(mapToComments([F("a.ts", 1)], hunks).inline).toHaveLength(1);
+    const left = mapToComments([F("d.ts", 3)], hunks);
+    expect(left.inline).toHaveLength(1);
+    expect(left.inline[0]!.side).toBe("LEFT");
+  });
+
+  it("takes lineless findings on present files with hunks or add lines", () => {
+    const files = filesFor();
+    const hunks = hunksFor();
+    // a.ts has hunks text with an add line.
+    expect(partitionGate([F("a.ts", undefined)], hunks, files).introduced).toHaveLength(1);
+    // new.bin is hunks-empty (added-binary) but present: counts.
+    expect(partitionGate([F("new.bin", undefined)], hunks, files).introduced).toHaveLength(1);
+  });
+
+  it("rejects lineless findings on deleted and pure-removal files", () => {
+    const files = filesFor();
+    const hunks = hunksFor();
+    expect(partitionGate([F("gone.ts", undefined)], hunks, files).introduced).toEqual([]);
+    expect(partitionGate([F("d.ts", undefined)], hunks, files).introduced).toEqual([]);
+  });
+
+  it("rejects lineless findings with empty or absent files", () => {
+    const files = filesFor();
+    const hunks = hunksFor();
+    expect(partitionGate([F("", undefined)], hunks, files).introduced).toEqual([]);
+    expect(partitionGate([F("absent.ts", undefined)], hunks, files).introduced).toEqual([]);
+  });
+
+  it("treats a null line like a missing line (same predicate as mapToComments)", () => {
+    const files = filesFor();
+    const hunks = hunksFor();
+    const nulled = { ...F("a.ts", undefined), line: null } as unknown as Finding;
+    expect(mapToComments([nulled], hunks).inline).toEqual([]);
+    expect(partitionGate([nulled], hunks, files).introduced).toHaveLength(1);
+    const nulledAbsent = { ...F("absent.ts", undefined), line: null } as unknown as Finding;
+    expect(partitionGate([nulledAbsent], hunks, files).introduced).toEqual([]);
+  });
+
+  it("preserves input order in both partitions", () => {
+    const files = filesFor();
+    const hunks = hunksFor();
+    const findings = [F("a.ts", 1, "ctx"), F("a.ts", 2, "add"), F("absent.ts", undefined, "abs"), F("new.bin", undefined, "bin")];
+    const { introduced, general } = partitionGate(findings, hunks, files);
+    expect(introduced.map((f) => f.rule)).toEqual(["add", "bin"]);
+    expect(general.map((f) => f.rule)).toEqual(["ctx", "abs"]);
   });
 });
 
@@ -242,9 +369,9 @@ describe("buildBody", () => {
 
   it("appends general findings to the summary with file:line locators", () => {
     const body = buildBody([{ severity: "warning", file: "a.ts", line: 99, rule: "r", message: "off diff" }], "Summary");
-    expect(body).toContain("Summary");
-    expect(body).toContain("off diff");
-    expect(body).toContain("a.ts:99");
+    expect(body).toBe(
+      "Summary\n\n**Note:** 1 finding(s) below are outside the PR diff and do not block.\n\n**Findings not placed inline:**\n- **warning** a.ts:99 [r] off diff",
+    );
   });
 
   it("locator: file without line, and (repository) for repo-level", () => {
@@ -255,8 +382,52 @@ describe("buildBody", () => {
       ],
       "S",
     );
-    expect(body).toContain("b.ts [r] no line");
-    expect(body).toContain("(repository) [r] repo wide");
+    expect(body).toBe(
+      "S\n\n**Note:** 2 finding(s) below are outside the PR diff and do not block.\n\n**Findings not placed inline:**\n- **info** b.ts [r] no line\n- **info** (repository) [r] repo wide",
+    );
+  });
+
+  it("note order is head, NOTE, heading, then items", () => {
+    const body = buildBody(
+      [
+        { severity: "warning", file: "a.ts", line: 99, rule: "r", message: "first" },
+        { severity: "info", file: "", rule: "q", message: "second" },
+      ],
+      "Head",
+    );
+    const lines = body.split("\n");
+    expect(lines[0]).toBe("Head");
+    expect(lines[2]).toBe("**Note:** 2 finding(s) below are outside the PR diff and do not block.");
+    expect(lines[4]).toBe("**Findings not placed inline:**");
+    expect(lines[5]).toContain("first");
+    expect(lines[6]).toContain("second");
+  });
+
+  it("the note counts only items outside the blocking set", () => {
+    const blockingItem: Finding = { severity: "info", file: "touched.bin", rule: "binary-note", message: "bin" };
+    const offItem: Finding = { severity: "warning", file: "a.ts", line: 99, rule: "r", message: "off diff" };
+    const blocking = new Set([reopenedKey(blockingItem)]);
+    const body = buildBody([blockingItem, offItem], "Head", { blocking });
+    expect(body).toContain("**Note:** 1 finding(s) below are outside the PR diff and do not block.");
+    expect(body).toContain("- **info** **blocking** touched.bin [binary-note] bin");
+    expect(body).toContain("- **warning** a.ts:99 [r] off diff");
+  });
+
+  it("omits the note when every body item blocks", () => {
+    const item: Finding = { severity: "info", file: "touched.bin", rule: "binary-note", message: "bin" };
+    const body = buildBody([item], "Head", { blocking: new Set([reopenedKey(item)]) });
+    expect(body).toBe("Head\n\n**Findings not placed inline:**\n- **info** **blocking** touched.bin [binary-note] bin");
+    expect(body).not.toContain("outside the PR diff");
+  });
+
+  it("**reopened** wins over **blocking** on the same item", () => {
+    const item: Finding = { severity: "high", file: "a.ts", line: 99, rule: "r", message: "drifted" };
+    const key = reopenedKey(item);
+    const body = buildBody([item], "Head", { reopened: new Set([key]), blocking: new Set([key]) });
+    expect(body).toContain("- **high** **reopened** a.ts:99 [r] drifted");
+    expect(body).not.toContain("**blocking**");
+    // Reopened items re-block, so nothing is outside the blocking set: no note.
+    expect(body).not.toContain("outside the PR diff");
   });
 });
 
@@ -292,6 +463,258 @@ describe("redactFindings", () => {
     expect(redactFindings(findings, [""])).toEqual(findings);
     expect(redactFindings(findings, [])).toEqual(findings);
   });
+
+  it("redactFindings redacts evidence snippet and analyzer secrets", () => {
+    const out = redactFindings(
+      [
+        {
+          severity: "warning",
+          file: "a.ts",
+          line: 1,
+          rule: "r",
+          message: "clean",
+          source: "semgrep",
+          confidence: 90,
+          evidence: { analyzer: "semgrep sk-secret-1", snippet: "token sk-secret-1 here" },
+        },
+      ],
+      ["sk-secret-1"],
+    );
+    expect(out).toEqual([
+      {
+        severity: "warning",
+        file: "a.ts",
+        line: 1,
+        rule: "r",
+        message: "clean",
+        source: "semgrep",
+        confidence: 90,
+        evidence: { analyzer: "semgrep [REDACTED]", snippet: "token [REDACTED] here" },
+      },
+    ]);
+  });
+
+  it("redactFindings creates fresh evidence objects (mutating the input afterwards leaves output unchanged)", () => {
+    const input: Finding[] = [
+      {
+        severity: "warning",
+        file: "a.ts",
+        rule: "r",
+        message: "m",
+        evidence: { analyzer: "semgrep", snippet: "code" },
+      },
+    ];
+    const out = redactFindings(input, ["zzz"]);
+    expect(out[0].evidence).toEqual({ analyzer: "semgrep", snippet: "code" });
+    expect(out[0].evidence).not.toBe(input[0].evidence);
+    input[0].evidence!.analyzer = "mutated";
+    input[0].evidence!.snippet = "mutated";
+    expect(out[0].evidence).toEqual({ analyzer: "semgrep", snippet: "code" });
+  });
+
+  it("redactFindings redacts secrets in patch (fresh object, input untouched)", () => {
+    const input: Finding[] = [
+      { severity: "warning", file: "a.ts", line: 1, rule: "r", message: "m", patch: "token sk-secret-1 here" },
+    ];
+    const out = redactFindings(input, ["sk-secret-1"]);
+    expect(out[0].patch).toBe("token [REDACTED] here");
+    expect(out[0]).not.toBe(input[0]);
+    expect(input[0].patch).toBe("token sk-secret-1 here");
+  });
+});
+
+describe("hasPatch", () => {
+  it("accepts a non-empty string patch, trimming only for the test (stored verbatim)", () => {
+    expect(hasPatch({ severity: "warning", file: "a.ts", rule: "r", message: "m", patch: "const x = 1;" })).toBe(true);
+    expect(hasPatch({ severity: "warning", file: "a.ts", rule: "r", message: "m", patch: "  const x = 1;  " })).toBe(true);
+  });
+
+  it("rejects absent, empty, whitespace-only, and TRUNC_MARK-capped patches", () => {
+    expect(hasPatch({ severity: "warning", file: "a.ts", rule: "r", message: "m" })).toBe(false);
+    expect(hasPatch({ severity: "warning", file: "a.ts", rule: "r", message: "m", patch: "" })).toBe(false);
+    expect(hasPatch({ severity: "warning", file: "a.ts", rule: "r", message: "m", patch: "  \n\t " })).toBe(false);
+    expect(
+      hasPatch({ severity: "warning", file: "a.ts", rule: "r", message: "m", patch: `code${TRUNC_MARK}` }),
+    ).toBe(false);
+  });
+});
+
+describe("Q01 patch rendering", () => {
+  // a.ts line 10 is a RIGHT addition (rangeFixture); a.ts line 3 is a LEFT deletion (hunksFixture).
+  const right = (extra: Partial<Finding>): Finding => ({
+    severity: "warning",
+    file: "a.ts",
+    line: 10,
+    rule: "r",
+    message: "m",
+    ...extra,
+  });
+  const left = (extra: Partial<Finding>): Finding => ({
+    severity: "high",
+    file: "a.ts",
+    line: 3,
+    rule: "r",
+    message: "m",
+    ...extra,
+  });
+
+  it("RIGHT + patch renders the fence verbatim, then Suggested advice, then the trailer", () => {
+    const r = mapToComments(
+      [right({ patch: "const x = 1;", suggestion: "explain it", source: "llm", confidence: 70 })],
+      rangeFixture(),
+    );
+    expect(r.inline[0].side).toBe("RIGHT");
+    const body = r.inline[0].body;
+    expect(body).toContain("```suggestion\nconst x = 1;\n```");
+    expect(body).toContain("Suggested: explain it");
+    expect(body.indexOf("**warning**")).toBeLessThan(body.indexOf("```suggestion"));
+    expect(body.indexOf("```suggestion")).toBeLessThan(body.indexOf("Suggested: explain it"));
+    expect(body.indexOf("Suggested: explain it")).toBeLessThan(body.indexOf("`src:llm · conf 70`"));
+    // Trailer is fence-external: it renders after the last fence close.
+    expect(body.indexOf("`src:llm · conf 70`")).toBeGreaterThan(body.lastIndexOf("```"));
+  });
+
+  it("RIGHT patch renders verbatim (no trim) even when whitespace-padded", () => {
+    const r = mapToComments([right({ patch: "  const x = 1;  " })], rangeFixture());
+    expect(r.inline[0].body).toContain("```suggestion\n  const x = 1;  \n```");
+  });
+
+  it("RIGHT + suggestion-only renders advice with no fence (the audit regression pin)", () => {
+    const r = mapToComments([right({ suggestion: "explain it" })], rangeFixture());
+    const body = r.inline[0].body;
+    expect(body).not.toContain("```");
+    expect(body).toContain("Suggested: explain it");
+  });
+
+  it("empty, whitespace-only, and TRUNC_MARK-capped patches never fence on RIGHT (suggestion normal)", () => {
+    for (const patch of ["", "   \n\t ", `code${TRUNC_MARK}`]) {
+      const r = mapToComments([right({ patch, suggestion: "advice" })], rangeFixture());
+      const body = r.inline[0].body;
+      expect(body).not.toContain("```");
+      expect(body).toContain("Suggested: advice");
+    }
+    const absent = mapToComments([right({ suggestion: "advice" })], rangeFixture());
+    expect(absent.inline[0].body).not.toContain("```");
+  });
+
+  it("LEFT + patch renders the advice-only label, a plain sized block, then Suggested (pinned separators)", () => {
+    const r = mapToComments([left({ patch: "const x = 1;", suggestion: "explain it" })], hunksFixture());
+    expect(r.inline[0].side).toBe("LEFT");
+    const body = r.inline[0].body;
+    expect(body).toContain("\n\nSuggested replacement (advice only):\n```\nconst x = 1;\n```");
+    expect(body).toContain("\n\nSuggested: explain it");
+    expect(body).not.toContain("```suggestion");
+  });
+
+  it("LEFT patch containing backticks gets a longer fence (never ```suggestion)", () => {
+    const patch = "a ```js\nx\n```";
+    const r = mapToComments([left({ patch })], hunksFixture());
+    const body = r.inline[0].body;
+    expect(body).toContain("Suggested replacement (advice only):\n````\n" + patch + "\n````");
+    expect(body).not.toContain("```suggestion");
+  });
+
+  it("LEFT with an invalid patch renders no advice block (suggestion normal)", () => {
+    for (const patch of ["", "  \n ", `code${TRUNC_MARK}`]) {
+      const r = mapToComments([left({ patch, suggestion: "advice" })], hunksFixture());
+      const body = r.inline[0].body;
+      expect(body).not.toContain("Suggested replacement");
+      expect(body).not.toContain("```");
+      expect(body).toContain("Suggested: advice");
+    }
+    const absent = mapToComments([left({ suggestion: "advice" })], hunksFixture());
+    expect(absent.inline[0].body).not.toContain("Suggested replacement");
+  });
+
+  it("general-body item with a patch renders the advice-only block indented, then Suggested", () => {
+    const body = buildBody(
+      [{ severity: "warning", file: "a.ts", line: 99, rule: "r", message: "off diff", patch: "const x = 1;", suggestion: "explain it" }],
+      "Summary",
+    );
+    expect(body).toContain(
+      "- **warning** a.ts:99 [r] off diff\n  Suggested replacement (advice only):\n  ```\n  const x = 1;\n  ```\n  Suggested: explain it",
+    );
+    expect(body).not.toContain("```suggestion");
+  });
+
+  it("general-body item with a multiline patch indents every continuation line", () => {
+    const body = buildBody(
+      [{ severity: "warning", file: "a.ts", line: 99, rule: "r", message: "off diff", patch: "a\nb" }],
+      "Summary",
+    );
+    expect(body).toContain("\n  ```\n  a\n  b\n  ```");
+  });
+
+  it("general-body item with an invalid patch renders no advice block (suggestion normal)", () => {
+    const body = buildBody(
+      [{ severity: "warning", file: "a.ts", line: 99, rule: "r", message: "off diff", patch: "   ", suggestion: "advice" }],
+      "Summary",
+    );
+    expect(body).not.toContain("Suggested replacement");
+    expect(body).not.toContain("```");
+    expect(body).toContain("Suggested: advice");
+  });
+
+  it("fallback report adds the Proposed patch row LAST, after remediation", () => {
+    const report = buildFallbackReport([
+      {
+        severity: "warning",
+        file: "a.ts",
+        line: 2,
+        rule: "r",
+        message: "m",
+        patch: "const x = 1;",
+        suggestion: "fix",
+        source: "semgrep",
+        confidence: 90,
+        evidence: { analyzer: "semgrep", snippet: "flagged" },
+      },
+    ]);
+    expect(report).toContain("- Proposed patch (advice only):\n```text\nconst x = 1;\n```");
+    const msgIdx = report.indexOf("- Message/evidence:");
+    const srcIdx = report.indexOf("- Source:");
+    const confIdx = report.indexOf("- Confidence:");
+    const evIdx = report.indexOf("- Evidence:");
+    const remIdx = report.indexOf("- Suggested remediation");
+    const patchIdx = report.indexOf("- Proposed patch (advice only):");
+    expect(msgIdx).toBeLessThan(srcIdx);
+    expect(srcIdx).toBeLessThan(confIdx);
+    expect(confIdx).toBeLessThan(evIdx);
+    expect(evIdx).toBeLessThan(remIdx);
+    expect(remIdx).toBeLessThan(patchIdx);
+  });
+
+  it("fallback report omits the patch row for an invalid patch, keeping the remediation placeholder", () => {
+    const report = buildFallbackReport([
+      { severity: "warning", file: "a.ts", line: 2, rule: "r", message: "m", patch: "   " },
+    ]);
+    expect(report).not.toContain("- Proposed patch");
+    expect(report).toContain("- Suggested remediation (advice only):\n```text\nNo remediation supplied\n```");
+  });
+
+  it("audit pins: credential-rotation and SQL prose in suggestion render as advice, never fenced", () => {
+    const rotation = mapToComments(
+      [right({ suggestion: "Rotate the leaked credential immediately and audit access logs." })],
+      rangeFixture(),
+    );
+    expect(rotation.inline[0].body).not.toContain("```");
+    expect(rotation.inline[0].body).toContain("Suggested: Rotate the leaked credential immediately and audit access logs.");
+
+    const sql = mapToComments(
+      [right({ suggestion: "Use a parameterized query instead of string concatenation." })],
+      rangeFixture(),
+    );
+    expect(sql.inline[0].body).not.toContain("```");
+    expect(sql.inline[0].body).toContain("Suggested: Use a parameterized query instead of string concatenation.");
+  });
+
+  it("audit pins: a genuine one-line replacement in patch still fences", () => {
+    const r = mapToComments(
+      [right({ patch: 'db.query("SELECT * FROM users WHERE id = $1", [id]);' })],
+      rangeFixture(),
+    );
+    expect(r.inline[0].body).toContain('```suggestion\ndb.query("SELECT * FROM users WHERE id = $1", [id]);\n```');
+  });
 });
 
 describe("eventFor", () => {
@@ -317,5 +740,621 @@ describe("exitFor", () => {
     expect(exitFor("high", [{ severity: "info", file: "a", rule: "r", message: "m" }])).toBe(0);
     expect(exitFor("high", highFinding())).toBe(1);
     expect(exitFor("high", [])).toBe(0);
+  });
+});
+
+describe("prioritizeFindings", () => {
+  it("orders high before warning before info and keeps ties stable", () => {
+    const findings: Finding[] = [
+      { severity: "info", file: "a", rule: "r", message: "i1" },
+      { severity: "high", file: "b", rule: "r", message: "h1" },
+      { severity: "warning", file: "c", rule: "r", message: "w1" },
+      { severity: "high", file: "d", rule: "r", message: "h2" },
+      { severity: "info", file: "e", rule: "r", message: "i2" },
+      { severity: "warning", file: "f", rule: "r", message: "w2" },
+    ];
+    const ordered = prioritizeFindings(findings);
+    expect(ordered.map((f) => f.message)).toEqual(["h1", "h2", "w1", "w2", "i1", "i2"]);
+    // Input order is untouched (a new array is returned).
+    expect(findings.map((f) => f.message)).toEqual(["i1", "h1", "w1", "h2", "i2", "w2"]);
+  });
+});
+
+describe("publication markers", () => {
+  it("pins the exact omission and truncation strings", () => {
+    expect(omissionMarkerFor(300, 200)).toBe(
+      "> Omitted: 300 finding(s) omitted to fit the 200-finding publication limit.",
+    );
+    expect(truncNoteFor(60000)).toBe("> Note: review body truncated to the 60000-character limit.");
+    expect(isTruncNoteLine("> Note: review body truncated to the 60000-character limit.")).toBe(true);
+    expect(isTruncNoteLine("> Note: review body truncated to the abc-character limit.")).toBe(false);
+    expect(isTruncNoteLine("  > Note: review body truncated to the 60000-character limit.")).toBe(false);
+  });
+});
+
+describe("capBody", () => {
+  const cps = (s: string): number => Array.from(s).length;
+  const loneSurrogate = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+
+  it("appends markers in argument order even when the content fits", () => {
+    expect(capBody("short", 60000, ["M1", "M2"])).toBe("short\nM1\nM2");
+  });
+
+  it("returns the body unchanged when it fits with no markers", () => {
+    expect(capBody("lupa: no findings.", 60000, [])).toBe("lupa: no findings.");
+  });
+
+  it("passes through a fitting CRLF body byte-for-byte (same reference)", () => {
+    const body = "line-one\r\nline-two\r\nline-three";
+    const out = capBody(body, 60000, []);
+    expect(out).toBe(body);
+    expect(out === body).toBe(true);
+  });
+
+  it("leaves marker-looking lines alone when nothing is capped and markers is empty", () => {
+    const marker = omissionMarkerFor(5, 200);
+    const body = `content\n${marker}`;
+    const out = capBody(body, 60000, []);
+    expect(out).toBe(body);
+    expect(out === body).toBe(true);
+  });
+
+  it("cuts whole lines and keeps markers plus a trailing note inside the cap", () => {
+    const body = ["lupa: 3 finding(s).", "", "line-aaaaaaaaaaaaaaaa", "line-bbbbbbbbbbbbbbbb", "line-cccccccccccccccc", "line-dddddddddddddddd"].join("\n");
+    const marker = omissionMarkerFor(5, 200);
+    const out = capBody(body, 160, [marker]);
+    expect(cps(out)).toBeLessThanOrEqual(160);
+    expect(out).toContain(marker);
+    expect(out.endsWith(truncNoteFor(160))).toBe(true);
+    // Whole-line cut: no partial line survives before the marker block.
+    const content = out.slice(0, out.indexOf(marker));
+    for (const line of content.split("\n").filter((l) => l !== "")) {
+      expect(body.split("\n")).toContain(line);
+    }
+  });
+
+  it("cuts a single over-long line mid-line, code-point-safe", () => {
+    const note = truncNoteFor(120);
+    const out = capBody("x".repeat(200), 120, []);
+    expect(cps(out)).toBe(120);
+    // The note is a line of its own: the separator newline is part of the cap.
+    expect(out).toBe(`${"x".repeat(120 - cps(note) - 1)}\n${note}`);
+  });
+
+  it("never splits a surrogate pair on a mid-line emoji cut", () => {
+    const note = truncNoteFor(120);
+    const out = capBody("😀".repeat(200), 120, []);
+    expect(cps(out)).toBe(120);
+    expect(out).toBe(`${"😀".repeat(120 - cps(note) - 1)}\n${note}`);
+    expect(loneSurrogate.test(out)).toBe(false);
+  });
+
+  it("backs up before the opening fence line when the cut lands inside a fence block", () => {
+    const body = `lupa: 1 finding(s).\n\n\`\`\`suggestion\n${"code-line\n".repeat(30)}\`\`\`\ntail\n`;
+    const out = capBody(body, 120, []);
+    expect(cps(out)).toBeLessThanOrEqual(120);
+    expect(out).toContain("lupa: 1 finding(s).");
+    expect(out).not.toContain("```suggestion");
+    expect(out.endsWith(truncNoteFor(120))).toBe(true);
+    const fences = out.split("\n").filter((l) => l.trimStart().startsWith("```")).length;
+    expect(fences % 2).toBe(0);
+  });
+
+  it("strips stale trunc-notes without emitting a fresh one when nothing is cut", () => {
+    const stale = "content line\n> Note: review body truncated to the 99999-character limit.";
+    expect(capBody(stale, 60000, [])).toBe("content line");
+  });
+
+  it("emits exactly one fresh note when a stale-noted body is cut again", () => {
+    const body = `${"y".repeat(200)}\n> Note: review body truncated to the 99999-character limit.`;
+    const out = capBody(body, 120, []);
+    expect(out.match(/^> Note: review body truncated to the \d+-character limit\.$/gm)).toHaveLength(1);
+    expect(out.endsWith(truncNoteFor(120))).toBe(true);
+    expect(cps(out)).toBeLessThanOrEqual(120);
+  });
+
+  it("extracts body omission lines as markers without duplicating a passed marker", () => {
+    const marker = omissionMarkerFor(5, 200);
+    const out = capBody(`content\n${marker}`, 60000, [marker]);
+    expect(out).toBe(`content\n${marker}`);
+  });
+
+  it("guarantees markers inside the cap on a long body", () => {
+    const marker = omissionMarkerFor(300, 200);
+    const out = capBody(`${"line\n".repeat(500)}`, 1000, [marker]);
+    expect(cps(out)).toBeLessThanOrEqual(1000);
+    expect(out).toContain(marker);
+    expect(out.endsWith(truncNoteFor(1000))).toBe(true);
+  });
+
+  it("throws RangeError when the markers alone exceed the cap", () => {
+    const big = `> Omitted: ${"9".repeat(50)} finding(s) omitted to fit the 200-finding publication limit.`;
+    expect(() => capBody("body", 10, [big])).toThrow(RangeError);
+  });
+});
+
+describe("mergeDuplicates", () => {
+  const F = (
+    severity: Finding["severity"],
+    file: string,
+    line: number | undefined,
+    rule: string,
+    message: string,
+    suggestion?: string,
+  ): Finding => ({
+    severity,
+    file,
+    ...(line !== undefined ? { line } : {}),
+    rule,
+    message,
+    ...(suggestion !== undefined ? { suggestion } : {}),
+  });
+  const V = (pairs: Array<[number, number]> = [], links: Array<[number, number]> = [], malformed = 0): DedupVerdicts => ({
+    pairs,
+    links,
+    malformed,
+  });
+
+  it("merges the canary pair into one high finding with a collapsed rule and redaction kept", () => {
+    const gitleaks = F("high", "src/leak.py", 7, "github-pat", "Artifact: leak.py … Match: [REDACTED]");
+    const semgrep = F("warning", "src/leak.py", 7, "github-pat", "github-pat has detected secret for file /src/leak.py: [REDACTED]");
+    const { merged, dropped } = mergeDuplicates([gitleaks, semgrep], V([[0, 1]]));
+    expect(dropped).toBe(0);
+    expect(merged).toHaveLength(1);
+    expect(merged[0]).toMatchObject({ severity: "high", file: "src/leak.py", line: 7, rule: "github-pat" });
+    expect(merged[0]!.message).toContain("Artifact: leak.py");
+    expect(merged[0]!.message).toContain("has detected secret");
+    expect(merged[0]!.message).toContain("[REDACTED]");
+  });
+
+  it("merges a model finding into a scanner finding via an absolute duplicateOf link", () => {
+    const scan = F("warning", "src/a.ts", 1, "scan-rule", "scanner evidence");
+    const other = F("info", "src/a.ts", 9, "other-rule", "unrelated");
+    const model = F("warning", "src/a.ts", 1, "llm-rule", "model restatement");
+    const { merged, dropped } = mergeDuplicates([scan, other, model], V([], [[2, 0]]));
+    expect(dropped).toBe(0);
+    expect(merged).toHaveLength(2);
+    expect(merged[0]!.rule).toBe("scan-rule+llm-rule");
+    expect(merged[0]!.message).toContain("scanner evidence");
+    expect(merged[0]!.message).toContain("model restatement");
+    expect(merged[1]).toEqual(other);
+  });
+
+  it("closes transitively over absolute positions (triple to one)", () => {
+    const fs = [F("info", "a.ts", 1, "r0", "m0"), F("warning", "a.ts", 1, "r1", "m1"), F("high", "a.ts", 1, "r2", "m2")];
+    const { merged, dropped } = mergeDuplicates(fs, V([[0, 1], [1, 2]]));
+    expect(dropped).toBe(0);
+    expect(merged).toHaveLength(1);
+    expect(merged[0]!.severity).toBe("high");
+    expect(merged[0]!.rule).toBe("r0+r1+r2");
+  });
+
+  it("checks the precondition per pair before closure: A~B merges while cross-file B~C leaves C alone", () => {
+    const a = F("warning", "a.ts", 1, "ra", "ma");
+    const b = F("warning", "a.ts", 1, "rb", "mb");
+    const c = F("warning", "b.ts", 1, "rc", "mc");
+    const { merged, dropped } = mergeDuplicates([a, b, c], V([[0, 1], [1, 2]]));
+    expect(dropped).toBe(1);
+    expect(merged).toHaveLength(2);
+    expect(merged[0]!.rule).toBe("ra+rb");
+    expect(merged[0]!.message).toContain("ma");
+    expect(merged[0]!.message).toContain("mb");
+    expect(merged[1]).toEqual(c);
+  });
+
+  it("ignores a same-file pair on different lines and counts it", () => {
+    const fs = [F("warning", "a.ts", 1, "r0", "m0"), F("warning", "a.ts", 2, "r1", "m1")];
+    const { merged, dropped } = mergeDuplicates(fs, V([[0, 1]]));
+    expect(dropped).toBe(1);
+    expect(merged).toEqual(fs);
+  });
+
+  it("ignores a pair mixing a defined and an undefined line", () => {
+    const fs = [F("warning", "a.ts", 1, "r0", "m0"), F("warning", "a.ts", undefined, "r1", "m1")];
+    const { merged, dropped } = mergeDuplicates(fs, V([[0, 1]]));
+    expect(dropped).toBe(1);
+    expect(merged).toEqual(fs);
+  });
+
+  it("merges line-less findings on the same file", () => {
+    const fs = [F("warning", "a.ts", undefined, "r0", "m0"), F("warning", "a.ts", undefined, "r1", "m1")];
+    const { merged, dropped } = mergeDuplicates(fs, V([[0, 1]]));
+    expect(dropped).toBe(0);
+    expect(merged).toHaveLength(1);
+    expect(merged[0]!.line).toBeUndefined();
+  });
+
+  it("drops a partially-valid pair whole: the valid member stays alone", () => {
+    const fs = [F("warning", "a.ts", 1, "r0", "m0"), F("warning", "a.ts", 1, "r1", "m1")];
+    const { merged, dropped } = mergeDuplicates(fs, V([[0, 5]]));
+    expect(dropped).toBe(1);
+    expect(merged).toEqual(fs);
+  });
+
+  it("drops an out-of-range link whole and counts it", () => {
+    const fs = [F("warning", "a.ts", 1, "r0", "m0"), F("warning", "a.ts", 1, "r1", "m1")];
+    const { merged, dropped } = mergeDuplicates(fs, V([], [[7, 8]]));
+    expect(dropped).toBe(1);
+    expect(merged).toEqual(fs);
+  });
+
+  it("re-caps joined rules at the rule cap with the marker", () => {
+    const fs = [F("warning", "a.ts", 1, "r".repeat(60), "m0"), F("warning", "a.ts", 1, "s".repeat(60), "m1")];
+    const { merged, dropped } = mergeDuplicates(fs, V([[0, 1]]));
+    expect(dropped).toBe(0);
+    expect(Array.from(merged[0]!.rule).length).toBeLessThanOrEqual(100);
+    expect(merged[0]!.rule).toContain("…[truncated]");
+  });
+
+  it("re-caps joined messages at the message cap with the marker", () => {
+    const fs = [F("warning", "a.ts", 1, "r", "m".repeat(1500)), F("warning", "a.ts", 1, "r", "n".repeat(1500))];
+    const { merged, dropped } = mergeDuplicates(fs, V([[0, 1]]));
+    expect(dropped).toBe(0);
+    expect(Array.from(merged[0]!.message).length).toBeLessThanOrEqual(2000);
+    expect(merged[0]!.message).toContain("…[truncated]");
+  });
+
+  it("keeps the first defined suggestion in group order", () => {
+    const withFirst = [F("warning", "a.ts", 1, "r0", "m0", "fix-a"), F("warning", "a.ts", 1, "r1", "m1", "fix-b")];
+    expect(mergeDuplicates(withFirst, V([[0, 1]])).merged[0]!.suggestion).toBe("fix-a");
+    const withSecond = [F("warning", "a.ts", 1, "r0", "m0"), F("warning", "a.ts", 1, "r1", "m1", "fix-b")];
+    expect(mergeDuplicates(withSecond, V([[0, 1]])).merged[0]!.suggestion).toBe("fix-b");
+    const withNone = [F("warning", "a.ts", 1, "r0", "m0"), F("warning", "a.ts", 1, "r1", "m1")];
+    expect(mergeDuplicates(withNone, V([[0, 1]])).merged[0]!.suggestion).toBeUndefined();
+  });
+
+  it("emits groups in first-member-position order (stable, deterministic)", () => {
+    const fs = [F("info", "a.ts", 1, "ra", "ma"), F("info", "a.ts", 1, "rb", "mb"), F("info", "b.ts", 2, "rc", "mc"), F("info", "b.ts", 2, "rd", "md")];
+    const { merged } = mergeDuplicates(fs, V([[2, 3], [0, 1]]));
+    expect(merged).toHaveLength(2);
+    expect(merged[0]!.message).toContain("ma");
+    expect(merged[1]!.message).toContain("mc");
+  });
+
+  it("passes empty verdicts through untouched", () => {
+    const fs = [F("warning", "a.ts", 1, "r0", "m0"), F("warning", "a.ts", 1, "r1", "m1")];
+    const { merged, dropped } = mergeDuplicates(fs, V());
+    expect(dropped).toBe(0);
+    expect(merged).toEqual(fs);
+  });
+
+  it("takes the maximum severity across the group", () => {
+    const fs = [F("info", "a.ts", 1, "r0", "m0"), F("warning", "a.ts", 1, "r1", "m1")];
+    expect(mergeDuplicates(fs, V([[0, 1]])).merged[0]!.severity).toBe("warning");
+  });
+});
+
+describe("finding provenance rendering (Q04)", () => {
+  const F = (
+    severity: Finding["severity"],
+    file: string,
+    line: number | undefined,
+    rule: string,
+    message: string,
+    extra?: Partial<Finding>,
+  ): Finding => ({
+    severity,
+    file,
+    ...(line !== undefined ? { line } : {}),
+    rule,
+    message,
+    ...extra,
+  });
+  const V = (pairs: Array<[number, number]> = [], links: Array<[number, number]> = [], malformed = 0): DedupVerdicts => ({
+    pairs,
+    links,
+    malformed,
+  });
+  // a.ts line 10 is a RIGHT addition (rangeFixture).
+  const rightHunks = () => parseHunks([{ file: "a.ts", hunks: "@@ -7,0 +8,3 @@\n+x\n+y\n+z\n" }]);
+
+  it("inline trailer renders full source and confidence", () => {
+    const r = mapToComments(
+      [F("warning", "a.ts", 10, "r", "m", { source: "semgrep", confidence: 90 })],
+      rightHunks(),
+    );
+    expect(r.inline[0].body).toContain("`src:semgrep · conf 90`");
+  });
+
+  it("inline trailer partials: source-only, confidence-only, neither", () => {
+    const srcOnly = mapToComments([F("warning", "a.ts", 10, "r", "m", { source: "semgrep" })], rightHunks());
+    expect(srcOnly.inline[0].body).toContain("`src:semgrep`");
+    expect(srcOnly.inline[0].body).not.toContain("conf");
+    const confOnly = mapToComments([F("warning", "a.ts", 10, "r", "m", { confidence: 50 })], rightHunks());
+    expect(confOnly.inline[0].body).toContain("`conf 50`");
+    expect(confOnly.inline[0].body).not.toContain("src:");
+    const neither = mapToComments([F("warning", "a.ts", 10, "r", "m")], rightHunks());
+    expect(neither.inline[0].body).not.toContain("`src:");
+    expect(neither.inline[0].body).not.toContain("`conf");
+  });
+
+  it("confidence 0 renders (never truthiness-tested)", () => {
+    const r = mapToComments(
+      [F("warning", "a.ts", 10, "r", "m", { source: "llm", confidence: 0 })],
+      rightHunks(),
+    );
+    expect(r.inline[0].body).toContain("`src:llm · conf 0`");
+    const confZeroOnly = mapToComments([F("warning", "a.ts", 10, "r", "m", { confidence: 0 })], rightHunks());
+    expect(confZeroOnly.inline[0].body).toContain("`conf 0`");
+  });
+
+  it("trailer renders AFTER the patch fence, never inside the patch", () => {
+    const r = mapToComments(
+      [F("warning", "a.ts", 10, "r", "m", { source: "semgrep", confidence: 90, patch: "fixed" })],
+      rightHunks(),
+    );
+    const body = r.inline[0].body;
+    expect(body).toContain("```suggestion\nfixed\n```");
+    expect(body.indexOf("`src:semgrep · conf 90`")).toBeGreaterThan(body.lastIndexOf("```"));
+  });
+
+  it("LEFT suggestion renders the trailer after the Suggested text", () => {
+    const hunks = parseHunks([{ file: "a.ts", hunks: "@@ -3,1 +3,0 @@\n-c\n" }]);
+    const r = mapToComments(
+      [F("high", "a.ts", 3, "r", "m", { source: "fastpath", confidence: 50, suggestion: "fixed" })],
+      hunks,
+    );
+    expect(r.inline[0].side).toBe("LEFT");
+    const body = r.inline[0].body;
+    expect(body).toContain("Suggested: fixed");
+    expect(body.indexOf("`src:fastpath · conf 50`")).toBeGreaterThan(body.indexOf("Suggested: fixed"));
+  });
+
+  it("general-body items render the trailer after any Suggested block", () => {
+    const body = buildBody(
+      [F("warning", "a.ts", 99, "r", "off diff", { source: "llm", confidence: 70, suggestion: "fix it" })],
+      "Summary",
+    );
+    expect(body).toContain("`src:llm · conf 70`");
+    expect(body.indexOf("`src:llm · conf 70`")).toBeGreaterThan(body.indexOf("Suggested: fix it"));
+  });
+
+  it("trailer is part of item text: it renders BEFORE any capBody cut", () => {
+    const body = buildBody(
+      [F("warning", "a.ts", 99, "r", "off diff " + "x".repeat(200), { source: "semgrep", confidence: 90 })],
+      "Summary",
+    );
+    expect(body).toContain("`src:semgrep · conf 90`");
+    const capped = capBody(body, 120, []);
+    expect(capped).toContain("truncated to the 120-character limit");
+    expect(Array.from(capped).length).toBeLessThanOrEqual(120);
+  });
+
+  it("fallback rows follow the Message row in Source/Confidence/Evidence order", () => {
+    const report = buildFallbackReport([
+      F("warning", "a.ts", 2, "r", "m", { source: "semgrep", confidence: 90, evidence: { analyzer: "semgrep", snippet: "flagged" } }),
+    ]);
+    expect(report).toContain("- Source:\n```text\nsemgrep\n```");
+    expect(report).toContain("- Confidence:\n```text\n90\n```");
+    const msgIdx = report.indexOf("- Message/evidence:");
+    const srcIdx = report.indexOf("- Source:");
+    const confIdx = report.indexOf("- Confidence:");
+    const evIdx = report.indexOf("- Evidence:");
+    const suggIdx = report.indexOf("- Suggested remediation");
+    expect(msgIdx).toBeLessThan(srcIdx);
+    expect(srcIdx).toBeLessThan(confIdx);
+    expect(confIdx).toBeLessThan(evIdx);
+    expect(evIdx).toBeLessThan(suggIdx);
+    expect(report).toContain("analyzer: semgrep");
+    expect(report).toContain("```text\nflagged\n```");
+  });
+
+  it("fallback rows show only present fields", () => {
+    const srcOnly = buildFallbackReport([F("warning", "a.ts", 2, "r", "m", { source: "l2" })]);
+    expect(srcOnly).toContain("- Source:");
+    expect(srcOnly).not.toContain("- Confidence:");
+    expect(srcOnly).not.toContain("- Evidence:");
+    const none = buildFallbackReport([F("warning", "a.ts", 2, "r", "m")]);
+    expect(none).not.toContain("- Source:");
+    expect(none).not.toContain("- Confidence:");
+    expect(none).not.toContain("- Evidence:");
+  });
+
+  it("survivor joins differing sources, collapses identical, and re-caps at 100", () => {
+    const joined = mergeDuplicates(
+      [F("warning", "a.ts", 1, "r0", "m0", { source: "semgrep" }), F("warning", "a.ts", 1, "r1", "m1", { source: "llm" })],
+      V([[0, 1]]),
+    ).merged[0]!;
+    expect(joined.source).toBe("semgrep+llm");
+    const collapsed = mergeDuplicates(
+      [F("warning", "a.ts", 1, "r0", "m0", { source: "semgrep" }), F("warning", "a.ts", 1, "r1", "m1", { source: "semgrep" })],
+      V([[0, 1]]),
+    ).merged[0]!;
+    expect(collapsed.source).toBe("semgrep");
+    const long = mergeDuplicates(
+      [F("warning", "a.ts", 1, "r0", "m0", { source: "s".repeat(60) }), F("warning", "a.ts", 1, "r1", "m1", { source: "t".repeat(60) })],
+      V([[0, 1]]),
+    ).merged[0]!;
+    expect(Array.from(long.source!).length).toBeLessThanOrEqual(100);
+    expect(long.source!).toContain("…[truncated]");
+  });
+
+  it("survivor takes max confidence, absent only when all members absent", () => {
+    const maxed = mergeDuplicates(
+      [F("warning", "a.ts", 1, "r0", "m0", { confidence: 50 }), F("warning", "a.ts", 1, "r1", "m1", { confidence: 90 })],
+      V([[0, 1]]),
+    ).merged[0]!;
+    expect(maxed.confidence).toBe(90);
+    const partial = mergeDuplicates(
+      [F("warning", "a.ts", 1, "r0", "m0"), F("warning", "a.ts", 1, "r1", "m1", { confidence: 50 })],
+      V([[0, 1]]),
+    ).merged[0]!;
+    expect(partial.confidence).toBe(50);
+    const absent = mergeDuplicates(
+      [F("warning", "a.ts", 1, "r0", "m0"), F("warning", "a.ts", 1, "r1", "m1")],
+      V([[0, 1]]),
+    ).merged[0]!;
+    expect(absent.confidence).toBeUndefined();
+    expect(absent.source).toBeUndefined();
+    expect(absent.evidence).toBeUndefined();
+  });
+
+  it("survivor merges evidence: first snippet, joined analyzers, absent when none", () => {
+    const merged = mergeDuplicates(
+      [
+        F("warning", "a.ts", 1, "r0", "m0", { evidence: { analyzer: "semgrep", snippet: "first" } }),
+        F("warning", "a.ts", 1, "r1", "m1", { evidence: { analyzer: "gitleaks", snippet: "second" } }),
+      ],
+      V([[0, 1]]),
+    ).merged[0]!;
+    expect(merged.evidence).toEqual({ analyzer: "semgrep+gitleaks", snippet: "first" });
+    const snippetOnly = mergeDuplicates(
+      [F("warning", "a.ts", 1, "r0", "m0", { evidence: { snippet: "only" } }), F("warning", "a.ts", 1, "r1", "m1")],
+      V([[0, 1]]),
+    ).merged[0]!;
+    expect(snippetOnly.evidence).toEqual({ snippet: "only" });
+    const none = mergeDuplicates(
+      [F("warning", "a.ts", 1, "r0", "m0"), F("warning", "a.ts", 1, "r1", "m1", { evidence: {} })],
+      V([[0, 1]]),
+    ).merged[0]!;
+    expect(none.evidence).toBeUndefined();
+  });
+
+  it("survivor takes the first member satisfying hasPatch, absent iff none", () => {
+    const first = mergeDuplicates(
+      [F("warning", "a.ts", 1, "r0", "m0", { patch: "first-patch" }), F("warning", "a.ts", 1, "r1", "m1", { patch: "second-patch" })],
+      V([[0, 1]]),
+    ).merged[0]!;
+    expect(first.patch).toBe("first-patch");
+    // A whitespace-only first patch must not shadow a valid later one.
+    const skip = mergeDuplicates(
+      [F("warning", "a.ts", 1, "r0", "m0", { patch: "   " }), F("warning", "a.ts", 1, "r1", "m1", { patch: "second-patch" })],
+      V([[0, 1]]),
+    ).merged[0]!;
+    expect(skip.patch).toBe("second-patch");
+    const none = mergeDuplicates(
+      [F("warning", "a.ts", 1, "r0", "m0"), F("warning", "a.ts", 1, "r1", "m1")],
+      V([[0, 1]]),
+    ).merged[0]!;
+    expect(none.patch).toBeUndefined();
+  });
+
+  it("cross-file pair stays ungrouped with provenance intact", () => {
+    const a = F("warning", "a.ts", 1, "r", "m", { source: "semgrep", confidence: 90 });
+    const b = F("warning", "b.ts", 1, "r", "m", { source: "semgrep", confidence: 90 });
+    const { merged, dropped } = mergeDuplicates([a, b], V([[0, 1]]));
+    expect(merged).toHaveLength(2);
+    expect(dropped).toBe(1);
+    expect(merged).toEqual([a, b]);
+  });
+
+  it("provenance changes neither eventFor nor exitFor outcomes", () => {
+    const provenanced: Finding[] = [
+      F("high", "a.ts", 1, "r", "m", { source: "fastpath", confidence: 50 }),
+      F("warning", "a.ts", 2, "r", "m", { source: "llm", confidence: 70 }),
+    ];
+    expect(eventFor("high", provenanced)).toBe("REQUEST_CHANGES");
+    expect(exitFor("high", provenanced)).toBe(1);
+    expect(exitFor("warning", provenanced)).toBe(2);
+    expect(exitFor("none", provenanced)).toBe(0);
+  });
+});
+
+describe("normalizeBot", () => {
+  it("strips one trailing [bot] on either side", () => {
+    expect(normalizeBot("lupa[bot]")).toBe("lupa");
+    expect(normalizeBot("lupa")).toBe("lupa");
+    expect(normalizeBot("github-actions[bot]")).toBe("github-actions");
+  });
+
+  it("leaves plain logins unchanged", () => {
+    expect(normalizeBot("octocat")).toBe("octocat");
+    expect(normalizeBot("")).toBe("");
+  });
+});
+
+describe("resolveReopened", () => {
+  const F = (rule: string, file: string, line?: number): Finding => ({
+    severity: "high",
+    file,
+    ...(line !== undefined ? { line } : {}),
+    rule,
+    message: "m",
+  });
+  const T = (o: Partial<import("../src/github.js").ReviewThread> & { rule?: string | null }): import("../src/github.js").ReviewThread => ({
+    authorLogin: "self",
+    isResolved: true,
+    path: "a.ts",
+    line: 10,
+    rule: "r",
+    ...o,
+  });
+
+  it("matches a resolved own thread with rule intersection and exact file+line", () => {
+    const out = resolveReopened([F("r", "a.ts", 10)], [T({})], "self");
+    expect(out.has(reopenedKey(F("r", "a.ts", 10)))).toBe(true);
+  });
+
+  it("matches on originalLine when line is absent", () => {
+    const out = resolveReopened([F("r", "a.ts", 10)], [T({ line: null, originalLine: 10 })], "self");
+    expect(out).toHaveLength(1);
+  });
+
+  it("matches a joined-thread rule against unmerged members", () => {
+    const out = resolveReopened([F("a", "a.ts", 10), F("b", "a.ts", 10)], [T({ rule: "a+b" })], "self");
+    expect(out.has(reopenedKey(F("a", "a.ts", 10)))).toBe(true);
+    expect(out.has(reopenedKey(F("b", "a.ts", 10)))).toBe(true);
+  });
+
+  it("matches a drifted-line member (context/LEFT position still re-blocks)", () => {
+    const out = resolveReopened([F("r", "a.ts", 3)], [T({ path: "a.ts", line: 3 })], "self");
+    expect(out.has(reopenedKey(F("r", "a.ts", 3)))).toBe(true);
+  });
+
+  it("matches across [bot] conventions on either side", () => {
+    expect(resolveReopened([F("r", "a.ts", 10)], [T({ authorLogin: "self[bot]" })], "self")).toHaveLength(1);
+    expect(resolveReopened([F("r", "a.ts", 10)], [T({ authorLogin: "self" })], "self[bot]")).toHaveLength(1);
+  });
+
+  it("rejects unresolved threads", () => {
+    expect(resolveReopened([F("r", "a.ts", 10)], [T({ isResolved: false })], "self")).toHaveLength(0);
+  });
+
+  it("rejects foreign and null authors", () => {
+    expect(resolveReopened([F("r", "a.ts", 10)], [T({ authorLogin: "other" })], "self")).toHaveLength(0);
+    expect(resolveReopened([F("r", "a.ts", 10)], [T({ authorLogin: null })], "self")).toHaveLength(0);
+  });
+
+  it("rejects null rules", () => {
+    expect(resolveReopened([F("r", "a.ts", 10)], [T({ rule: null })], "self")).toHaveLength(0);
+  });
+
+  it("rejects rules containing ] (the parser never yields them)", () => {
+    expect(resolveReopened([F("r]junk", "a.ts", 10)], [T({ rule: "r" })], "self")).toHaveLength(0);
+  });
+
+  it("rejects line mismatches and threads with both lines absent", () => {
+    expect(resolveReopened([F("r", "a.ts", 11)], [T({})], "self")).toHaveLength(0);
+    expect(resolveReopened([F("r", "a.ts", 10)], [T({ line: null, originalLine: null })], "self")).toHaveLength(0);
+    expect(resolveReopened([F("r", "a.ts", 10)], [T({ line: undefined, originalLine: undefined })], "self")).toHaveLength(0);
+  });
+
+  it("rejects file mismatches", () => {
+    expect(resolveReopened([F("r", "b.ts", 10)], [T({})], "self")).toHaveLength(0);
+  });
+});
+
+describe("formatBody reopened marker", () => {
+  const F = (): Finding => ({ severity: "high", file: "a.ts", line: 10, rule: "r", message: "m" });
+
+  it("renders **reopened** between severity and rule when true", () => {
+    expect(formatBody(F(), "RIGHT", true)).toContain("**high** **reopened** [r]");
+  });
+
+  it("renders today's shape when false or omitted", () => {
+    expect(formatBody(F(), "RIGHT", false)).toContain("**high** [r]");
+    expect(formatBody(F(), "RIGHT", false)).not.toContain("reopened");
+    expect(formatBody(F(), "RIGHT")).toContain("**high** [r]");
+  });
+
+  it("marks inline items whose key is reopened via mapToComments", () => {
+    const findings: Finding[] = [F()];
+    const hunks = parseHunks([{ file: "a.ts", hunks: "@@ -9,2 +9,2 @@\n ctx\n-old\n+new\n" }]);
+    const key = reopenedKey(findings[0]!);
+    const marked = mapToComments(findings, hunks, new Set([key]));
+    expect(marked.inline).toHaveLength(1);
+    expect(marked.inline[0]!.body).toContain("**reopened**");
+    const plain = mapToComments(findings, hunks);
+    expect(plain.inline[0]!.body).not.toContain("reopened");
   });
 });

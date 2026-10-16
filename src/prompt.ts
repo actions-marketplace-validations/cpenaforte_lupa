@@ -24,9 +24,14 @@ Rules:
  */
 const BLOCK_TAG = /<\s*\/?\s*(?:untrusted-diff|linked-issue)\b[^>]*>?/gi;
 
-function neutralise(text: string): string {
+export function neutralise(text: string): string {
   return text.replace(BLOCK_TAG, (m) => m.replace(/</g, "&lt;").replace(/>/g, "&gt;"));
 }
+
+export const LINKED_ISSUE_HEADER = "## Linked issue (context from the PR's closing reference)";
+export const LINKED_ISSUE_OPEN = "<linked-issue>\n";
+export const LINKED_ISSUE_CLOSE = "\n</linked-issue>";
+export const ISSUE_TRUNCATION_MARKER = "…[issue context truncated to fit the prompt budget]";
 
 function agentAddendum(maxTurns: number): string {
   return [
@@ -36,27 +41,49 @@ function agentAddendum(maxTurns: number): string {
   ].join("\n");
 }
 
+/**
+ * Verdict instructions for the single-shot call path (budget-excluded system
+ * channel). Names the `duplicates` / `duplicateOf` fields, 0-based indices
+ * into the sent fast-findings list, and pair arrays — the full verdict shape
+ * for providers that never see the JSON schema.
+ */
+export const DEDUP_INSTRUCTIONS = `Dedup verdicts: each object in the fast-findings list above carries an "id" field holding its 0-based index into the sent list. If two SENT findings describe the same underlying issue at the same location, list the pair in "duplicates" as a two-element array [idA, idB] of 0-based sent-list indices. If one of YOUR new findings restates a sent finding, set that finding's "duplicateOf" to the sent finding's 0-based id; otherwise use null. Only judge duplicates you can point to at the same file and line; when in doubt, report no verdict ("duplicates": null, "duplicateOf": null). Set "confidence" to your 0-100 integer confidence in each new finding; otherwise use null. Set \`patch\` to the exact replacement code for the flagged line, and only then; put all explanations in \`suggestion\`; use null when there is no replacement.`;
+
 export function buildMessages(
   fast: Finding[],
   diffText: string,
   issueBody?: string,
   skipped: string[] = [],
   agent?: { maxTurns: number },
+  omitted = 0,
+  opts?: { withIds?: boolean },
 ): { system: string; user: string } {
-  const system = agent ? `${SYSTEM}\n\n${agentAddendum(agent.maxTurns)}` : SYSTEM;
+  // The agent path never renders IDs: it measures exactly as base (byte-identical prompts).
+  const withIds = opts?.withIds === true && agent === undefined;
+  const system = agent
+    ? `${SYSTEM}\n\n${agentAddendum(agent.maxTurns)}`
+    : withIds
+      ? `${SYSTEM}\n\n${DEDUP_INSTRUCTIONS}`
+      : SYSTEM;
   const parts: string[] = [];
   parts.push("## Fast findings (deterministic checks already run)");
+  const sent = withIds ? fast.map((f, id) => ({ id, ...f })) : fast;
   // `<` -> \u003c is parse-neutral JSON and stops fake tags inside finding text.
-  parts.push(JSON.stringify(fast).replace(/</g, "\\u003c"));
+  parts.push(
+    JSON.stringify(sent).replace(/</g, "\\u003c") +
+      (omitted > 0 ? `\n\nOmitted ${omitted} fast finding(s) to fit the prompt budget.` : ""),
+  );
   if (skipped.length > 0) {
     parts.push(
       "## Diff budget note\nThe following files were omitted from the diff below to fit the review budget and were not reviewed:",
     );
-    parts.push(skipped.map((f) => `- ${neutralise(f).replace(/[\r\n]/g, "?")}`).join("\n"));
+    const shown = skipped.slice(0, 20).map((f) => `- ${neutralise(f).replace(/[\r\n]/g, "?")}`);
+    if (skipped.length > 20) shown.push(`- …and ${skipped.length - 20} more omitted from this note`);
+    parts.push(shown.join("\n"));
   }
   if (issueBody !== undefined && issueBody.trim() !== "") {
-    parts.push("## Linked issue (context from the PR's closing reference)");
-    parts.push(`<linked-issue>\n${neutralise(issueBody)}\n</linked-issue>`);
+    parts.push(LINKED_ISSUE_HEADER);
+    parts.push(`${LINKED_ISSUE_OPEN}${neutralise(issueBody)}${LINKED_ISSUE_CLOSE}`);
   }
   parts.push("## Pull request diff");
   parts.push(`<untrusted-diff>\n${neutralise(diffText)}\n</untrusted-diff>`);
@@ -69,14 +96,14 @@ export const PR_REVIEW_SCHEMA = {
   schema: {
     type: "object",
     additionalProperties: false,
-    required: ["findings"],
+    required: ["findings", "duplicates"],
     properties: {
       findings: {
         type: "array",
         items: {
           type: "object",
           additionalProperties: false,
-          required: ["severity", "file", "line", "rule", "message", "suggestion"],
+          required: ["severity", "file", "line", "rule", "message", "suggestion", "duplicateOf", "confidence", "patch"],
           properties: {
             severity: { type: "string", enum: ["info", "warning", "high"] },
             file: { type: "string" },
@@ -84,8 +111,15 @@ export const PR_REVIEW_SCHEMA = {
             rule: { type: "string" },
             message: { type: "string" },
             suggestion: { type: ["string", "null"] },
+            duplicateOf: { type: ["integer", "null"] },
+            confidence: { type: ["integer", "null"] },
+            patch: { type: ["string", "null"] },
           },
         },
+      },
+      duplicates: {
+        type: ["array", "null"],
+        items: { type: "array", items: { type: "integer" }, minItems: 2, maxItems: 2 },
       },
     },
   },

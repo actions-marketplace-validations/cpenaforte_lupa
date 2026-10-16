@@ -49,6 +49,10 @@ inputs:
     description: "Maximum number of diff characters sent to the LLM"
     required: false
     default: "60000"
+  max_prompt_chars:
+    description: "Maximum UTF-8 bytes for the assembled initial LLM user message on both paths (single-shot reviews and the agent-mode initial message): diff text, fast-findings JSON, linked-issue context, section headers, and the skipped-files note (the fixed ~1.5 KB system prompt is excluded). Requests that stay over budget after bounded cuts are skipped with a warning. Note: max_diff_chars is counted in UTF-16 code units, not bytes."
+    required: false
+    default: "120000"
   post_comment:
     description: "Whether to post the review comment on the PR"
     required: false
@@ -73,6 +77,22 @@ inputs:
     description: "Wall-clock budget in seconds for the agent tool loop"
     required: false
     default: "180"
+  max_findings:
+    description: "Total findings published (inline + body)"
+    required: false
+    default: "200"
+  max_inline_comments:
+    description: "Inline comments posted per review"
+    required: false
+    default: "30"
+  max_review_body_chars:
+    description: "Maximum review body size in Unicode code points"
+    required: false
+    default: "60000"
+  max_artifact_bytes:
+    description: "Maximum bytes read from SARIF, SBOM, findings, and pr-meta artifacts"
+    required: false
+    default: "8388608"
 outputs:
   exit-code:
     description: "fail_level gate result: 0 pass, 2 warning findings, 1 high-severity findings"

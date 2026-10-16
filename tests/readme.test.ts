@@ -33,9 +33,9 @@ describe("README", () => {
       "two-workflow pattern",
       "Dry-run: `post_comment: false`",
       "fail_level: high",
-      "when a high-severity finding exists",
+      "when a blocking high-severity finding exists",
       "Warning findings never block a merge",
-      "event, inline, general and high",
+      "event, inline, general, high and blocking",
       "llm_provider: opencode-go",
       "Anthropic-compatible",
     ]) {
@@ -71,12 +71,22 @@ describe("README", () => {
     expect(sec).toMatch(/review still posts/i);
   });
 
+  it("readme says a failed SARIF upload is no longer silent (a separate warning step reports it)", () => {
+    const r = fs.readFileSync("README.md", "utf8");
+    expect(r).toContain("a separate warning step reports the failure");
+    expect(r).not.toContain("silently absorbs it");
+  });
+
   it("documents the agent inputs, tools and disclosure", () => {
     const r = fs.readFileSync("README.md", "utf8");
     for (const s of [
       "llm_agent",
       "llm_agent_max_turns",
       "llm_agent_max_seconds",
+      "max_findings",
+      "max_inline_comments",
+      "max_review_body_chars",
+      "max_artifact_bytes",
       "read_file",
       "stop=final",
     ]) {
@@ -91,5 +101,74 @@ describe("README", () => {
     const r = fs.readFileSync("README.md", "utf8");
     expect(r).toContain("runtime-key masking only");
     expect(r).toContain("separate scanner concern");
+  });
+
+  it("fork section documents the workflow-run credential chain", () => {
+    const r = fs.readFileSync("README.md", "utf8");
+    expect(r).toContain("two-workflow pattern");
+    expect(r).toContain(
+      "On fork PRs, the workflow-run token is the default posting credential.",
+    );
+    expect(r).toContain(
+      "An App token via `PR_REVIEWER_APP_ID` / `PR_REVIEWER_APP_KEY` is the recommended upgrade.",
+    );
+    expect(r).toContain(
+      "Without an App token, the run posts with the workflow-run token and emits the downgrade notice.",
+    );
+    expect(r).toContain(
+      "A `github-token` or unset token type never posts on a fork; it skips posting with a loud warning.",
+    );
+  });
+});
+
+describe("README novelty-gated blocking (Q02)", () => {
+  it("documents the blocking set, the non-blocking note, and the markers", () => {
+    const r = fs.readFileSync("README.md", "utf8");
+    for (const s of [
+      "when a blocking high-severity finding exists",
+      "`1` if any blocking high finding",
+      "event, inline, general, high and blocking",
+      "blocking subset of the merged set",
+      "outside the PR diff and do not block",
+      "**blocking**",
+      "(non-blocking)",
+      "a marked `warning` under `fail_level: high` still exits 0",
+    ]) {
+      expect(r).toContain(s);
+    }
+  });
+});
+
+describe("README finding provenance (Q04)", () => {
+  it("documents the provenance section: fields, values, display-only gates, conf-50-on-high policy", () => {
+    const r = fs.readFileSync("README.md", "utf8");
+    expect(r).toContain("## Finding provenance");
+    expect(r).toContain("`source` names the producer");
+    expect(r).toContain("`confidence` is an integer 0-100");
+    expect(r).toContain("`evidence` names the analyzer");
+    expect(r).toContain(
+      "Deterministic analyzer output reports confidence 90; heuristic text matches report confidence 50; the LLM reports its own 0-100 (absent when unmarked).",
+    );
+    expect(r).toContain("Provenance is display-only: it never changes gates or severity.");
+    expect(r).toContain(
+      "Policy note: heuristic fastpath matches report confidence 50 even when they are high severity",
+    );
+  });
+});
+
+describe("README suggestion fences (Q01)", () => {
+  it("pins the model-supplied patch rendering note", () => {
+    const r = fs.readFileSync("README.md", "utf8");
+    expect(r).toContain("renders in an applicable suggestion fence");
+    expect(r).toContain(
+      "Only model-supplied replacement code renders in an applicable suggestion fence; explanatory text always renders as advice.",
+    );
+  });
+});
+
+describe("README add-only heuristics (Q03)", () => {
+  it("pins the content-evidence policy note", () => {
+    const r = fs.readFileSync("README.md", "utf8");
+    expect(r).toContain("a path match alone never emits");
   });
 });

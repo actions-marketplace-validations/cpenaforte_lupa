@@ -143,16 +143,45 @@ describe("buildMessages agent variant", () => {
 });
 
 describe("PR_REVIEW_SCHEMA", () => {
-  it("requires findings with strict item shape and all six keys", () => {
+  it("requires findings with strict item shape and all nine keys", () => {
     const item = (PR_REVIEW_SCHEMA.schema.properties.findings as any).items;
-    expect(item.required).toEqual(["severity", "file", "line", "rule", "message", "suggestion"]);
+    expect(item.required).toEqual(["severity", "file", "line", "rule", "message", "suggestion", "duplicateOf", "confidence", "patch"]);
     expect(Object.keys(item.properties).sort()).toEqual(
-      ["file", "line", "message", "rule", "severity", "suggestion"],
+      ["confidence", "duplicateOf", "file", "line", "message", "patch", "rule", "severity", "suggestion"],
     );
     expect(item.additionalProperties).toBe(false);
     expect(item.properties.severity.enum).toEqual(["info", "warning", "high"]);
+    expect(item.properties.duplicateOf).toEqual({ type: ["integer", "null"] });
+    expect(item.properties.confidence).toEqual({ type: ["integer", "null"] });
+    expect(item.properties.patch).toEqual({ type: ["string", "null"] });
     expect(PR_REVIEW_SCHEMA.schema.additionalProperties).toBe(false);
-    expect(PR_REVIEW_SCHEMA.schema.required).toEqual(["findings"]);
+    expect(PR_REVIEW_SCHEMA.schema.required).toEqual(["findings", "duplicates"]);
+  });
+
+  it("declares a nullable duplicates array of integer pairs with min/max length 2", () => {
+    const dupes = (PR_REVIEW_SCHEMA.schema.properties as any).duplicates;
+    expect(dupes.type).toEqual(["array", "null"]);
+    expect(dupes.items).toEqual({
+      type: "array",
+      items: { type: "integer" },
+      minItems: 2,
+      maxItems: 2,
+    });
+    expect(JSON.stringify(PR_REVIEW_SCHEMA.schema)).not.toContain("prefixItems");
+  });
+});
+
+describe("budget rendering", () => {
+  it("renders the omission line via the 6th param", () => {
+    const m = buildMessages([], "DIFF", undefined, [], undefined, 3);
+    expect(m.user).toContain("\n\nOmitted 3 fast finding(s) to fit the prompt budget.");
+    expect(buildMessages([], "DIFF").user).not.toContain("Omitted ");
+  });
+  it("caps the skipped-files list at 20 with a count", () => {
+    const skipped = Array.from({ length: 25 }, (_, i) => `src/f${i}.ts`);
+    const m = buildMessages([], "DIFF", undefined, skipped);
+    expect(m.user).toContain("- …and 5 more omitted from this note");
+    expect(m.user.match(/^- src\/f\d+\.ts$/gm)).toHaveLength(20);
   });
 });
 
@@ -187,5 +216,76 @@ describe("linkedIssueNumber", () => {
 
   it("rejects a reference with an alphanumeric tail", () => {
     expect(linkedIssueNumber("Fixes #12abc")).toBeNull();
+  });
+});
+
+describe("buildMessages withIds (dedup)", () => {
+  const F = [
+    { severity: "high" as const, file: "a.ts", line: 1, rule: "r1", message: "m1".repeat(50), suggestion: "s1".repeat(50) },
+    { severity: "warning" as const, file: "b.ts", rule: "r2", message: "m2" },
+  ];
+  const sentJson = (m: { user: string }): unknown[] =>
+    JSON.parse(m.user.split("\n\n").find((l) => l.startsWith("[")) as string) as unknown[];
+
+  it("renders an id field first with all other fields complete and untruncated", async () => {
+    const { buildMessages } = await import("../src/prompt.js");
+    const m = buildMessages(F, "DIFF", undefined, [], undefined, 0, { withIds: true });
+    const parsed = sentJson(m) as Array<Record<string, unknown>>;
+    expect(parsed).toHaveLength(2);
+    expect(Object.keys(parsed[0]!)[0]).toBe("id");
+    expect(parsed[0]).toEqual({ id: 0, ...F[0] });
+    expect(parsed[1]).toEqual({ id: 1, ...F[1] });
+    expect(parsed[0]!.message).toBe("m1".repeat(50));
+    expect(parsed[0]!.suggestion).toBe("s1".repeat(50));
+  });
+
+  it("is off by default and byte-identical with explicit withIds:false", async () => {
+    const { buildMessages } = await import("../src/prompt.js");
+    const base = buildMessages(F, "DIFF");
+    expect(JSON.stringify(sentJson(base)[0])).not.toContain('"id"');
+    const explicit = buildMessages(F, "DIFF", undefined, [], undefined, 0, { withIds: false });
+    expect(explicit.user).toBe(base.user);
+    expect(explicit.system).toBe(base.system);
+  });
+
+  it("appends the dedup instructions to the system text only for the single-shot path", async () => {
+    const { buildMessages, DEDUP_INSTRUCTIONS } = await import("../src/prompt.js");
+    expect(buildMessages([], "D").system).not.toContain(DEDUP_INSTRUCTIONS);
+    const single = buildMessages([], "D", undefined, [], undefined, 0, { withIds: true });
+    expect(single.system).toContain(DEDUP_INSTRUCTIONS);
+    const agent = buildMessages([], "D", undefined, [], { maxTurns: 10 });
+    const agentExplicit = buildMessages([], "D", undefined, [], { maxTurns: 10 }, 0, { withIds: false });
+    expect(agentExplicit.user).toBe(agent.user);
+    expect(agentExplicit.system).toBe(agent.system);
+    expect(agent.system).not.toContain(DEDUP_INSTRUCTIONS);
+  });
+});
+
+describe("DEDUP_INSTRUCTIONS", () => {
+  it("names the verdict fields, 0-based indices, and pair arrays", async () => {
+    const { DEDUP_INSTRUCTIONS } = await import("../src/prompt.js");
+    for (const token of ["duplicates", "duplicateOf", "0-based", "pair"]) {
+      expect(DEDUP_INSTRUCTIONS).toContain(token);
+    }
+  });
+
+  it("names the confidence field for the single-shot path only (agent prompts stay clean)", async () => {
+    const { buildMessages, DEDUP_INSTRUCTIONS } = await import("../src/prompt.js");
+    expect(DEDUP_INSTRUCTIONS).toContain("confidence");
+    expect(buildMessages([], "D", undefined, [], undefined, 0, { withIds: true }).system).toContain("confidence");
+    expect(buildMessages([], "D", undefined, [], { maxTurns: 10 }).system).not.toContain("confidence");
+    expect(buildMessages([], "D").system).not.toContain("confidence");
+  });
+
+  it("names the patch field with the spec §4 sentence on the single-shot path only (agent prompts stay clean)", async () => {
+    const { buildMessages, DEDUP_INSTRUCTIONS } = await import("../src/prompt.js");
+    const SENTENCE =
+      "Set `patch` to the exact replacement code for the flagged line, and only then; put all explanations in `suggestion`; use null when there is no replacement.";
+    expect(DEDUP_INSTRUCTIONS).toContain(SENTENCE);
+    expect(buildMessages([], "D", undefined, [], undefined, 0, { withIds: true }).system).toContain(SENTENCE);
+    expect(buildMessages([], "D").system).not.toContain(SENTENCE);
+    const agent = buildMessages([], "D", undefined, [], { maxTurns: 10 });
+    expect(agent.system).not.toContain(SENTENCE);
+    expect(agent.system).not.toContain("Set `patch`");
   });
 });

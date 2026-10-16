@@ -11,6 +11,7 @@ import {
   type FileDiff,
   type PrMeta,
 } from "../src/diff.js";
+import { parseDiffFiles } from "../src/main.js";
 
 // Local fixture (do NOT import from review.js — Task 10 owns it).
 function hunksFor(file: string): { file: string; header: string; body: string }[] {
@@ -121,6 +122,129 @@ describe("diff", () => {
     const dir = mkdtempSync(join(tmpdir(), "prmeta-"));
     try {
       expect(readPrMeta(dir)).toBeUndefined();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("readPrMeta throws Invalid pr-meta.json on oversize", () => {
+    const dir = mkdtempSync(join(tmpdir(), "prmeta-"));
+    try {
+      const m: PrMeta = {
+        pr_number: 42,
+        head_sha: "a".repeat(40),
+        base_sha: "b".repeat(40),
+        head_repo_full_name: "org/repo",
+        is_fork: false,
+      };
+      writeFileSync(join(dir, "pr-meta.json"), JSON.stringify(m), "utf8");
+      expect(() => readPrMeta(dir, 10)).toThrow(/Invalid pr-meta\.json/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("parseDiffFiles deleted marker", () => {
+  const text = [
+    "diff --git a/gone.ts b/gone.ts",
+    "deleted file mode 100644",
+    "index 1111111..0000000",
+    "--- a/gone.ts",
+    "+++ /dev/null",
+    "@@ -1 +0,0 @@",
+    "-x",
+    "diff --git a/live.ts b/live.ts",
+    "index 1111111..2222222 100644",
+    "--- a/live.ts",
+    "+++ b/live.ts",
+    "@@ -1 +1 @@",
+    "-a",
+    "+b",
+    "",
+  ].join("\n");
+
+  it("marks deleted-file sections and leaves live files unmarked", () => {
+    const files = parseDiffFiles(text);
+    expect(files).toHaveLength(2);
+    expect(files[0]).toMatchObject({ file: "gone.ts", deleted: true });
+    expect(files[1]!.file).toBe("live.ts");
+    expect("deleted" in files[1]!).toBe(false);
+  });
+});
+
+describe("pr-meta verdicts (dedup)", () => {
+  it("round-trips verdicts through pr-meta; unknown top-level keys stay lenient", async () => {
+    const { writePrMeta, readPrMeta } = await import("../src/diff.js");
+    const dir = mkdtempSync(join(tmpdir(), "prmeta-"));
+    try {
+      const m: PrMeta = {
+        pr_number: 42,
+        head_sha: "a".repeat(40),
+        base_sha: "b".repeat(40),
+        head_repo_full_name: "org/repo",
+        is_fork: false,
+        verdicts: { pairs: [[0, 1]], links: [[2, 0]], malformed: 1 },
+      };
+      writePrMeta(m, dir);
+      expect(readPrMeta(dir)).toEqual(m);
+      writeFileSync(join(dir, "pr-meta.json"), JSON.stringify({ ...m, fail_level: "none" }), "utf8");
+      expect(readPrMeta(dir)).toEqual(m);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("returns undefined verdicts when the key is missing", async () => {
+    const { writePrMeta, readPrMeta } = await import("../src/diff.js");
+    const dir = mkdtempSync(join(tmpdir(), "prmeta-"));
+    try {
+      const m: PrMeta = {
+        pr_number: 42,
+        head_sha: "a".repeat(40),
+        base_sha: "b".repeat(40),
+        head_repo_full_name: "org/repo",
+        is_fork: false,
+      };
+      writePrMeta(m, dir);
+      expect(readPrMeta(dir)).toEqual(m);
+      expect(readPrMeta(dir)!.verdicts).toBeUndefined();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    ["non-object", "x"],
+    ["null", null],
+    ["array", []],
+    ["pairs not an array", { pairs: "x", links: [], malformed: 0 }],
+    ["links not an array", { pairs: [], links: {}, malformed: 0 }],
+    ["malformed negative", { pairs: [], links: [], malformed: -1 }],
+    ["malformed non-integer", { pairs: [], links: [], malformed: 1.5 }],
+    ["malformed missing", { pairs: [], links: [] }],
+    ["negative pair index", { pairs: [[0, -1]], links: [], malformed: 0 }],
+    ["non-integer pair index", { pairs: [[0, 1.5]], links: [], malformed: 0 }],
+    ["long pair", { pairs: [[0, 1, 2]], links: [], malformed: 0 }],
+    ["non-integer link target", { pairs: [], links: [[2, "a"]], malformed: 0 }],
+    ["negative link index", { pairs: [], links: [[-2, 0]], malformed: 0 }],
+  ])("readPrMeta throws like any contract violation on malformed verdicts (%s)", async (_name, verdicts) => {
+    const { readPrMeta } = await import("../src/diff.js");
+    const dir = mkdtempSync(join(tmpdir(), "prmeta-"));
+    try {
+      writeFileSync(
+        join(dir, "pr-meta.json"),
+        JSON.stringify({
+          pr_number: 42,
+          head_sha: "a".repeat(40),
+          base_sha: "b".repeat(40),
+          head_repo_full_name: "org/repo",
+          is_fork: false,
+          verdicts,
+        }),
+        "utf8",
+      );
+      expect(() => readPrMeta(dir)).toThrow(/Invalid pr-meta\.json/);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

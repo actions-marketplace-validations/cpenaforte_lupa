@@ -18,6 +18,15 @@ export const highFinding = {
   message: "The changed check runs without any authentication.",
 } as const;
 
+const q03KeyFinding = {
+  severity: "high",
+  file: "id_rsa",
+  rule: "sensitive-path",
+  message: "Sensitive file path changed: id_rsa",
+  source: "fastpath",
+  confidence: 50,
+} as const;
+
 const commandFinding = {
   severity: "warning",
   file: "src/archive.ts",
@@ -94,7 +103,7 @@ const forkFinding = {
   message: "The new default enables an unsafe mode.",
 } as const;
 const forkL2Skipped = {
-  severity: "info", file: "", rule: "l2-skipped",
+  severity: "info", file: "", rule: "l2-skipped", source: "l2",
   message: "L2 native toolchains were not executed: fork PR with secrets in scope. Semgrep, gitleaks and trivy still ran.",
 } as const;
 
@@ -103,12 +112,20 @@ const mergeL2Note = {
   message: "Synthetic L2 note.",
 } as const;
 
-function summaryForMany(findings: readonly { severity: string; file: string; line?: number; rule: string; message: string }[]): string {
+function summaryForMany(findings: readonly { severity: string; file: string; line?: number; rule: string; message: string; source?: string; confidence?: number; evidence?: { snippet?: string; analyzer?: string } }[]): string {
   return [`lupa: ${findings.length} finding(s).`, ...findings.flatMap((finding, index) => [
     "", `### Finding ${index + 1}`, "", `- Severity: ${finding.severity}`, "- Location:", "```text",
     finding.file === "" ? "(repository)" : `${finding.file}${finding.line === undefined ? "" : `:${finding.line}`}`,
     "```", "- Rule:", "```text", finding.rule, "```", "- Message/evidence:", "```text", finding.message,
-    "```", "- Suggested remediation (advice only):", "```text", "No remediation supplied", "```",
+    "```",
+    ...(finding.source !== undefined ? ["- Source:", "```text", finding.source, "```"] : []),
+    ...(finding.confidence !== undefined ? ["- Confidence:", "```text", String(finding.confidence), "```"] : []),
+    ...(finding.evidence !== undefined && (finding.evidence.analyzer !== undefined || finding.evidence.snippet !== undefined)
+      ? ["- Evidence:",
+        ...(finding.evidence.analyzer !== undefined ? ["```text", `analyzer: ${finding.evidence.analyzer}`, "```"] : []),
+        ...(finding.evidence.snippet !== undefined ? ["```text", finding.evidence.snippet, "```"] : [])]
+      : []),
+    "- Suggested remediation (advice only):", "```text", "No remediation supplied", "```",
   ])].join("\n");
 }
 
@@ -254,7 +271,7 @@ export const evalCases: readonly EvalCase[] = [
     llmFindings: [deletionFinding],
     expected: {
       promptDiffSnippet: "-  return privileged();",
-      findings: [deletionFinding], exitCode: 2, summary: summaryFor(deletionFinding),
+      findings: [deletionFinding], exitCode: 0, summary: summaryFor(deletionFinding),
       publication: { kind: "review", payload: inlinePayload(deletionFinding, "LEFT") },
     },
   },
@@ -270,7 +287,7 @@ export const evalCases: readonly EvalCase[] = [
     id: "synthetic-fork-readonly-summary-only",
     categories: ["fork-readonly"], syntheticRationale: "Synthetic permission regression: a fork with a read-only token still emits its summary without writes.",
     patchFixture: "fork-readonly.patch", fakeGatewayMode: "isFork",
-    envOverrides: { tokenIsApp: false, issueFallback: true }, llmFindings: [forkFinding],
+    envOverrides: { tokenType: "github-token", issueFallback: true }, llmFindings: [forkFinding],
     expected: {
       promptDiffSnippet: "+  enabled = true;", findings: [forkL2Skipped, forkFinding], exitCode: 2,
       summary: summaryForMany([forkL2Skipped, forkFinding]), publication: { kind: "none" },
@@ -369,7 +386,7 @@ export const evalCases: readonly EvalCase[] = [
         kind: "review",
         payload: {
           ...authzReviewPayload,
-          body: "lupa: 2 finding(s).\n\n**Findings not placed inline:**\n- **info** (repository) [l2-note] Synthetic L2 note.",
+          body: "lupa: 2 finding(s).\n\n**Note:** 1 finding(s) below are outside the PR diff and do not block.\n\n**Findings not placed inline:**\n- **info** (repository) [l2-note] Synthetic L2 note.",
         },
       },
     },
@@ -404,7 +421,8 @@ export const evalCases: readonly EvalCase[] = [
     patchFixture: "positive-authz.patch",
     llmError: { reason: "content-filter", detail: "synthetic refusal" },
     expected: {
-      promptDiffSnippet: "+  return record;", findings: [], exitCode: 0, summary: "lupa: no findings.",
+      promptDiffSnippet: "+  return record;", findings: [], exitCode: 0,
+      summary: "lupa: dedup skipped (slow path unavailable); scanner findings published unmerged\nlupa: no findings.",
       publication: { kind: "review", payload: cleanPayload },
     },
   },
@@ -421,6 +439,43 @@ export const evalCases: readonly EvalCase[] = [
       exitCode: 0,
       summary: `${authzSummary}\n${staleSkipNote}`,
       publication: { kind: "none" },
+    },
+  },
+  {
+    id: "synthetic-positive-q03-key-addition",
+    categories: ["positive"],
+    syntheticRationale: "Synthetic Q03 regression: a newly added private key in a sensitive path emits an evidence-backed high finding.",
+    patchFixture: "q03-key-addition.patch",
+    inputOverrides: { failLevel: "high" },
+    llmFindings: [],
+    expected: {
+      promptDiffSnippet: "+-----BEGIN RSA PRIVATE KEY-----",
+      findings: [q03KeyFinding],
+      exitCode: 1,
+      summary: summaryForMany([q03KeyFinding]),
+      publication: {
+        kind: "review",
+        payload: {
+          commit_id: HEAD_SHA,
+          body: "lupa: 1 finding(s).\n\n**Findings not placed inline:**\n- **high** **blocking** id_rsa [sensitive-path] Sensitive file path changed: id_rsa\n  \n  \x60src:fastpath · conf 50\x60",
+          event: "REQUEST_CHANGES",
+          comments: [],
+        },
+      },
+    },
+  },
+  {
+    id: "synthetic-safe-negative-q03-cert-addition",
+    categories: ["safe-negative"],
+    syntheticRationale: "Synthetic Q03 safe control: a newly added public certificate carries no private-key evidence and emits nothing.",
+    patchFixture: "q03-cert-addition.patch",
+    llmFindings: [],
+    expected: {
+      promptDiffSnippet: "+-----BEGIN CERTIFICATE-----",
+      findings: [],
+      exitCode: 0,
+      summary: "lupa: no findings.",
+      publication: { kind: "review", payload: cleanPayload },
     },
   },
 ];

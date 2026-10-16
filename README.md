@@ -49,6 +49,11 @@ The diff is treated as untrusted data. By default the LLM has no tools (see Agen
 | `pr_number` | (empty) | Used only by `workflow_dispatch`. |
 | `fail_level` | `warning` | `none`, `warning` or `high`. See the gate section. |
 | `max_diff_chars` | `60000` | Diff ceiling sent to the LLM. |
+| `max_prompt_chars` | `120000` | Total UTF-8 byte budget for the assembled LLM user message (diff, findings, issue context, headers, skipped-files note); the fixed system prompt is excluded. Note: `max_diff_chars` is counted in UTF-16 code units, not bytes. |
+| `max_findings` | `200` | Total findings published (inline + body). |
+| `max_inline_comments` | `30` | Inline comments posted per review. |
+| `max_review_body_chars` | `60000` | Maximum review body size in Unicode code points. |
+| `max_artifact_bytes` | `8388608` | Maximum bytes read from SARIF, SBOM, findings, and pr-meta artifacts. |
 | `post_comment` | `true` | `false` makes a dry-run. |
 | `timeout_seconds` | `90` | LLM request timeout. A timeout degrades to a summary without retry. |
 
@@ -122,44 +127,62 @@ In agent mode, whole files from the repository (and from linked repositories men
 Budget figures are estimates. Prices change: check your provider's price page, and compare **Zen vs direto** (calling the model provider directly with its own key). Zen is pay-per-use through OpenCode, and its prices can differ from the direct provider prices.
 
 - **Cost of a typical PR:** about 3k input tokens plus 600 output tokens.
-- **Ceiling:** `max_diff_chars` 60000 is about 15k input tokens plus prompt overhead. At frontier-model prices a PR at the ceiling costs roughly $0.15 to $0.30. Compare with the typical figure above (about 3k input and 600 output tokens). Lower `max_diff_chars` to cap spend. Files larger than the per-file cap (8000 characters) are truncated, and files over the total ceiling are skipped with a note.
+- **Ceiling:** `max_prompt_chars` 120000 bytes is about 30k input tokens (≈bytes/4) plus prompt overhead. At frontier-model prices a PR at the ceiling costs roughly $0.30 to $0.60. Compare with the typical figure above (about 3k input and 600 output tokens). Lower `max_prompt_chars` to cap spend. `max_diff_chars` (60000 UTF-16 code units) stays the diff-only allowance inside that total. Files larger than the per-file cap (8000 characters) are truncated, and files over the total ceiling are skipped with a note. Any diff whose UTF-8 bytes exceed 120,000 skips the slow path at default config — e.g. ~40k units at 3 B/unit, ~60k units at 2 B/unit.
 - **peak/off-peak pricing:** some models price by time of day. For example, `deepseek-v4.1-flash` has different peak and off-peak prices. Check the current rates before choosing a model for high-volume repositories.
 - **Retries:** one retry after a fixed 500 ms delay, only on 5xx and 429. A `Retry-After` header replaces the delay, capped at 5 s. Timeouts and output truncation (`finish_reason: length`) are not retried with a smaller diff, because truncating the input does not fix truncated output.
 
 ## Gate: `fail_level`
 
-The findings and the gate are separate. The review event and the exit code follow the level:
+Only PR-touched findings block. The review event and the exit code read the blocking set — findings on added lines, plus lineless findings on touched files — under the active level:
 
 | `fail_level` | Review event | Exit code |
 |---|---|---|
 | `none` | always `COMMENT` | `0` always (log only) |
-| `warning` | `COMMENT` | `2` if any finding is `warning` or `high`; `0` for info-only |
-| `high` | `REQUEST_CHANGES` when a high-severity finding exists; otherwise `COMMENT` | `1` if any `high` finding; `0` otherwise |
+| `warning` | `COMMENT` | `2` if any blocking finding is `warning` or `high`; `0` for info-only |
+| `high` | `REQUEST_CHANGES` when a blocking high-severity finding exists; otherwise `COMMENT` | `1` if any blocking high finding; `0` otherwise |
 
 - The action never approves automatically in v1.
 - A `REQUEST_CHANGES` review always has a body.
 - The action step exits non-zero for `1` and `2`, so the template runs it with `continue-on-error: true` and reads `steps.review.outputs.exit-code` in a separate gate step.
 - The template's gate passes on `0` and `2` and fails on `1`. Warning findings never block a merge. A failed run (for example an action error, where no exit code is produced) still fails the gate. To block on high-severity findings, set `fail_level: high`.
+- A prompt-budget skip passes the gate on fast findings only; the skip is recorded in the step summary.
+- Findings outside the PR diff never block on their own: they stay visible in the review body under `**Findings not placed inline:**`, preceded by a `**Note:** <n> finding(s) below are outside the PR diff and do not block.` header when at least one body item is non-blocking. Body items in the blocking set carry a `**blocking**` marker after the severity; folded excess inline comments outside the blocking set render `- path:line (non-blocking)`. Markers denote blocking-set membership read under the active fail level (a marked `warning` under `fail_level: high` still exits 0).
+- **Wrongly-resolved findings re-block.** Clicking Resolve on a review thread while the flagged issue still persists re-arms the gate: the next run re-reads the PR's review threads and any of our own resolved threads whose finding is still reported blocks again, marked `**reopened**` (in the body, or inline when the line drifted to a commentable context line — never promoted, only marked). Matching is exact on file and line with rule intersection, so a re-merged thread still reopens its members. Identity is the token's own login, falling back to the newest `lupa:`-bodied review on installation tokens; when neither resolves, or the thread read fails, the run gates on diff membership only (fail-open, with a warning). Only the newest 100 threads are read (older ones warn-truncate).
+- Only model-supplied replacement code renders in an applicable suggestion fence; explanatory text always renders as advice. A finding's `patch` fences inline as a GitHub `suggestion` on the new side, or renders as a plain advice-only replacement block elsewhere (the fallback report adds a `- Proposed patch (advice only):` row); `suggestion` never fences.
 
 ## Scanners and their runtimes
 
 - **semgrep** runs from the PyPI package, pinned to `semgrep==1.180.0`. The unprivileged template installs it into a venv. No docker is needed for semgrep. Without `SEMGREP_APP_TOKEN` it runs `semgrep scan --config p/default --metrics=off` (`--config auto` is rejected when `--metrics=off` is set: "Cannot create auto config when metrics are off"); with a token it runs `semgrep ci` (diff-aware via `SEMGREP_BASELINE_COMMIT`).
 - **gitleaks, trivy and osv-scanner** run from docker images pinned by digest. The runner needs docker for them. Without docker, each one reports a `scanner-missing` warning and the run continues.
 - Docker scanners mount the checkout at `/src`, so SARIF reports absolute `/src/<path>` (or `file:///src/<path>`) artifact URIs. These are normalized back to repo-relative paths before findings are mapped, so inline comments still land on the right file.
-- **Known limitation:** trivy and gitleaks can report the same secret or dependency once each, and there is no cross-scanner dedupe. The same location may appear twice in the review. This is deliberate in v1: the scanners use different rule ids and severities, so a blind merge could drop a real finding.
+- **Cross-scanner dedupe:** trivy and gitleaks can report the same secret or dependency once each. The single-shot LLM judges duplicates pairwise (`duplicates` index pairs, `duplicateOf` restatements) and deterministic code merges them: same file and line only, severity is the maximum, rules join with `+`, messages cite each rule. A wrong model pair never swallows an unrelated location — cross-file and cross-line verdicts are ignored with a warning. The gate sees the blocking subset of the merged set; the summary head/counts and the dry-run high count see the full pre-merge set; only the funnel (inline/body), SARIF, and marker counts use the merged set, while `findings.json` keeps the pre-merge set. When the slow path is skipped (no LLM) findings publish unmerged with a `lupa: dedup skipped` note; agent mode publishes unmerged with no note, by design.
+
+## Finding provenance
+
+Every finding may carry where it came from, what proves it, and how confident the claimant is:
+
+- `source` names the producer (`semgrep`, `trivy`, `gitleaks`, `osv-scanner`, `gofmt`, `fastpath`, `sbom`, `l2`, `llm`). Absent means a legacy finding.
+- `confidence` is an integer 0-100. Deterministic analyzer output reports confidence 90; heuristic text matches report confidence 50; the LLM reports its own 0-100 (absent when unmarked).
+- `evidence` names the analyzer and carries the flagged snippet (the snippet is reserved in v1 and assigned by no producer).
+
+Provenance is display-only: it never changes gates or severity. It renders as an inline `` `src:<source> · conf <n>` `` trailer, `- Source:` / `- Confidence:` / `- Evidence:` fallback rows, and SARIF `properties`.
+
+Policy note: heuristic fastpath matches report confidence 50 even when they are high severity (for example sensitive-path findings), because emission requires added-line secret evidence — a path match alone never emits.
 
 ## Dry-run: `post_comment: false`
 
-With `post_comment: false` the action runs the whole pipeline, writes the summary and the artifact, and logs the event and the finding counts it would have posted (event, inline, general and high). The review body is not logged. Nothing is posted to the PR. Use it to tune the prompt, the model, or `max_diff_chars` before you enable posting.
+With `post_comment: false` the action runs the whole pipeline, writes the summary and the artifact, and logs the event from the blocking set and the finding counts it would have posted (event, inline, general, high and blocking). The review body is not logged. Nothing is posted to the PR. Use it to tune the prompt, the model, or `max_diff_chars` before you enable posting.
 
 ## Forks and the two-workflow setup
 
 A fork PR gets a read-only `GITHUB_TOKEN`, so the review cannot be posted from the PR workflow. In that case the action writes the summary and uploads the review artifact (`pr-reviewer-out`, containing `diff.patch`, `pr-meta.json`, `findings.json`, `sarif.json` and `sbom.cdx.json`). Issue comments and code-scanning uploads do not work on read-only fork runs either.
 
-To post reviews on fork PRs, use the two-workflow pattern with an App token:
+To post reviews on fork PRs, use the two-workflow pattern:
 
 1. **Unprivileged** (`docs/workflow-template.yml`, trigger `pull_request`): checks out the PR head with `persist-credentials: false`, writes the diff against the fetched base SHA, runs the review and uploads the artifact. It holds no App key.
-2. **Privileged** (`docs/workflow-template-privileged.yml`, trigger `workflow_run` on `Lupa` with `types: [completed]`, guarded to fork `pull_request` runs that were not cancelled): runs in the base repository context. It only downloads the artifact by `run-id`, verifies the files, and posts the review, using a GitHub App token created with `actions/create-github-app-token` when `PR_REVIEWER_APP_ID` is set. It never checks out PR code, never runs scanners or L2, and never calls the LLM.
+2. **Privileged** (`docs/workflow-template-privileged.yml`, trigger `workflow_run` on `Lupa` with `types: [completed]`, guarded to fork `pull_request` runs that were not cancelled): runs in the base repository context. It only downloads the artifact by `run-id`, verifies the files, and posts the review, using the workflow-run token by default and upgrading to a GitHub App token created with `actions/create-github-app-token` when `PR_REVIEWER_APP_ID` is set. It never checks out PR code, never runs scanners or L2, and never calls the LLM.
+
+On fork PRs, the workflow-run token is the default posting credential. An App token via `PR_REVIEWER_APP_ID` / `PR_REVIEWER_APP_KEY` is the recommended upgrade. Without an App token, the run posts with the workflow-run token and emits the downgrade notice. A `github-token` or unset token type never posts on a fork; it skips posting with a loud warning.
 
 The segregation matters: the privileged job reads only the artifact, so PR code never runs with the App key.
 
@@ -171,7 +194,7 @@ The segregation matters: the privileged job reads only the artifact, so PR code 
 
 ## Security notes
 
-- Keep `permissions` minimal: `contents: read`, `pull-requests: write`. The unprivileged template ships `issues: write`, `security-events: write` and `actions: read` commented out; the privileged template already grants `actions: read` (needed for the `workflow_run` artifact fetch). Uncomment `issues: write` only with the issue-comment fallback (`PR_REVIEWER_ISSUE_FALLBACK: "true"`). Enabling the code-scanning SARIF upload needs **both** `security-events: write` and `actions: read` (private repos need `actions: read` for the workflow-run lookup, and the `upload-sarif` telemetry also uses it). With either one missing the upload fails with "Resource not accessible by integration" and `continue-on-error` silently absorbs it, so the review still posts.
+- Keep `permissions` minimal: `contents: read`, `pull-requests: write`. The unprivileged template ships `issues: write`, `security-events: write` and `actions: read` commented out; the privileged template already grants `actions: read` (needed for the `workflow_run` artifact fetch). Uncomment `issues: write` only with the issue-comment fallback (`PR_REVIEWER_ISSUE_FALLBACK: "true"`). Enabling the code-scanning SARIF upload needs **both** `security-events: write` and `actions: read` (private repos need `actions: read` for the workflow-run lookup, and the `upload-sarif` telemetry also uses it). With either one missing the upload fails with "Resource not accessible by integration" and `continue-on-error` absorbs it, so the review still posts; a separate warning step reports the failure.
 - Pin the action and every third-party action to a commit SHA.
 - Never interpolate PR titles or bodies into `run:` steps. `pull_request_target` is not used.
 - `llm_api_key` is never written to logs. Prompt-injection defences are structural (delimited diff, no tools for the model, output validation, an auditable log of each call). They are not a guarantee.

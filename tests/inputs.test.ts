@@ -19,12 +19,17 @@ const INPUT_NAMES = [
   "pr_number",
   "fail_level",
   "max_diff_chars",
+  "max_prompt_chars",
   "post_comment",
   "timeout_seconds",
   "llm_max_tokens",
   "llm_agent",
   "llm_agent_max_turns",
   "llm_agent_max_seconds",
+  "max_findings",
+  "max_inline_comments",
+  "max_review_body_chars",
+  "max_artifact_bytes",
 ];
 
 let saved: Record<string, string | undefined> = {};
@@ -60,6 +65,7 @@ describe("getInputs defaults", () => {
     expect(i.llmApiStyle).toBe("auto");
     expect(i.failLevel).toBe("warning");
     expect(i.maxDiffChars).toBe(60000);
+    expect(i.maxPromptChars).toBe(120000);
     expect(i.timeoutSeconds).toBe(90);
     expect(i.llmMaxTokens).toBe(2000);
     expect(i.postComment).toBe(true);
@@ -69,6 +75,10 @@ describe("getInputs defaults", () => {
     expect(i.llmAgent).toBe(false);
     expect(i.llmAgentMaxTurns).toBe(10);
     expect(i.llmAgentMaxSeconds).toBe(180);
+    expect(i.maxFindings).toBe(200);
+    expect(i.maxInlineComments).toBe(30);
+    expect(i.maxReviewBodyChars).toBe(60000);
+    expect(i.maxArtifactBytes).toBe(8388608);
   });
 });
 
@@ -246,9 +256,29 @@ describe("getInputs integer inputs", () => {
     ["timeout_seconds", "9007199254740993"],
     ["llm_max_tokens", "9007199254740993"],
     ["max_diff_chars", "9007199254740993"],
+    ["max_prompt_chars", "9007199254740993"],
   ])("rejects unsafe-integer %s naming the input", (name, v) => {
     setInputs({ [name]: v });
     expect(() => getInputs()).toThrow(new RegExp(name));
+  });
+
+  it("rejects non-integer max_prompt_chars naming the input", () => {
+    setInputs({ max_prompt_chars: "12.5" });
+    expect(() => getInputs()).toThrow(/max_prompt_chars/);
+  });
+
+  it.each([
+    ["max_prompt_chars", "lots"],
+    ["max_prompt_chars", "0"],
+    ["max_prompt_chars", "-5"],
+  ])("rejects max_prompt_chars %s naming the input", (name, v) => {
+    setInputs({ [name]: v });
+    expect(() => getInputs()).toThrow(new RegExp(name));
+  });
+
+  it("accepts max_prompt_chars boundary '1' (minimum)", () => {
+    setInputs({ max_prompt_chars: "1" });
+    expect(getInputs().maxPromptChars).toBe(1);
   });
 });
 
@@ -286,5 +316,44 @@ describe("getInputs agent inputs", () => {
   it("rejects invalid llm_agent naming the input", () => {
     setInputs({ llm_agent: "yes" });
     expect(() => getInputs()).toThrow(/llm_agent/);
+  });
+});
+
+describe("getInputs aggregate limits (F15)", () => {
+  it("rejects max_findings = 0 (must be >= 1)", () => {
+    setInputs({ max_findings: "0" });
+    expect(() => getInputs()).toThrow(/max_findings/);
+  });
+
+  it.each(["5", "999"])("rejects max_review_body_chars %s (must be >= 1000)", (v) => {
+    setInputs({ max_review_body_chars: v });
+    expect(() => getInputs()).toThrow(/max_review_body_chars/);
+  });
+
+  it("accepts max_review_body_chars boundary '1000' (minimum)", () => {
+    setInputs({ max_review_body_chars: "1000" });
+    expect(getInputs().maxReviewBodyChars).toBe(1000);
+  });
+
+  it.each([
+    ["max_findings", "12.5"],
+    ["max_findings", "lots"],
+    ["max_inline_comments", "12.5"],
+    ["max_inline_comments", "lots"],
+    ["max_review_body_chars", "12.5"],
+    ["max_review_body_chars", "lots"],
+    ["max_artifact_bytes", "12.5"],
+    ["max_artifact_bytes", "lots"],
+  ])("rejects %s %s naming the input", (name, v) => {
+    setInputs({ [name]: v });
+    expect(() => getInputs()).toThrow(new RegExp(name));
+  });
+
+  it.each([
+    ["max_inline_comments", "0"],
+    ["max_artifact_bytes", "0"],
+  ])("rejects %s = 0 (must be >= 1)", (name, v) => {
+    setInputs({ [name]: v });
+    expect(() => getInputs()).toThrow(new RegExp(name));
   });
 });

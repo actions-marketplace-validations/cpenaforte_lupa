@@ -3,6 +3,12 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import type { ActionInputs } from "../../src/inputs.js";
+import {
+  DEFAULT_MAX_ARTIFACT_BYTES,
+  DEFAULT_MAX_FINDINGS,
+  DEFAULT_MAX_INLINE_COMMENTS,
+  DEFAULT_MAX_REVIEW_BODY_CHARS,
+} from "../../src/inputs.js";
 import { ReadonlyTokenError, StaleHeadError } from "../../src/github.js";
 import type { Analysis, Deps, Gateway, PrInfo, RunEnv } from "../../src/main.js";
 import type { LlmResult } from "../../src/llm.js";
@@ -30,6 +36,11 @@ function defaultInputs(): ActionInputs {
     llmMaxTokens: 128,
     failLevel: "warning",
     maxDiffChars: 60000,
+    maxPromptChars: 120000,
+    maxFindings: DEFAULT_MAX_FINDINGS,
+    maxInlineComments: DEFAULT_MAX_INLINE_COMMENTS,
+    maxReviewBodyChars: DEFAULT_MAX_REVIEW_BODY_CHARS,
+    maxArtifactBytes: DEFAULT_MAX_ARTIFACT_BYTES,
     postComment: true,
     timeoutSeconds: 1,
     prNumber: null,
@@ -135,6 +146,14 @@ export async function runBundleEval(testCase: EvalCase): Promise<EvalRun> {
       gatewayCalls.push({ method: "getRepoSize", args: [owner, repo] });
       return 0;
     },
+    async listReviewThreads(pr) {
+      gatewayCalls.push({ method: "listReviewThreads", args: [pr] });
+      return [];
+    },
+    async getActor(pr) {
+      gatewayCalls.push({ method: "getActor", args: [pr] });
+      return "synthetic-actor";
+    },
     async createReview(pr, payload) {
       gatewayCalls.push({ method: "createReview", args: [pr, payload] });
       if (testCase.fakeGatewayMode === "refusedReview") throw new ReadonlyTokenError("refused", 403);
@@ -194,7 +213,7 @@ export async function runBundleEval(testCase: EvalCase): Promise<EvalRun> {
     artifactDir,
     baseSha: BASE_SHA,
     headSha: HEAD_SHA,
-    tokenIsApp: false,
+    tokenType: "github-token",
     issueFallback: false,
     summaryPath,
     ...testCase.envOverrides,

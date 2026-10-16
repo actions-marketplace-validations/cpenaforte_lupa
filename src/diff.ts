@@ -1,5 +1,8 @@
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
+import { readCappedFileSync } from "./artifact-limits.js";
+import { DEFAULT_MAX_ARTIFACT_BYTES } from "./inputs.js";
+import type { DedupVerdicts } from "./llm.js";
 
 export interface FileDiff {
   file: string;
@@ -7,6 +10,8 @@ export interface FileDiff {
   truncated: boolean;
   /** Decided by git (binary diff). Never guess from extension. */
   binary?: boolean;
+  /** Set from the `deleted file mode` header: the file was deleted, so it introduces nothing. */
+  deleted?: boolean;
   /** Bytes on disk (stat). The large-file rule uses this, never hunks.length. */
   size?: number;
 }
@@ -175,6 +180,27 @@ export interface PrMeta {
   base_sha: string;
   head_repo_full_name: string;
   is_fork: boolean;
+  /** Dedup verdicts from the Flow A slow path. A missing key means no judge ran (silent no-merge). */
+  verdicts?: DedupVerdicts;
+}
+
+/** A present verdicts key must carry the DedupVerdicts shape; anything else throws like any contract violation. */
+function isVerdictPair(v: unknown): v is [number, number] {
+  return Array.isArray(v) && v.length === 2 && v.every((n) => typeof n === "number" && Number.isInteger(n) && n >= 0);
+}
+
+function isVerdicts(v: unknown): v is DedupVerdicts {
+  if (typeof v !== "object" || v === null || Array.isArray(v)) return false;
+  const r = v as Record<string, unknown>;
+  return (
+    Array.isArray(r.pairs) &&
+    r.pairs.every(isVerdictPair) &&
+    Array.isArray(r.links) &&
+    r.links.every(isVerdictPair) &&
+    typeof r.malformed === "number" &&
+    Number.isInteger(r.malformed) &&
+    r.malformed >= 0
+  );
 }
 
 const PR_META_FILE = "pr-meta.json";
@@ -184,12 +210,14 @@ export function writePrMeta(m: PrMeta, dir: string): void {
 }
 
 /** Returns undefined when no pr-meta file exists; throws when it is malformed. */
-export function readPrMeta(dir: string): PrMeta | undefined {
+export function readPrMeta(dir: string, maxBytes: number = DEFAULT_MAX_ARTIFACT_BYTES): PrMeta | undefined {
   const path = join(dir, PR_META_FILE);
   if (!existsSync(path)) return undefined;
+  const capped = readCappedFileSync(path, maxBytes);
+  if (!capped.ok) throw new Error(`Invalid ${PR_META_FILE} in ${dir}: exceeds the artifact read limit (${maxBytes} bytes)`);
   let parsed: unknown;
   try {
-    parsed = JSON.parse(readFileSync(path, "utf8"));
+    parsed = JSON.parse(capped.text);
   } catch {
     throw new Error(`Invalid ${PR_META_FILE} in ${dir}: malformed JSON`);
   }
@@ -210,11 +238,15 @@ export function readPrMeta(dir: string): PrMeta | undefined {
   ) {
     throw new Error(`Invalid ${PR_META_FILE} in ${dir}`);
   }
+  if ("verdicts" in v && v.verdicts !== undefined && !isVerdicts(v.verdicts)) {
+    throw new Error(`Invalid ${PR_META_FILE} in ${dir}`);
+  }
   return {
     pr_number: v.pr_number,
     head_sha: v.head_sha,
     base_sha: v.base_sha,
     head_repo_full_name: v.head_repo_full_name,
     is_fork: v.is_fork,
+    ...(v.verdicts !== undefined ? { verdicts: v.verdicts as DedupVerdicts } : {}),
   };
 }

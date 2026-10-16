@@ -13,6 +13,28 @@ import type { ToolContext } from "../src/agent-tools.js";
 
 vi.mock("@actions/core", () => ({ warning: vi.fn(), info: vi.fn() }));
 
+// Records every runAgent budget seen through the agent-mode probe so the
+// shared-deadline test can pin that all probed styles receive the same
+// absolute deadlineMs. Delegates to the real runAgent; existing tests are
+// unaffected.
+vi.mock("../src/agent.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/agent.js")>();
+  const budgets = ((globalThis as Record<string, unknown>)["__probeBudgets"] ??= []) as Array<
+    Parameters<typeof actual.runAgent>[2]
+  >;
+  return {
+    ...actual,
+    runAgent: (...args: Parameters<typeof actual.runAgent>) => {
+      budgets.push(args[2]);
+      return actual.runAgent(...args);
+    },
+  };
+});
+
+function probeBudgets(): Array<{ deadlineMs?: number }> {
+  return (globalThis as Record<string, unknown>)["__probeBudgets"] as Array<{ deadlineMs?: number }>;
+}
+
 // ---------- helpers ----------
 
 const FINDING = { severity: "warning", file: "src/a.ts", line: 2, rule: "logic", message: "m", suggestion: "sug" };
@@ -111,10 +133,44 @@ describe("callWithProbeAgent", () => {
     // Next call for the same model: single-shot, no tools attached.
     vi.mocked(fetch).mockClear();
     const r2 = await callWithProbeAgent("opencode-zen", "ap2-model", ZEN, "k", conv(), AGENT_O, TOOL_CTX);
-    expect(r2.result).toEqual({ ok: true, findings: [FINDING] });
+    // Single-shot fallback goes through callLlm, so it carries verdicts (empty here).
+    expect(r2.result).toEqual({
+      ok: true,
+      findings: [FINDING],
+      verdicts: { pairs: [], links: [], malformed: 0 },
+    });
     expect(vi.mocked(fetch)).toHaveBeenCalledTimes(1);
     expect(bodies()[0]).not.toContain('"tools"');
     expect(vi.mocked(core.info)).toHaveBeenCalledWith("agent tools unsupported for this model: using single-shot");
+  });
+
+  it("memo single-shot path strips provenance from findings but keeps verdicts", async () => {
+    const provenanced = JSON.stringify({
+      findings: [{ ...FINDING, confidence: 80, duplicateOf: null }],
+      duplicates: null,
+    });
+    const provenancedChat = { choices: [{ finish_reason: "stop", message: { content: provenanced } }] };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string | URL, init?: unknown) => {
+        const body = String(((init as RequestInit | undefined)?.body ?? "") as unknown as string);
+        if (body.includes('"tools"')) return new Response("bad tools", { status: 400 });
+        return new Response(JSON.stringify(provenancedChat), { status: 200 });
+      }),
+    );
+    // Seed TOOLS_MEMO via the tools-unsupported fallback…
+    const r = await callWithProbeAgent("opencode-zen", "ap2b-model", ZEN, "k", conv(), AGENT_O, TOOL_CTX);
+    expect(r.result).toEqual({ ok: true, findings: [FINDING] });
+    // …then the memoized single-shot strips provenance while keeping verdicts.
+    vi.mocked(fetch).mockClear();
+    const r2 = await callWithProbeAgent("opencode-zen", "ap2b-model", ZEN, "k", conv(), AGENT_O, TOOL_CTX);
+    expect(r2.result).toEqual({
+      ok: true,
+      findings: [FINDING],
+      verdicts: { pairs: [], links: [], malformed: 0 },
+    });
+    expect(JSON.stringify(r2.result)).not.toContain("confidence");
+    expect(JSON.stringify(r2.result)).not.toContain("llm");
   });
 
   it("400 with tools then no-tools retry 400 → advances to the next style", async () => {
@@ -187,6 +243,33 @@ describe("callWithProbeAgent", () => {
     const w = warnings()[0]!;
     expect(w).toContain("ap6-model");
     for (const s of PROBE_ORDER) expect(w).toContain(s);
+  });
+
+  it("probed styles share one probe deadline instead of restarting it", async () => {
+    probeBudgets().length = 0;
+    // Advance the real clock on every read: a per-style recompute would
+    // land later than the first style's deadline, so equality pins sharing.
+    let now = 1_700_000_000_000;
+    vi.spyOn(Date, "now").mockImplementation(() => (now += 1000));
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string | URL) => {
+        const u = String(url);
+        // Turn-0 404 on chat advances the probe; responses then succeeds.
+        if (u.endsWith("/chat/completions")) return new Response("not found", { status: 404 });
+        return new Response(JSON.stringify(RESPONSES_OK), { status: 200 });
+      }),
+    );
+    const r = await callWithProbeAgent("opencode-zen", "ap-deadline-model", ZEN, "k", conv(), AGENT_O, TOOL_CTX);
+    expect(r.result).toEqual({ ok: true, findings: [FINDING] });
+    expect(r.via).toBe("openai-responses");
+    // Exactly two styles ran (chat advanced, responses succeeded).
+    expect(probeBudgets()).toHaveLength(2);
+    const first = probeBudgets()[0]!.deadlineMs;
+    expect(first).toBeDefined();
+    // The second probed style receives the FIRST style's deadline (shared,
+    // not restarted): strict equality, no wall-clock arithmetic.
+    expect(probeBudgets()[1]!.deadlineMs).toBe(first);
   });
 });
 

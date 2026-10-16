@@ -1,4 +1,5 @@
 import type { Finding } from "./fastpath.js";
+import { stripProvenance } from "./fastpath.js";
 import type { Conversation, ToolCall } from "./agent-types.js";
 import { PR_REVIEW_SCHEMA } from "./prompt.js";
 import { buildEndpointForStyle } from "./providers.js";
@@ -6,7 +7,7 @@ import type { ApiStyle, ResolvedApiStyle, ResolvedEndpoint } from "./providers.j
 import { callGoogle, callGoogleTurn } from "./adapters/google.js";
 import { callMessages, callMessagesTurn } from "./adapters/messages.js";
 import { callResponses, callResponsesTurn } from "./adapters/responses.js";
-import { runAgent } from "./agent.js";
+import { runAgent, type AgentOutcome } from "./agent.js";
 import type { ToolContext } from "./agent-tools.js";
 import * as core from "@actions/core";
 
@@ -26,7 +27,7 @@ const MAX_RETRY_AFTER_MS = 5_000;
 export const SNIPPET_CHARS = 200;
 
 export type LlmResult =
-  | { ok: true; findings: Finding[] }
+  | { ok: true; findings: Finding[]; verdicts?: DedupVerdicts; usage?: LlmUsage }
   | {
       ok: false;
       reason: "no-key" | "unsupported" | "timeout" | "content-filter" | "invalid-json";
@@ -41,13 +42,24 @@ export type LlmResult =
     };
 
 /**
+ * Aggregate LLM token usage (numbers only — never model text or prompts).
+ * `calls` counts the contributing results: each adapter attaches 1 to the
+ * result it produced; the agent loop's total adds the per-turn counts.
+ */
+export interface LlmUsage {
+  input: number;
+  output: number;
+  calls: number;
+}
+
+/**
  * A single agent-mode turn reply: the assistant's text plus any tool calls it
  * requested. A failure keeps the single-shot LlmResult union so callers handle
  * both shapes identically. `rawItems` carries adapter-specific raw reply items
  * to echo verbatim on the next turn (unused by the chat adapter).
  */
 export type AgentReply =
-  | { ok: true; text: string; toolCalls: ToolCall[]; rawItems?: unknown[] }
+  | { ok: true; text: string; toolCalls: ToolCall[]; rawItems?: unknown[]; usage?: LlmUsage }
   | { ok: false; result: LlmResult };
 
 type ResponseFormat = { type: "json_schema"; json_schema: typeof PR_REVIEW_SCHEMA } | { type: "json_object" };
@@ -133,9 +145,138 @@ export function parseContent(raw: string): unknown {
 const SEVERITIES: ReadonlySet<unknown> = new Set(["info", "warning", "high"]);
 
 /**
+ * Dedup verdicts carried out-of-band alongside findings (positions stay
+ * aligned because every pipeline stage is order-preserving):
+ * - `pairs`: sent-list index pairs judged duplicates of each other.
+ * - `links`: `[responseIndex, sentIndex]` pointers from model findings
+ *   (which restate sent findings via `duplicateOf`) back to sent findings.
+ * - `malformed`: count of shape-bad entries dropped at parse.
+ */
+export interface DedupVerdicts {
+  pairs: Array<[number, number]>;
+  links: Array<[number, number]>;
+  malformed: number;
+}
+
+/**
+ * Extracts dedup verdicts from the ALREADY-PARSED response object (adapters
+ * parse once via `parseContent` — fence handling inherited, no double parse).
+ * Shape validation ONLY: drops negative/non-integer indices, self-pairs,
+ * non-pairs, and wrong-length pairs (each drop increments `malformed`).
+ * Referent checks (unknown sent indices, dangling pointers) belong to the
+ * caller holding the arrays — NOT here. Null and absent verdict keys both
+ * mean "no verdicts" (never malformed).
+ */
+export function parseVerdicts(parsed: unknown): DedupVerdicts {
+  const verdicts: DedupVerdicts = { pairs: [], links: [], malformed: 0 };
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return verdicts;
+  const root = parsed as Record<string, unknown>;
+  const dupes = root.duplicates;
+  if (dupes === undefined || dupes === null) {
+    // No verdicts — normal, not malformed.
+  } else if (!Array.isArray(dupes)) {
+    verdicts.malformed++;
+  } else {
+    for (const entry of dupes) {
+      if (!Array.isArray(entry) || entry.length !== 2) {
+        verdicts.malformed++;
+        continue;
+      }
+      const [a, b] = entry;
+      if (!Number.isInteger(a) || (a as number) < 0 || !Number.isInteger(b) || (b as number) < 0 || a === b) {
+        verdicts.malformed++;
+        continue;
+      }
+      verdicts.pairs.push([a as number, b as number]);
+    }
+  }
+  const findings = root.findings;
+  if (Array.isArray(findings)) {
+    for (let i = 0; i < findings.length; i++) {
+      const item = findings[i];
+      if (typeof item !== "object" || item === null || Array.isArray(item)) continue;
+      const target = (item as Record<string, unknown>).duplicateOf;
+      if (target === undefined || target === null) continue;
+      if (!Number.isInteger(target) || (target as number) < 0) {
+        verdicts.malformed++;
+        continue;
+      }
+      verdicts.links.push([i, target as number]);
+    }
+  }
+  return verdicts;
+}
+
+/** A finite number >= 0, or undefined (never NaN/Infinity/negative/wrong-typed). */
+function nonNegNumber(v: unknown): number | undefined {
+  return typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : undefined;
+}
+
+/**
+ * Pure shape normalization of a provider response body into `{input, output}`
+ * per API style (spec §4). Returns undefined for a non-object body, a missing /
+ * non-numeric / negative / non-finite field, or a half-shaped usage object —
+ * never a partial, NaN or negative result. Counting is the call site's job:
+ * each adapter attaches `calls: 1` to the result it produced. Non-object bodies
+ * (null, arrays, primitives) yield undefined so adapters never reject on shape.
+ */
+export function extractUsage(
+  body: unknown,
+  apiStyle: ResolvedApiStyle,
+): { input: number; output: number } | undefined {
+  if (typeof body !== "object" || body === null || Array.isArray(body)) return undefined;
+  const root = body as Record<string, unknown>;
+  const usage = apiStyle === "google-models" ? root.usageMetadata : root.usage;
+  if (typeof usage !== "object" || usage === null || Array.isArray(usage)) return undefined;
+  const u = usage as Record<string, unknown>;
+
+  switch (apiStyle) {
+    case "openai-chat": {
+      const input = nonNegNumber(u.prompt_tokens);
+      const output = nonNegNumber(u.completion_tokens);
+      return input === undefined || output === undefined ? undefined : { input, output };
+    }
+    case "openai-responses": {
+      const input = nonNegNumber(u.input_tokens);
+      const output = nonNegNumber(u.output_tokens);
+      return input === undefined || output === undefined ? undefined : { input, output };
+    }
+    case "anthropic-messages": {
+      // input_tokens is required (caches alone do not form an input); the cache
+      // counters are billed input, so they fold in. Wrong-typed caches count as
+      // 0, never concatenated.
+      const input = nonNegNumber(u.input_tokens);
+      const output = nonNegNumber(u.output_tokens);
+      if (input === undefined || output === undefined) return undefined;
+      const cacheRead = nonNegNumber(u.cache_read_input_tokens) ?? 0;
+      const cacheCreation = nonNegNumber(u.cache_creation_input_tokens) ?? 0;
+      return { input: input + cacheRead + cacheCreation, output };
+    }
+    case "google-models": {
+      // promptTokenCount already includes cached tokens: no addition. Output is
+      // total−prompt when both are present (a negative derivation is absent),
+      // else candidatesTokenCount.
+      const input = nonNegNumber(u.promptTokenCount);
+      if (input === undefined) return undefined;
+      const total = nonNegNumber(u.totalTokenCount);
+      if (total !== undefined) {
+        const derived = total - input;
+        return derived >= 0 ? { input, output: derived } : undefined;
+      }
+      const candidates = nonNegNumber(u.candidatesTokenCount);
+      return candidates === undefined ? undefined : { input, output: candidates };
+    }
+  }
+}
+
+/**
  * Hand-written structural check against PR_REVIEW_SCHEMA's required fields.
  * Returns undefined when the response is invalid. Line is coerced rather than
  * rejected: only an integer >= 1 is kept, anything else becomes undefined.
+ * Single-shot provenance (Q04): every finding gains `source: "llm"`; a
+ * safe-integer 0..100 `confidence` is carried, anything else drops the FIELD
+ * (never the finding — verdict-index alignment is preserved). A string `patch`
+ * is carried verbatim; a wrong-typed one drops the field the same way.
  */
 export function toFindings(v: unknown): Finding[] | undefined {
   if (typeof v !== "object" || v === null || Array.isArray(v)) return undefined;
@@ -153,9 +294,22 @@ export function toFindings(v: unknown): Finding[] | undefined {
       file: i.file,
       rule: i.rule,
       message: i.message,
+      source: "llm",
     };
     if (Number.isInteger(i.line) && (i.line as number) >= 1) f.line = i.line as number;
     if (typeof i.suggestion === "string") f.suggestion = i.suggestion;
+    // Wrong-typed patch drops the FIELD only (confidence precedent): a single
+    // malformed patch must never discard the whole review — positions stay
+    // untouched, so verdict-index alignment holds.
+    if (typeof i.patch === "string") f.patch = i.patch;
+    if (
+      typeof i.confidence === "number" &&
+      Number.isSafeInteger(i.confidence) &&
+      i.confidence >= 0 &&
+      i.confidence <= 100
+    ) {
+      f.confidence = i.confidence;
+    }
     out.push(f);
   }
   return out;
@@ -406,7 +560,13 @@ export async function callLlm(
   if (findings === undefined) {
     return { ok: false, reason: "invalid-json", detail: "response does not match the review schema" };
   }
-  return { ok: true, findings };
+  const u = extractUsage(json, "openai-chat");
+  return {
+    ok: true,
+    findings,
+    verdicts: parseVerdicts(parsed),
+    ...(u ? { usage: { ...u, calls: 1 } } : {}),
+  };
 }
 
 /**
@@ -468,7 +628,13 @@ export async function callChatTurn(
   }
   const reply = parseChatReply(json, chatFlags);
   if (!reply.ok) return { ok: false, result: reply.result };
-  return { ok: true, text: reply.text ?? "", toolCalls: reply.toolCalls };
+  const u = extractUsage(json, "openai-chat");
+  return {
+    ok: true,
+    text: reply.text ?? "",
+    toolCalls: reply.toolCalls,
+    ...(u ? { usage: { ...u, calls: 1 } } : {}),
+  };
 }
 
 /** Default client timeout for the Ollama pull (pulls can be slow). */
@@ -740,6 +906,16 @@ function agentCallFor(ep: ResolvedEndpoint, o: AgentCallOptions) {
 }
 
 /**
+ * Propagates the agent-loop usage total onto an ok:true result (overwriting any
+ * single-turn value — the total supersedes it). Conditional so no explicit
+ * `usage: undefined` key is written; ok:false results never carry usage.
+ */
+function withAgentUsage(outcome: AgentOutcome, result: LlmResult): LlmResult {
+  if (result.ok && outcome.usage !== undefined) return { ...result, usage: outcome.usage };
+  return result;
+}
+
+/**
  * Runs the agent tool loop against one already-resolved endpoint. The `agent
  * done` summary is logged through runAgent; the loop's final result is
  * returned directly.
@@ -756,7 +932,7 @@ export async function callByStyleAgent(
     { maxTurns: o.maxTurns, maxSeconds: o.maxSeconds, timeoutSeconds: o.timeoutSeconds },
     { call: agentCallFor(ep, o), log: core.info },
   );
-  return outcome.result;
+  return withAgentUsage(outcome, outcome.result);
 }
 
 /**
@@ -789,9 +965,15 @@ export async function callWithProbeAgent(
 
   // A model that already proved it rejects tools skips the loop entirely.
   // The conversation has no turns at this point, so this is single-shot.
+  // Agent-mode findings carry no provenance (Q04): strip them here while
+  // keeping the genuine single-shot `verdicts` judgment.
   if (TOOLS_MEMO.get(memoKey) === false) {
     core.info("agent tools unsupported for this model: using single-shot");
-    return callWithProbe(provider, model, baseUrl, key, { system: conv.system, user: conv.user }, o, explicitStyle);
+    const out = await callWithProbe(provider, model, baseUrl, key, { system: conv.system, user: conv.user }, o, explicitStyle);
+    if (out.result.ok) {
+      out.result.findings = out.result.findings.map(stripProvenance);
+    }
+    return out;
   }
 
   const agentOpts: AgentCallOptions = {
@@ -806,12 +988,17 @@ export async function callWithProbeAgent(
     maxSeconds: o.maxSeconds,
   };
 
+  // One absolute deadline per probe invocation: every probed style shares
+  // it instead of restarting the clock (real-clock; the agent loop derives
+  // per-call timeouts from it).
+  const deadlineMs = Date.now() + o.maxSeconds * 1000;
+
   const runStyle = async (style: ResolvedApiStyle) => {
     const ep = buildEndpointForStyle(provider, model, baseUrl, key, style, o.prNumber ?? null, o.userBase ?? false);
     const outcome = await runAgent(
       conv,
       toolCtx,
-      { maxTurns: o.maxTurns, maxSeconds: o.maxSeconds, timeoutSeconds: o.timeoutSeconds },
+      { maxTurns: o.maxTurns, maxSeconds: o.maxSeconds, timeoutSeconds: o.timeoutSeconds, deadlineMs },
       { call: agentCallFor(ep, agentOpts), log: core.info },
     );
     return { outcome, via: style };
@@ -820,7 +1007,7 @@ export async function callWithProbeAgent(
   // Explicit style: the user decided; exactly one loop, no probe.
   if (explicitStyle !== undefined && explicitStyle !== "auto") {
     const { outcome } = await runStyle(explicitStyle);
-    return { result: outcome.result, via: explicitStyle };
+    return { result: withAgentUsage(outcome, outcome.result), via: explicitStyle };
   }
 
   // A stale memo must not dead-end the probe: the memoized style goes first,
@@ -848,13 +1035,13 @@ export async function callWithProbeAgent(
       // result may still be ok (fallback success), so this check must come
       // before the ok branch.
       TOOLS_MEMO.set(memoKey, false);
-      return { result: outcome.result, via: style };
+      return { result: withAgentUsage(outcome, outcome.result), via: style };
     }
     if (outcome.result.ok) {
       PROBE_MEMO.set(memoKey, style);
-      return { result: outcome.result, via: style };
+      return { result: withAgentUsage(outcome, outcome.result), via: style };
     }
-    return { result: outcome.result, via: style };
+    return { result: withAgentUsage(outcome, outcome.result), via: style };
   }
 
   // Every tried style failed: report the last failure, name what was tried.

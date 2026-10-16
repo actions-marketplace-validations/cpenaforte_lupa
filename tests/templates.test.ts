@@ -2,13 +2,13 @@ import * as fs from "node:fs";
 import { describe, expect, it } from "vitest";
 
 describe("workflow templates", () => {
-  it("both templates pin the v0.5.0 release SHA", () => {
+  it("both templates pin the v0.9.0 release SHA", () => {
     for (const file of [
       "docs/workflow-template.yml",
       "docs/workflow-template-privileged.yml",
     ]) {
       expect(fs.readFileSync(file, "utf8")).toContain(
-        "uses: cpenaforte/lupa@658ab55ae32d6e9e53193a5d6be75c3794de71d8",
+        "uses: cpenaforte/lupa@a69c377a7f34d35274456512d47e5cbd223a141e",
       );
     }
   });
@@ -229,5 +229,109 @@ describe("workflow templates", () => {
     const p = fs.readFileSync("docs/workflow-template-privileged.yml", "utf8");
     expect(p).not.toContain("upload-sarif");
     expect(p).not.toMatch(/^ {2}issues:\s*write/m);
+  });
+
+  it("privileged template falls back to the workflow-run token with a visible downgrade notice", () => {
+    const p = fs.readFileSync("docs/workflow-template-privileged.yml", "utf8");
+    const sentence =
+      "lupa: posting fork review with the workflow-run token (App token unavailable). For App-token posting set PR_REVIEWER_APP_ID / PR_REVIEWER_APP_KEY — see README (fork reviews)";
+    const escaped = sentence.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    // Guard step present with the exact name.
+    expect(p).toContain("- name: Note posting credential");
+    // Guard condition pins always() plus the App-outcome check.
+    const guardIdx = p.indexOf("Note posting credential");
+    const guardEnd = p.indexOf("- name:", guardIdx + 1);
+    const guardBlock = p.slice(guardIdx, guardEnd);
+    expect(guardBlock).toContain("always()");
+    expect(guardBlock).toContain("steps.app.outcome != 'success'");
+    // Summary emission is a heredoc carrying the bare sentence on its own line
+    // (leading YAML indent allowed; an echo-prefix or trailing text fails).
+    expect(guardBlock).toContain('cat >> "$GITHUB_STEP_SUMMARY" <<\'EOF\'');
+    expect(guardBlock).toMatch(new RegExp(`^[ \\t]*${escaped}$`, "m"));
+    expect(guardBlock).toMatch(/^[ \t]*EOF$/m);
+    // Annotation echoes the identical line with the ::notice:: prefix.
+    expect(guardBlock).toContain("::notice::" + sentence);
+    expect(guardBlock).toContain(`echo "::notice::${sentence}"`);
+    // Ordering: guard sits after the App step and before the download step.
+    const appIdx = p.indexOf("Create GitHub App token");
+    const downloadIdx = p.indexOf("Download the PR run's review artifact");
+    expect(appIdx).toBeGreaterThanOrEqual(0);
+    expect(downloadIdx).toBeGreaterThanOrEqual(0);
+    expect(guardIdx).toBeGreaterThan(appIdx);
+    expect(guardIdx).toBeLessThan(downloadIdx);
+    // The App step's own block carries continue-on-error (scoped, not file-wide).
+    const appBlock = p.slice(appIdx, p.indexOf("- name:", appIdx + 1));
+    expect(appBlock).toContain("continue-on-error: true");
+    // Token-type fallback arm uses the workflow-run token.
+    expect(p).toContain("'workflow-run'");
+    expect(p).toContain("steps.app.outcome == 'success' && 'app'");
+  });
+
+  it("unprivileged template warns visibly when the optional SARIF upload fails", () => {
+    const t = fs.readFileSync("docs/workflow-template.yml", "utf8");
+    const sentence =
+      "lupa: SARIF upload failed — code-scanning results were not uploaded. See the Upload SARIF step log for the cause (commonly: grant security-events: write / actions: read in workflow permissions), or ignore if code scanning is not used.";
+    const escaped = sentence.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    /** Step keys only (6-space `- key:` or 8-space `key:`), excluding the indented run body. */
+    const stepKeys = (block: string): string[] =>
+      block
+        .split("\n")
+        .map((l) => /^(?: {6}- | {8}|- )([a-z-]+):/.exec(l)?.[1])
+        .filter((k): k is string => k !== undefined);
+
+    // The upload step gains exactly one line (`id: sarif`); every other key is unchanged.
+    const uploadIdx = t.indexOf('- name: "Upload SARIF');
+    expect(uploadIdx).toBeGreaterThanOrEqual(0);
+    const uploadEnd = t.indexOf("- name:", uploadIdx + 1);
+    const uploadBlock = t.slice(uploadIdx, uploadEnd);
+    expect(stepKeys(uploadBlock)).toEqual(["name", "id", "if", "continue-on-error", "uses", "with"]);
+
+    // The note step sits immediately after the upload step (nothing else moves).
+    const noteIdx = t.indexOf('- name: "Note SARIF upload failure"');
+    expect(noteIdx).toBeGreaterThanOrEqual(0);
+    expect(t.slice(uploadEnd, uploadEnd + 40)).toContain("Note SARIF upload failure");
+    const noteEnd = t.indexOf("- name:", noteIdx + 1);
+    const noteBlock = t.slice(noteIdx, noteEnd);
+    expect(stepKeys(noteBlock)).toEqual(["name", "if", "run"]);
+
+    // Guard pins always() plus `== 'failure'`: a failed upload warns, while a skipped step
+    // (fork, issue_comment, workflow_dispatch, or the same-repo guard false) has outcome
+    // 'skipped' — `!= 'success'` would warn on those too, so the vocabulary is load-bearing.
+    expect(noteBlock).toContain("always()");
+    expect(noteBlock).toContain("steps.sarif.outcome == 'failure'");
+    expect(noteBlock).not.toContain("!= 'success'");
+
+    // Annotation echoes the sentence with the ::warning:: prefix.
+    expect(noteBlock).toContain(`echo "::warning::${sentence}"`);
+
+    // Summary emission is a heredoc carrying the bare sentence on its own line
+    // (leading YAML indent allowed; an echo-prefix or trailing text fails).
+    expect(noteBlock).toContain('cat >> "$GITHUB_STEP_SUMMARY" <<\'EOF\'');
+    expect(noteBlock).toMatch(new RegExp(`^[ \\t]*${escaped}$`, "m"));
+    expect(noteBlock).toMatch(/^[ \t]*EOF$/m);
+
+    // Echoes only: the note step never fails the job (no continue-on-error, exit or false).
+    expect(noteBlock).not.toContain("continue-on-error");
+    expect(noteBlock).not.toMatch(/\bexit\b/);
+    expect(noteBlock).not.toMatch(/\bfalse\b/);
+  });
+
+  it("both templates pin the same fail_level (severity parity)", () => {
+    const extract = (file: string): string => {
+      const text = fs.readFileSync(file, "utf8");
+      const usesIdx = text.indexOf("uses: cpenaforte/lupa@");
+      expect(usesIdx, `${file}: lupa step missing`).toBeGreaterThanOrEqual(0);
+      const withIdx = text.indexOf("with:", usesIdx);
+      expect(withIdx, `${file}: with block missing`).toBeGreaterThanOrEqual(0);
+      const block = text.slice(withIdx, withIdx + 1500);
+      const m = /fail_level: (\w+)/.exec(block);
+      expect(m, `${file}: fail_level missing from lupa with block`).not.toBeNull();
+      const level = m![1];
+      expect(["none", "warning", "high"]).toContain(level);
+      return level;
+    };
+    const privileged = extract("docs/workflow-template-privileged.yml");
+    const producer = extract("docs/workflow-template.yml");
+    expect(privileged).toBe(producer);
   });
 });

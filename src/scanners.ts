@@ -1,9 +1,11 @@
 import os from "node:os";
 import { execFile } from "node:child_process";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join, resolve as resolvePath } from "node:path";
 import type { Finding } from "./fastpath.js";
 import type { PrMeta } from "./diff.js";
+import { byteCheck, oversizeMessage, readCappedFileSync, sourceForLabel } from "./artifact-limits.js";
+import { DEFAULT_MAX_ARTIFACT_BYTES } from "./inputs.js";
 
 // ---- pins ----------------------------------------------------------------
 
@@ -220,8 +222,10 @@ export function runExec(
   });
 }
 
-function warning(rule: string, message: string): Finding {
-  return { severity: "warning", file: "", rule, message };
+export function warning(rule: string, message: string, source?: string): Finding {
+  return source === undefined
+    ? { severity: "warning", file: "", rule, message }
+    : { severity: "warning", file: "", rule, message, source };
 }
 
 /**
@@ -273,28 +277,33 @@ function findingsExitCodes(label: string): number[] {
 /**
  * Interpret a scanner whose SARIF arrives on stdout. Fail-open: a non-zero exit (or
  * any exit) with empty/unparseable stdout is a `scanner-failed` warning, never a clean pass.
+ * The `maxBytes` byte check runs before parsing (after the missing/timedOut guards).
  * The timeout message names the actual `timeoutMs` budget the tool ran under.
  * Parsed findings are always kept; a failed invocation appends a `scanner-failed`
  * warning, never substituted. Explicit invocation success wins over a contradictory
  * exit code; code 0 with no invocation info stays quiet.
  */
-export function fromStdout(tool: string, label: string, r: Exec, timeoutMs: number = TOOL_TIMEOUT_MS): Finding[] {
-  if (r.missing) return [warning("scanner-missing", `${label} unavailable: ${tool} not found`)];
-  if (r.timedOut) return [warning("scanner-failed", `${label} timed out after ${timeoutMs / 1000}s`)];
+export function fromStdout(tool: string, label: string, r: Exec, timeoutMs: number = TOOL_TIMEOUT_MS, maxBytes: number = DEFAULT_MAX_ARTIFACT_BYTES): Finding[] {
+  const source = sourceForLabel(label);
+  if (r.missing) return [warning("scanner-missing", `${label} unavailable: ${tool} not found`, source)];
+  if (r.timedOut) return [warning("scanner-failed", `${label} timed out after ${timeoutMs / 1000}s`, source)];
+  const over = byteCheck(r.stdout, maxBytes, label);
+  if (over !== undefined) return over;
   const parsed = r.stdout.trim() ? parseSarif(r.stdout) : undefined;
   if (!parsed) {
-    return [warning("scanner-failed", `${label} exited ${r.code ?? "abnormally"} without parseable SARIF`)];
+    return [warning("scanner-failed", `${label} exited ${r.code ?? "abnormally"} without parseable SARIF`, source)];
   }
+  const provenanced = parsed.map((f) => ({ ...f, source, confidence: 90, evidence: { analyzer: source } }));
   const health = invocationFailed(r.stdout);
   if (health === true) {
-    return [...parsed, warning("scanner-failed", `${label} reported an unsuccessful run`)];
+    return [...provenanced, warning("scanner-failed", `${label} reported an unsuccessful run`, source)];
   }
-  if (health === false) return parsed;
-  if (r.code === 0) return parsed;
+  if (health === false) return provenanced;
+  if (r.code === 0) return provenanced;
   if (r.code === null || !findingsExitCodes(label).includes(r.code)) {
-    return [...parsed, warning("scanner-failed", `${label} reported an unsuccessful run`)];
+    return [...provenanced, warning("scanner-failed", `${label} reported an unsuccessful run`, source)];
   }
-  return parsed;
+  return provenanced;
 }
 
 /**
@@ -326,6 +335,7 @@ export interface ScannerResult {
  * `outDir` (parent for the SBOM's mkdtemp dir; defaults to `os.tmpdir()`),
  * `timeoutMs` (per-tool wall-clock budget; defaults to `TOOL_TIMEOUT_MS`, threaded to every
  * tool invocation and to its timeout message).
+ * `maxArtifactBytes` (read cap for scanner artifacts; defaults to `DEFAULT_MAX_ARTIFACT_BYTES`).
  * Lifecycle: `sbomPath` is returned for upload; the caller (Task 12) owns the file and its
  * temp dir. runScanners does NOT delete the SBOM.
  * Semgrep runs the PyPI binary; trivy/osv/gitleaks run from digest-pinned docker images.
@@ -339,27 +349,29 @@ export async function runScanners(o: {
   lockfiles?: string[];
   outDir?: string;
   timeoutMs?: number;
+  maxArtifactBytes?: number;
 }): Promise<ScannerResult> {
   const findings: Finding[] = [];
   const jobs = o.jobs ?? resolveJobs();
   const dir = resolvePath(o.dir);
   const timeoutMs = o.timeoutMs ?? TOOL_TIMEOUT_MS;
+  const maxArtifactBytes = o.maxArtifactBytes ?? DEFAULT_MAX_ARTIFACT_BYTES;
 
   // semgrep (binary, not docker)
   const sg = semgrepArgv({ baselineSha: o.baselineSha, jobs, hasToken: !!o.hasSemgrepToken });
-  findings.push(...fromStdout("semgrep", "semgrep", await runExec("semgrep", sg.argv, dir, sg.env, timeoutMs), timeoutMs));
+  findings.push(...fromStdout("semgrep", "semgrep", await runExec("semgrep", sg.argv, dir, sg.env, timeoutMs), timeoutMs, maxArtifactBytes));
 
   // trivy (docker image pinned by digest)
   const tv = await runExec("docker", dockerArgs(dir, TRIVY_IMAGE, TRIVY_DIGEST, trivyArgv(".")), dir, undefined, timeoutMs);
-  findings.push(...fromStdout("docker", "trivy", tv, timeoutMs));
+  findings.push(...fromStdout("docker", "trivy", tv, timeoutMs, maxArtifactBytes));
 
   // gitleaks (docker image pinned by digest; SARIF goes to a report file in a temp dir)
-  findings.push(...(await runGitleaks(dir, timeoutMs)));
+  findings.push(...(await runGitleaks(dir, timeoutMs, maxArtifactBytes)));
 
   // osv-scanner (docker image pinned by digest), one run per lockfile
   for (const lock of o.lockfiles ?? []) {
     const osv = await runExec("docker", dockerArgs(dir, OSV_IMAGE, OSV_DIGEST, osvArgv(lock)), dir, undefined, timeoutMs);
-    findings.push(...fromStdout("docker", `osv-scanner (${lock})`, osv, timeoutMs));
+    findings.push(...fromStdout("docker", `osv-scanner (${lock})`, osv, timeoutMs, maxArtifactBytes));
   }
 
   // SBOM (trivy fs --format cyclonedx). Written under a unique mkdtemp dir inside outDir.
@@ -367,22 +379,27 @@ export async function runScanners(o: {
   if (o.sbom) {
     const sb = await runExec("docker", dockerArgs(dir, TRIVY_IMAGE, TRIVY_DIGEST, sbomArgv(".")), dir, undefined, timeoutMs);
     if (sb.missing) {
-      findings.push(warning("scanner-missing", "sbom unavailable: docker not found"));
-    } else if (!isCycloneDx(sb.stdout)) {
-      // The exit code is not decisive: a valid CycloneDX document is accepted even on non-zero
-      // exit (scanners exit non-zero when they report findings), matching the SARIF rule.
-      findings.push(warning("scanner-failed", `sbom exited ${sb.code ?? "abnormally"} without a CycloneDX document`));
+      findings.push(warning("scanner-missing", "sbom unavailable: docker not found", "sbom"));
     } else {
-      let sbomDir: string | undefined;
-      try {
-        sbomDir = await mkdtemp(join(o.outDir ?? os.tmpdir(), "sbom-"));
-        const out = join(sbomDir, "sbom.cdx.json");
-        await writeFile(out, sb.stdout, "utf8");
-        sbomPath = out;
-      } catch (e) {
-        // A failed write must not leave a half-created dir behind: remove it best-effort.
-        if (sbomDir) await rm(sbomDir, { recursive: true, force: true }).catch(() => undefined);
-        findings.push(warning("sbom-write", `could not write SBOM: ${(e as Error).message}`));
+      const over = byteCheck(sb.stdout, maxArtifactBytes, "sbom");
+      if (over !== undefined) {
+        findings.push(...over);
+      } else if (!isCycloneDx(sb.stdout)) {
+        // The exit code is not decisive: a valid CycloneDX document is accepted even on non-zero
+        // exit (scanners exit non-zero when they report findings), matching the SARIF rule.
+        findings.push(warning("scanner-failed", `sbom exited ${sb.code ?? "abnormally"} without a CycloneDX document`, "sbom"));
+      } else {
+        let sbomDir: string | undefined;
+        try {
+          sbomDir = await mkdtemp(join(o.outDir ?? os.tmpdir(), "sbom-"));
+          const out = join(sbomDir, "sbom.cdx.json");
+          await writeFile(out, sb.stdout, "utf8");
+          sbomPath = out;
+        } catch (e) {
+          // A failed write must not leave a half-created dir behind: remove it best-effort.
+          if (sbomDir) await rm(sbomDir, { recursive: true, force: true }).catch(() => undefined);
+          findings.push(warning("sbom-write", `could not write SBOM: ${(e as Error).message}`, "sbom"));
+        }
       }
     }
   }
@@ -406,12 +423,12 @@ function isCycloneDx(text: string): boolean {
  * when clean and may not create the report; exit 0 with no report is therefore clean.
  * A temp-dir failure is a `scanner-failed` warning, never a throw.
  */
-async function runGitleaks(dir: string, timeoutMs: number = TOOL_TIMEOUT_MS): Promise<Finding[]> {
+async function runGitleaks(dir: string, timeoutMs: number = TOOL_TIMEOUT_MS, maxBytes: number = DEFAULT_MAX_ARTIFACT_BYTES): Promise<Finding[]> {
   let reportDir: string;
   try {
     reportDir = await mkdtemp(join(os.tmpdir(), "gitleaks-"));
   } catch (e) {
-    return [warning("scanner-failed", `gitleaks temp dir unavailable: ${(e as Error).message}`)];
+    return [warning("scanner-failed", `gitleaks temp dir unavailable: ${(e as Error).message}`, "gitleaks")];
   }
   const hostReport = join(reportDir, "report.sarif");
   try {
@@ -424,25 +441,30 @@ async function runGitleaks(dir: string, timeoutMs: number = TOOL_TIMEOUT_MS): Pr
       undefined,
       timeoutMs,
     );
-    if (gl.missing) return [warning("scanner-missing", "gitleaks unavailable: docker not found")];
-    if (gl.timedOut) return [warning("scanner-failed", `gitleaks timed out after ${timeoutMs / 1000}s`)];
+    if (gl.missing) return [warning("scanner-missing", "gitleaks unavailable: docker not found", "gitleaks")];
+    if (gl.timedOut) return [warning("scanner-failed", `gitleaks timed out after ${timeoutMs / 1000}s`, "gitleaks")];
     let text: string | undefined;
     try {
-      text = await readFile(hostReport, "utf8");
+      const capped = readCappedFileSync(hostReport, maxBytes);
+      if (!capped.ok) {
+        return [warning("scanner-failed", oversizeMessage("gitleaks", maxBytes), "gitleaks")];
+      }
+      text = capped.text;
     } catch {
       text = undefined;
     }
     if (text === undefined) {
-      return gl.code === 0 ? [] : [warning("scanner-failed", `gitleaks exited ${gl.code ?? "abnormally"} with no report`)];
+      return gl.code === 0 ? [] : [warning("scanner-failed", `gitleaks exited ${gl.code ?? "abnormally"} with no report`, "gitleaks")];
     }
     const parsed = parseSarif(text);
-    if (!parsed) return [warning("scanner-failed", "gitleaks report is not parseable SARIF")];
+    if (!parsed) return [warning("scanner-failed", "gitleaks report is not parseable SARIF", "gitleaks")];
+    const provenanced = parsed.map((f) => ({ ...f, source: "gitleaks", confidence: 90, evidence: { analyzer: "gitleaks" } }));
     // Exit codes do not apply here (this path parses a report file, not a process
     // result), but invocation health still does when the SARIF carries it.
     if (invocationFailed(text) === true) {
-      return [...parsed, warning("scanner-failed", "gitleaks reported an unsuccessful run")];
+      return [...provenanced, warning("scanner-failed", "gitleaks reported an unsuccessful run", "gitleaks")];
     }
-    return parsed;
+    return provenanced;
   } finally {
     await rm(reportDir, { recursive: true, force: true }).catch(() => undefined);
   }
